@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache
+
+# Virtual environments
+venv/
+.venv/
+
+# Environment variables / secrets
+.env
+
+# Large/local database files
+db/*.db
+db/*.db-shm
+db/*.db-wal
+db/backup/
+
+# Database schema dumps
+db/*.db.sql
+*.db.sql
+
+# Ollama query complexity config
+config/ollama_complexity.json
+
+# Logs
+*.log
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Application output
+downloads/
+exports/
+imports/
+cache/
+
+# Temp adjudication folder
+adj/
