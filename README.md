@@ -64,7 +64,7 @@ only rows with searchable websites are included in search runs.
 
 The header includes the Save Oregon Schools logo linking to
 `https://www.saveoregonschools.com/`, and the footer includes the Save Oregon
-Schools copyright, source code, and license links.
+Schools copyright, source code, license, and trademark notice links.
 
 ## Settings
 
