@@ -15,6 +15,9 @@ db/*.db
 db/*.db-shm
 db/*.db-wal
 db/backup/
+data/*.db
+data/*.db-shm
+data/*.db-wal
 
 # Database schema dumps
 db/*.db.sql
@@ -25,6 +28,7 @@ config/ollama_complexity.json
 
 # Logs
 *.log
+logs/*.log
 
 # OS files
 Thumbs.db
@@ -32,8 +36,10 @@ Thumbs.db
 
 # Application output
 downloads/
-exports/
-imports/
+exports/*
+!exports/.gitkeep
+imports/*
+!imports/.gitkeep
 cache/
 
 # Temp adjudication folder

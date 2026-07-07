@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+
+{% block title %}Search - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Search</h2>
+    <div class="metric-inline">
+      <span>Matching districts</span>
+      <strong>{{ match_count|fmt_int }}</strong>
+    </div>
+  </section>
+
+  <section class="tool-surface">
+    <form method="get" action="{{ url_for('search_page') }}" class="search-form">
+      <div class="full">
+        <div class="label-row">
+          <label for="query_text">Keyword or phrase</label>
+          <details class="help-popover">
+            <summary>Help</summary>
+            <div class="help-panel">
+              <p>Current search is simple case-insensitive text matching. Enter one word or an exact phrase, such as <code>calendar</code> or <code>community schools</code>.</p>
+              <p>Boolean logic, wildcards, and quote parsing are not supported yet. Do not add quotes unless you want quote characters included in the search.</p>
+            </div>
+          </details>
+        </div>
+        <input id="query_text" name="query_text" value="{{ query_text }}" placeholder="community schools">
+      </div>
+
+      <div>
+        <label for="states">States</label>
+        <select id="states" name="states" multiple size="8">
+          {% for state in options.states %}
+            <option value="{{ state }}" {% if state in selected_states %}selected{% endif %}>{{ state }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label for="agency_types">Agency types</label>
+        <select id="agency_types" name="agency_types" multiple size="8">
+          {% for agency_type in options.agency_types %}
+            <option value="{{ agency_type }}" {% if agency_type in selected_agency_types %}selected{% endif %}>{{ agency_type }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label for="min_enrollment">Min enrollment</label>
+        <input id="min_enrollment" name="min_enrollment" type="number" value="{{ min_enrollment or '' }}">
+      </div>
+      <div>
+        <label for="max_enrollment">Max enrollment</label>
+        <input id="max_enrollment" name="max_enrollment" type="number" value="{{ max_enrollment or '' }}">
+      </div>
+      <div>
+        <label for="max_districts">Max districts this run</label>
+        <input id="max_districts" name="max_districts" type="number" min="1" max="{{ max_total_districts_per_run }}" value="{{ max_districts }}">
+      </div>
+      <div>
+        <label for="max_pages_per_district">Max pages per district</label>
+        <input id="max_pages_per_district" name="max_pages_per_district" type="number" min="1" max="500" value="{{ max_pages_per_district }}">
+      </div>
+      <div class="checkbox-field">
+        <input id="debug_logging" name="debug_logging" type="checkbox" value="1">
+        <label for="debug_logging">Capture debug log</label>
+      </div>
+
+      <div class="form-actions full">
+        <button type="submit" class="secondary">Preview count</button>
+        <button type="submit" formaction="{{ url_for('run_search_route') }}" formmethod="post">Run search</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <h2>Recent Runs</h2>
+    {% if recent_runs %}
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Query</th>
+            <th>Status</th>
+            <th>Matched</th>
+            <th>Searched</th>
+            <th>Failed</th>
+            <th>Started</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for run in recent_runs %}
+            <tr>
+              <td><a href="{{ url_for('run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
+              <td>{{ run.query_text }}</td>
+              <td><span class="status {{ run.status }}">{{ run.status }}</span></td>
+              <td>{{ run.districts_matched|fmt_int }}</td>
+              <td>{{ run.districts_searched|fmt_int }}</td>
+              <td>{{ run.districts_failed|fmt_int }}</td>
+              <td>{{ run.started_at|fmt_dt }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No search runs yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

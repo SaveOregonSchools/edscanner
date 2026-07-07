@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+
+{% block title %}Districts - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Districts</h2>
+    <div class="metric-inline">
+      <span>Rows</span>
+      <strong>{{ total|fmt_int }}</strong>
+    </div>
+  </section>
+
+  <section class="tool-surface">
+    <form method="get" class="inline-form">
+      <div>
+        <label for="state">State</label>
+        <select id="state" name="state">
+          <option value="">All</option>
+          {% for option in options.states %}
+            <option value="{{ option }}" {% if option == state %}selected{% endif %}>{{ option }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="wide">
+        <label for="q">Search</label>
+        <input id="q" name="q" value="{{ query }}">
+      </div>
+      <button type="submit">Filter</button>
+    </form>
+  </section>
+
+  <section class="content-section">
+    {% if rows %}
+      <table>
+        <thead>
+          <tr>
+            <th>
+              <div class="sortable-heading">
+                <span>Name</span>
+                <span class="sort-buttons">
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='agency_name', direction='asc') }}">A-Z</a>
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='agency_name', direction='desc') }}">Z-A</a>
+                </span>
+              </div>
+            </th>
+            <th>
+              <div class="sortable-heading">
+                <span>State</span>
+                <span class="sort-buttons">
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='state', direction='asc') }}">A-Z</a>
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='state', direction='desc') }}">Z-A</a>
+                </span>
+              </div>
+            </th>
+            <th>
+              <div class="sortable-heading">
+                <span>Agency type</span>
+                <span class="sort-buttons">
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='agency_type', direction='asc') }}">A-Z</a>
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='agency_type', direction='desc') }}">Z-A</a>
+                </span>
+              </div>
+            </th>
+            <th>
+              <div class="sortable-heading">
+                <span>Enrollment</span>
+                <span class="sort-buttons">
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='total_enrollment_excludes_ae', direction='asc') }}">0-9</a>
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='total_enrollment_excludes_ae', direction='desc') }}">9-0</a>
+                </span>
+              </div>
+            </th>
+            <th>
+              <div class="sortable-heading">
+                <span>Website</span>
+                <span class="sort-buttons">
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='website', direction='asc') }}">A-Z</a>
+                  <a href="{{ url_for('districts_page', state=state, q=query, sort='website', direction='desc') }}">Z-A</a>
+                </span>
+              </div>
+            </th>
+            <th>Searchable</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>{{ row.agency_name }}</td>
+              <td>{{ row.state }}</td>
+              <td>{{ row.agency_type }}</td>
+              <td>{{ row.total_enrollment_excludes_ae|fmt_int }}</td>
+              <td>
+                {% if row.website_normalized %}
+                  <a href="{{ row.website_normalized }}" target="_blank" rel="noopener">{{ row.website }}</a>
+                {% else %}
+                  {{ row.website }}
+                {% endif %}
+              </td>
+              <td>{% if row.has_searchable_website %}<span class="status good">Yes</span>{% else %}<span class="status warn">No</span>{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <div class="pagination">
+        {% if page > 1 %}
+          <a class="button-link" href="{{ url_for('districts_page', state=state, q=query, sort=sort, direction=direction, page=page-1) }}">Previous</a>
+        {% endif %}
+        {% if page * per_page < total %}
+          <a class="button-link" href="{{ url_for('districts_page', state=state, q=query, sort=sort, direction=direction, page=page+1) }}">Next</a>
+        {% endif %}
+      </div>
+    {% else %}
+      <p class="empty">No districts match the current filters.</p>
+    {% endif %}
+  </section>
+{% endblock %}

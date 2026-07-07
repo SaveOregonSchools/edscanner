@@ -1,0 +1,87 @@
+{% extends "base.html" %}
+
+{% block title %}Import Districts - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Import Districts</h2>
+    <div class="metric-inline">
+      <span>Loaded districts</span>
+      <strong>{{ stats.district_count|fmt_int }}</strong>
+    </div>
+  </section>
+
+  <section class="tool-surface">
+    <form method="post">
+      <label for="source_file">Source file</label>
+      <select id="source_file" name="source_file">
+        <option value="__auto__">Auto-select newest import file</option>
+        {% for file in files %}
+          <option value="{{ file.name }}">{{ file.name }}</option>
+        {% endfor %}
+      </select>
+      <button type="submit">Run import</button>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <h2>Available Files</h2>
+    {% if files %}
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Size</th>
+            <th>Modified</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for file in files %}
+            <tr>
+              <td>{{ file.name }}</td>
+              <td>{{ file.size|fmt_int }} bytes</td>
+              <td>{{ file.modified }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No CSV or XLSX files found in imports.</p>
+    {% endif %}
+  </section>
+
+  {% if summary %}
+    <section class="content-section">
+      <h2>Import Summary</h2>
+      <div class="summary-grid">
+        <div><span>Rows read</span><strong>{{ summary.rows_read|fmt_int }}</strong></div>
+        <div><span>Inserted</span><strong>{{ summary.districts_inserted|fmt_int }}</strong></div>
+        <div><span>Updated</span><strong>{{ summary.districts_updated|fmt_int }}</strong></div>
+        <div><span>Searchable</span><strong>{{ summary.searchable_websites|fmt_int }}</strong></div>
+        <div><span>Missing websites</span><strong>{{ summary.skipped_missing_websites|fmt_int }}</strong></div>
+        <div><span>States</span><strong>{{ summary.states_found|length }}</strong></div>
+        <div><span>Agency types</span><strong>{{ summary.agency_types_found|length }}</strong></div>
+      </div>
+      <table class="key-table">
+        <tbody>
+          <tr>
+            <th>Source</th>
+            <td><code>{{ summary.source_file }}</code></td>
+          </tr>
+          <tr>
+            <th>Header row</th>
+            <td>{{ summary.header_row_number }}</td>
+          </tr>
+          <tr>
+            <th>Website field</th>
+            <td>{{ summary.field_mapping.website }}</td>
+          </tr>
+          <tr>
+            <th>Enrollment field</th>
+            <td>{{ summary.field_mapping.total_enrollment_excludes_ae }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  {% endif %}
+{% endblock %}

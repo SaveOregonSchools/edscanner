@@ -1,0 +1,165 @@
+{% extends "base.html" %}
+
+{% block title %}Run #{{ run.id }} - EdScanner{% endblock %}
+
+{% block head_extra %}
+  {% if run.status in ["queued", "running"] %}
+    <meta http-equiv="refresh" content="15">
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Run #{{ run.id }}</h2>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('search_page') }}">New search</a>
+      <a class="button-link" href="{{ url_for('run_detail', run_id=run.id) }}">Refresh</a>
+      {% if run.debug_log_path %}
+        <a class="button-link" href="{{ url_for('debug_log_file', run_id=run.id) }}" target="_blank" rel="noopener">Debug log</a>
+      {% endif %}
+      <a class="button-link primary" href="{{ url_for('export_run', run_id=run.id) }}">Export CSV</a>
+      {% if run.status in ["queued", "running"] and not run.cancel_requested %}
+        <form method="post" action="{{ url_for('cancel_run', run_id=run.id) }}" class="inline-action">
+          <button type="submit" class="danger">Cancel</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if run.cancel_requested and run.status in ["queued", "running"] %}
+    <p class="status-note">Cancellation has been requested. The run will stop after the current page or district finishes.</p>
+  {% elif run.status in ["queued", "running"] %}
+    <p class="status-note">This page auto-refreshes every 15 seconds while the run is queued or running.</p>
+  {% endif %}
+
+  <section class="stat-grid compact" aria-label="Run status">
+    <div class="stat">
+      <span class="stat-label">Status</span>
+      <strong>{{ run.status }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Matched by filters</span>
+      <strong>{{ run.districts_matched|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Planned this run</span>
+      <strong>{{ planned_districts|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Searched</span>
+      <strong>{{ run.districts_searched|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">In progress</span>
+      <strong>{{ in_progress_count|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Left to go</span>
+      <strong>{{ left_count|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">No result</span>
+      <strong>{{ no_result_count|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Hits so far</span>
+      <strong>{{ result_count|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Failed</span>
+      <strong>{{ run.districts_failed|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Elapsed</span>
+      <strong>{{ elapsed or "" }}</strong>
+    </div>
+  </section>
+
+  <section class="content-section">
+    <h2>Search</h2>
+    <table class="key-table">
+      <tbody>
+        <tr>
+          <th>Query</th>
+          <td>{{ run.query_text }}</td>
+        </tr>
+        <tr>
+          <th>States</th>
+          <td>{{ states|join(", ") if states else "All" }}</td>
+        </tr>
+        <tr>
+          <th>Agency types</th>
+          <td>{{ agency_types|join(", ") if agency_types else "All" }}</td>
+        </tr>
+        <tr>
+          <th>Enrollment</th>
+          <td>{{ run.min_enrollment|fmt_int or "Any" }} to {{ run.max_enrollment|fmt_int or "Any" }}</td>
+        </tr>
+        <tr>
+          <th>Limits</th>
+          <td>{{ run.max_districts|fmt_int or "Default" }} districts, {{ run.max_pages_per_district|fmt_int or "Default" }} pages per district</td>
+        </tr>
+        <tr>
+          <th>Debug logging</th>
+          <td>
+            {% if run.debug_logging %}
+              Enabled{% if run.debug_log_path %} - <a href="{{ url_for('debug_log_file', run_id=run.id) }}" target="_blank" rel="noopener">open log</a>{% endif %}
+            {% else %}
+              Disabled
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
+          <th>Started</th>
+          <td>{{ run.started_at|fmt_dt }}</td>
+        </tr>
+        <tr>
+          <th>Finished</th>
+          <td>{{ run.finished_at|fmt_dt }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="content-section">
+    <h2>Results</h2>
+    {% if groups %}
+      {% for key, rows in groups.items() %}
+        {% set first = rows[0] %}
+        <article class="result-group">
+          <header class="result-group-header">
+            <div>
+              <h3>{{ first.district_name }}</h3>
+              <p>{{ first.state }} · {{ first.agency_type }} · Enrollment {{ first.total_enrollment_excludes_ae|fmt_int }}</p>
+            </div>
+            <a href="{{ first.website }}" target="_blank" rel="noopener">{{ first.website }}</a>
+          </header>
+          <table>
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Title</th>
+                <th>Score</th>
+                <th>Snippet</th>
+                <th>URL</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for result in rows %}
+                <tr>
+                  <td>{{ result.result_rank }}</td>
+                  <td>{{ result.title or "(untitled)" }}</td>
+                  <td>{{ "%.1f"|format(result.score) }}</td>
+                  <td class="snippet">{{ result.snippet|highlight(run.query_text) }}</td>
+                  <td><a href="{{ result.url }}" target="_blank" rel="noopener">{{ result.url }}</a></td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+      {% endfor %}
+    {% else %}
+      <p class="empty">No matching pages were stored for this run.</p>
+    {% endif %}
+  </section>
+{% endblock %}

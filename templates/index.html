@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+
+{% block title %}EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Dashboard</h2>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('import_page') }}">Import districts</a>
+      <a class="button-link primary" href="{{ url_for('search_page') }}">Search websites</a>
+    </div>
+  </section>
+
+  <section class="stat-grid" aria-label="Database status">
+    <div class="stat">
+      <span class="stat-label">Districts</span>
+      <strong>{{ stats.district_count|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Searchable websites</span>
+      <strong>{{ stats.searchable_count|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">State coverage</span>
+      <strong>{{ stats.state_display }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Agency types</span>
+      <strong>{{ stats.agency_type_count|fmt_int }}</strong>
+    </div>
+  </section>
+
+  <section class="content-section">
+    <h2>Database</h2>
+    <table class="key-table">
+      <tbody>
+        <tr>
+          <th>Status</th>
+          <td>{% if stats.db_exists %}<span class="status good">Ready</span>{% else %}<span class="status warn">Not created</span>{% endif %}</td>
+        </tr>
+        <tr>
+          <th>Path</th>
+          <td><code>{{ stats.db_path }}</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="content-section">
+    <h2>Recent Runs</h2>
+    {% if recent_runs %}
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Query</th>
+            <th>Status</th>
+            <th>Matched</th>
+            <th>Searched</th>
+            <th>Failed</th>
+            <th>Started</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for run in recent_runs %}
+            <tr>
+              <td><a href="{{ url_for('run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
+              <td>{{ run.query_text }}</td>
+              <td><span class="status {{ run.status }}">{{ run.status }}</span></td>
+              <td>{{ run.districts_matched|fmt_int }}</td>
+              <td>{{ run.districts_searched|fmt_int }}</td>
+              <td>{{ run.districts_failed|fmt_int }}</td>
+              <td>{{ run.started_at|fmt_dt }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No search runs yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

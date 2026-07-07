@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}EdScanner{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+    {% block head_extra %}{% endblock %}
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="brand">
+        <a class="home-mark" href="{{ url_for('index') }}" aria-label="Home">E</a>
+        <div>
+          <h1>EdScanner</h1>
+          <p class="subtitle">Public school district website search</p>
+        </div>
+      </div>
+      <div class="header-actions">
+        <nav class="nav-links" aria-label="Main navigation">
+          <a href="{{ url_for('index') }}">Home</a>
+          <a href="{{ url_for('import_page') }}">Import</a>
+          <a href="{{ url_for('search_page') }}">Search</a>
+          <a href="{{ url_for('districts_page') }}">Districts</a>
+        </nav>
+        <a class="brand-link" href="https://www.saveoregonschools.com/" target="_blank" rel="noopener" aria-label="Save Oregon Schools website">
+          <img class="brand-logo" src="{{ url_for('static', filename='save-oregon-schools-logo.png') }}" alt="Save Oregon Schools">
+        </a>
+      </div>
+    </header>
+
+    <main>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="messages">
+            {% for category, message in messages %}
+              <div class="message {{ category }}">{{ message }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </main>
+
+    <footer class="footer">
+      Copyright &copy; {{ year }} Save Oregon Schools, LLC.
+      <a href="https://www.saveoregonschools.com">www.saveoregonschools.com</a>
+      |
+      <a href="https://github.com/SaveOregonSchools">Check out all our apps on GitHub</a>
+    </footer>
+  </body>
+</html>
