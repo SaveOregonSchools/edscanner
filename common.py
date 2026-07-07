@@ -17,6 +17,42 @@ IMPORTS_DIR = APP_ROOT / "imports"
 EXPORTS_DIR = APP_ROOT / "exports"
 LOGS_DIR = APP_ROOT / "logs"
 SEARCH_RUN_LOGS_DIR = LOGS_DIR / "search_runs"
+ENV_PATH = APP_ROOT / ".env"
+
+
+def parse_env_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return key, value
+
+
+def read_env_file(path: Path | str | None = None) -> dict[str, str]:
+    env_path = Path(path or ENV_PATH)
+    if not env_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        parsed = parse_env_line(line)
+        if parsed:
+            key, value = parsed
+            values[key] = value
+    return values
+
+
+def load_local_env(path: Path | str | None = None) -> None:
+    for key, value in read_env_file(path).items():
+        os.environ.setdefault(key, value)
+
+
+load_local_env()
 
 DEFAULT_DB_PATH = DATA_DIR / "edscanner.db"
 DB_PATH = Path(os.getenv("EDSCANNER_DB_PATH", DEFAULT_DB_PATH)).expanduser().resolve()
@@ -64,6 +100,44 @@ MAX_PDF_SIZE_BYTES = _env_int("EDSCANNER_MAX_PDF_SIZE_MB", 10, minimum=1) * 1024
 MAX_HTML_SIZE_BYTES = _env_int("EDSCANNER_MAX_HTML_SIZE_MB", 5, minimum=1) * 1024 * 1024
 MAX_TOTAL_DISTRICTS_PER_RUN = _env_int("EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN", 25, minimum=1)
 VERIFY_SSL = _env_bool("EDSCANNER_VERIFY_SSL", True)
+BRAVE_SEARCH_API_KEY_ENV = "BRAVE_SEARCH_API_KEY"
+
+
+def quote_env_value(value: str) -> str:
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def get_local_setting(name: str, default: str = "") -> str:
+    return os.getenv(name) or read_env_file().get(name, default)
+
+
+def set_local_setting(name: str, value: str) -> None:
+    ensure_directories()
+    value = str(value or "").strip()
+    lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
+    out: list[str] = []
+    found = False
+    for line in lines:
+        parsed = parse_env_line(line)
+        if parsed and parsed[0] == name:
+            found = True
+            if value:
+                out.append(f"{name}={quote_env_value(value)}")
+        else:
+            out.append(line)
+    if value and not found:
+        out.append(f"{name}={quote_env_value(value)}")
+    text = "\n".join(out).strip()
+    ENV_PATH.write_text((text + "\n") if text else "", encoding="utf-8")
+    if value:
+        os.environ[name] = value
+    else:
+        os.environ.pop(name, None)
+
+
+def has_brave_search_api_key() -> bool:
+    return bool(get_local_setting(BRAVE_SEARCH_API_KEY_ENV).strip())
 
 
 STATE_NAME_TO_ABBR = {
@@ -239,6 +313,10 @@ def init_db(db_path: Path | str | None = None) -> None:
                 max_enrollment INTEGER,
                 max_districts INTEGER,
                 max_pages_per_district INTEGER,
+                search_method TEXT NOT NULL DEFAULT 'crawler',
+                search_provider TEXT,
+                api_results_per_district INTEGER,
+                follow_depth INTEGER NOT NULL DEFAULT 0,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
                 debug_logging INTEGER NOT NULL DEFAULT 0,
                 debug_log_path TEXT,
@@ -265,6 +343,7 @@ def init_db(db_path: Path | str | None = None) -> None:
                 title TEXT,
                 content_type TEXT,
                 status_code INTEGER,
+                search_source TEXT,
                 score REAL NOT NULL DEFAULT 0,
                 snippet TEXT,
                 matched_terms_json TEXT,
@@ -285,12 +364,26 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE search_runs ADD COLUMN max_districts INTEGER;")
         if "max_pages_per_district" not in existing_columns:
             conn.execute("ALTER TABLE search_runs ADD COLUMN max_pages_per_district INTEGER;")
+        if "search_method" not in existing_columns:
+            conn.execute("ALTER TABLE search_runs ADD COLUMN search_method TEXT NOT NULL DEFAULT 'crawler';")
+        if "search_provider" not in existing_columns:
+            conn.execute("ALTER TABLE search_runs ADD COLUMN search_provider TEXT;")
+        if "api_results_per_district" not in existing_columns:
+            conn.execute("ALTER TABLE search_runs ADD COLUMN api_results_per_district INTEGER;")
+        if "follow_depth" not in existing_columns:
+            conn.execute("ALTER TABLE search_runs ADD COLUMN follow_depth INTEGER NOT NULL DEFAULT 0;")
         if "cancel_requested" not in existing_columns:
             conn.execute("ALTER TABLE search_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;")
         if "debug_logging" not in existing_columns:
             conn.execute("ALTER TABLE search_runs ADD COLUMN debug_logging INTEGER NOT NULL DEFAULT 0;")
         if "debug_log_path" not in existing_columns:
             conn.execute("ALTER TABLE search_runs ADD COLUMN debug_log_path TEXT;")
+        existing_result_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(search_results)")
+        }
+        if "search_source" not in existing_result_columns:
+            conn.execute("ALTER TABLE search_results ADD COLUMN search_source TEXT;")
         conn.commit()
 
 

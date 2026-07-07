@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import unittest
 from pathlib import Path
@@ -19,6 +20,26 @@ from search_engine import (
 
 class LocalSiteHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith("/api/search"):
+            body = json.dumps(
+                {
+                    "web": {
+                        "results": [
+                            {
+                                "title": "Community Schools Policy",
+                                "url": f"http://{self.headers['Host']}/policy.html",
+                                "description": "The district supports community schools partnerships.",
+                            }
+                        ]
+                    }
+                }
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if self.path == "/robots.txt":
             self.send_response(404)
             self.end_headers()
@@ -99,6 +120,37 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(results[0]["content_type"], "text/html")
         self.assertIn("/policy.html", results[0]["url"])
         self.assertGreater(results[0]["score"], 0)
+        self.assertIn("community schools", results[0]["snippet"].casefold())
+
+    def test_brave_search_uses_api_results_and_fetches_page(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), LocalSiteHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            base_url = f"http://127.0.0.1:{server.server_address[1]}/"
+            results = search_district(
+                {"agency_name": "Local District", "website_normalized": base_url},
+                "community schools",
+                SearchSettings(
+                    search_method="brave",
+                    brave_api_key="test-key",
+                    brave_endpoint=f"{base_url}api/search",
+                    api_results_per_district=3,
+                    follow_depth=0,
+                    max_pages_per_district=5,
+                    max_results_per_district=5,
+                    request_timeout_seconds=2,
+                    delay_seconds=0,
+                ),
+            )
+        finally:
+            server.shutdown()
+            thread.join(timeout=2)
+            server.server_close()
+
+        self.assertTrue(results)
+        self.assertIn("/policy.html", results[0]["url"])
+        self.assertEqual(results[0]["search_source"], "brave+fetch")
         self.assertIn("community schools", results[0]["snippet"].casefold())
 
     def test_run_search_stores_results_and_exports_csv(self):

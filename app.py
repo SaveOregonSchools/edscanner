@@ -15,6 +15,7 @@ from flask import Flask, Response, abort, flash, redirect, render_template, requ
 from markupsafe import Markup, escape
 
 from common import (
+    BRAVE_SEARCH_API_KEY_ENV,
     IMPORTS_DIR,
     MAX_PAGES_PER_DISTRICT,
     MAX_TOTAL_DISTRICTS_PER_RUN,
@@ -24,8 +25,11 @@ from common import (
     connect_db,
     current_db_path,
     discover_import_files,
+    get_local_setting,
+    has_brave_search_api_key,
     init_db,
     list_filter_options,
+    set_local_setting,
     utc_now_iso,
 )
 from import_districts import ImportErrorWithContext, import_districts
@@ -35,6 +39,7 @@ from search_engine import (
     create_search_run,
     execute_search_run,
     export_search_run_csv,
+    normalize_search_method,
     parse_optional_int,
 )
 
@@ -220,6 +225,33 @@ def import_page():
     return render_template("import.html", files=files, stats=stats, summary=summary)
 
 
+@app.route("/settings", methods=["GET", "POST"])
+def settings_page():
+    if request.method == "POST":
+        action = request.form.get("action", "save")
+        if action == "clear_brave_key":
+            set_local_setting(BRAVE_SEARCH_API_KEY_ENV, "")
+            flash("Brave Search API key cleared.", "success")
+        else:
+            api_key = request.form.get("brave_api_key", "").strip()
+            if not api_key:
+                flash("Enter a Brave Search API key or use Clear key.", "error")
+            else:
+                set_local_setting(BRAVE_SEARCH_API_KEY_ENV, api_key)
+                flash("Brave Search API key saved to the local .env file.", "success")
+        return redirect(url_for("settings_page"))
+
+    key_present = has_brave_search_api_key()
+    key = get_local_setting(BRAVE_SEARCH_API_KEY_ENV)
+    masked_key = f"{key[:6]}...{key[-4:]}" if len(key) > 12 else "saved" if key_present else ""
+    return render_template(
+        "settings.html",
+        key_present=key_present,
+        masked_key=masked_key,
+        env_key_name=BRAVE_SEARCH_API_KEY_ENV,
+    )
+
+
 @app.route("/districts")
 def districts_page():
     state = request.args.get("state", "").strip()
@@ -289,7 +321,14 @@ def search_page():
     max_enrollment = parse_optional_int(request.args.get("max_enrollment"))
     max_districts = parse_optional_int(request.args.get("max_districts")) or MAX_TOTAL_DISTRICTS_PER_RUN
     max_pages_per_district = parse_optional_int(request.args.get("max_pages_per_district")) or MAX_PAGES_PER_DISTRICT
+    brave_key_present = has_brave_search_api_key()
+    default_method = "brave" if brave_key_present else "crawler"
+    search_method = normalize_search_method(request.values.get("search_method") or default_method)
+    api_results_per_district = clamp_int(parse_optional_int(request.values.get("api_results_per_district")), 10, 1, 20)
+    follow_depth = clamp_int(parse_optional_int(request.values.get("follow_depth")), 0, 0, 2)
     match_count = count_matching_districts(states, agency_types, min_enrollment, max_enrollment)
+    estimated_api_calls = min(match_count, max_districts) if search_method in {"brave", "hybrid"} else 0
+    estimated_brave_cost = estimated_api_calls * 0.005
     with connect_db() as conn:
         recent_runs = conn.execute(
             """
@@ -309,6 +348,12 @@ def search_page():
         max_enrollment=max_enrollment,
         max_districts=max_districts,
         max_pages_per_district=max_pages_per_district,
+        search_method=search_method,
+        api_results_per_district=api_results_per_district,
+        follow_depth=follow_depth,
+        brave_key_present=brave_key_present,
+        estimated_api_calls=estimated_api_calls,
+        estimated_brave_cost=estimated_brave_cost,
         query_text=request.values.get("query_text", ""),
         match_count=match_count,
         recent_runs=recent_runs,
@@ -334,9 +379,15 @@ def run_search_route():
         1,
         500,
     )
+    search_method = normalize_search_method(request.form.get("search_method"))
+    api_results_per_district = clamp_int(parse_optional_int(request.form.get("api_results_per_district")), 10, 1, 20)
+    follow_depth = clamp_int(parse_optional_int(request.form.get("follow_depth")), 0, 0, 2)
     debug_logging = request.form.get("debug_logging", "").casefold() in {"1", "true", "yes", "on"}
     if not query_text:
         flash("Search text is required.", "error")
+        return redirect(url_for("search_page"))
+    if search_method in {"brave", "hybrid"} and not has_brave_search_api_key():
+        flash("Save a Brave Search API key in Settings before using Brave or Hybrid search.", "error")
         return redirect(url_for("search_page"))
     try:
         run_id = create_search_run(
@@ -347,7 +398,13 @@ def run_search_route():
             max_enrollment=max_enrollment,
             max_districts=max_districts,
             debug_logging=debug_logging,
-            settings=SearchSettings(max_pages_per_district=max_pages_per_district),
+            settings=SearchSettings(
+                max_pages_per_district=max_pages_per_district,
+                search_method=search_method,
+                api_results_per_district=api_results_per_district,
+                follow_depth=follow_depth,
+                brave_api_key=get_local_setting(BRAVE_SEARCH_API_KEY_ENV),
+            ),
             status="queued",
         )
         enqueue_search_run(run_id)

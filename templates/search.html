@@ -61,9 +61,40 @@
         <label for="max_pages_per_district">Max pages per district</label>
         <input id="max_pages_per_district" name="max_pages_per_district" type="number" min="1" max="500" value="{{ max_pages_per_district }}">
       </div>
+      <div>
+        <label for="search_method">Search method</label>
+        <select id="search_method" name="search_method">
+          <option value="brave" {% if search_method == "brave" %}selected{% endif %}>Brave API first</option>
+          <option value="hybrid" {% if search_method == "hybrid" %}selected{% endif %}>Brave with crawler fallback</option>
+          <option value="crawler" {% if search_method == "crawler" %}selected{% endif %}>Crawler only</option>
+        </select>
+      </div>
+      <div>
+        <label for="api_results_per_district">API results per district</label>
+        <input id="api_results_per_district" name="api_results_per_district" type="number" min="1" max="20" value="{{ api_results_per_district }}">
+      </div>
+      <div>
+        <label for="follow_depth">Follow depth</label>
+        <select id="follow_depth" name="follow_depth">
+          <option value="0" {% if follow_depth == 0 %}selected{% endif %}>0 - result pages only</option>
+          <option value="1" {% if follow_depth == 1 %}selected{% endif %}>1 - one page deeper</option>
+          <option value="2" {% if follow_depth == 2 %}selected{% endif %}>2 - two pages deeper</option>
+        </select>
+      </div>
       <div class="checkbox-field">
         <input id="debug_logging" name="debug_logging" type="checkbox" value="1">
         <label for="debug_logging">Capture debug log</label>
+      </div>
+
+      <div class="search-estimate full">
+        {% if search_method in ["brave", "hybrid"] %}
+          <span>Brave key: {{ "saved" if brave_key_present else "not saved" }}</span>
+          <span>Estimated API calls: <strong>{{ estimated_api_calls|fmt_int }}</strong></span>
+          <span>Approximate listed API cost: <strong>${{ "%.2f"|format(estimated_brave_cost) }}</strong></span>
+          <a href="{{ url_for('settings_page') }}">Settings</a>
+        {% else %}
+          <span>Crawler-only runs do not use search API calls.</span>
+        {% endif %}
       </div>
 
       <div class="form-actions full">

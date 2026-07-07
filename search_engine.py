@@ -20,6 +20,7 @@ from bs4 import BeautifulSoup
 from requests.exceptions import SSLError
 
 from common import (
+    BRAVE_SEARCH_API_KEY_ENV,
     MAX_HTML_SIZE_BYTES,
     MAX_PAGES_PER_DISTRICT,
     MAX_PDF_SIZE_BYTES,
@@ -31,6 +32,7 @@ from common import (
     USER_AGENT,
     VERIFY_SSL,
     connect_db,
+    get_local_setting,
     init_db,
     json_dumps,
     normalize_website,
@@ -39,6 +41,9 @@ from common import (
 
 
 LOGGER = logging.getLogger(__name__)
+SEARCH_METHODS = {"crawler", "brave", "hybrid"}
+MAX_API_RESULTS_PER_DISTRICT = 20
+MAX_FOLLOW_DEPTH = 2
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,12 @@ class SearchSettings:
     max_total_districts_per_run: int = MAX_TOTAL_DISTRICTS_PER_RUN
     user_agent: str = USER_AGENT
     verify_ssl: bool = VERIFY_SSL
+    search_method: str = "crawler"
+    search_provider: str = "brave"
+    api_results_per_district: int = 10
+    follow_depth: int = 0
+    brave_api_key: str = ""
+    brave_endpoint: str = "https://api.search.brave.com/res/v1/web/search"
 
 
 class RunDebugLogger:
@@ -473,7 +484,7 @@ def discover_seed_urls(
     return queue
 
 
-def search_district(
+def _search_district_crawler(
     district: dict[str, Any],
     query_text: str,
     settings: SearchSettings | None = None,
@@ -613,6 +624,7 @@ def search_district(
                     continue
                 result_urls.add(match["url"])
                 match["status_code"] = status_code
+                match["search_source"] = "crawler"
                 results.append(match)
                 debug_log(
                     debug_logger,
@@ -663,6 +675,296 @@ def search_district(
     return top_results
 
 
+def normalize_search_method(value: str | None) -> str:
+    method = str(value or "crawler").strip().casefold()
+    return method if method in SEARCH_METHODS else "crawler"
+
+
+def clamp_api_results(value: int | None) -> int:
+    if value is None:
+        value = 10
+    return max(1, min(int(value), MAX_API_RESULTS_PER_DISTRICT))
+
+
+def clamp_follow_depth(value: int | None) -> int:
+    if value is None:
+        value = 0
+    return max(0, min(int(value), MAX_FOLLOW_DEPTH))
+
+
+def strip_search_markup(value: str | None) -> str:
+    if not value:
+        return ""
+    return collapse_ws(BeautifulSoup(str(value), "html.parser").get_text(" "))
+
+
+def site_search_query(query_text: str, base_url: str) -> str:
+    host = _core_host(_host(base_url))
+    query = str(query_text or "").strip()
+    if not query.startswith('"') and not query.endswith('"'):
+        query = f'"{query}"'
+    return f"{query} site:{host}"
+
+
+def brave_api_search(
+    query_text: str,
+    base_url: str,
+    settings: SearchSettings,
+    debug_logger: RunDebugLogger | None = None,
+) -> list[dict[str, Any]]:
+    api_key = settings.brave_api_key or get_local_setting(BRAVE_SEARCH_API_KEY_ENV)
+    if not api_key:
+        raise RuntimeError("Brave Search API key is required for Brave search mode.")
+
+    session = make_session(settings)
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "X-Subscription-Token": api_key,
+        }
+    )
+    query = site_search_query(query_text, base_url)
+    params = {
+        "q": query,
+        "count": clamp_api_results(settings.api_results_per_district),
+        "safesearch": "off",
+        "search_lang": "en",
+    }
+    debug_log(debug_logger, "brave_request", query=query, count=params["count"])
+    response = request_get(
+        session,
+        settings.brave_endpoint,
+        settings,
+        params=params,
+        timeout=settings.request_timeout_seconds,
+    )
+    response.raise_for_status()
+    data = response.json()
+    raw_results = data.get("web", {}).get("results", []) if isinstance(data, dict) else []
+    results: list[dict[str, Any]] = []
+    for rank, item in enumerate(raw_results, start=1):
+        if not isinstance(item, dict):
+            continue
+        url = canonical_url(str(item.get("url") or ""))
+        if not url or not same_organization_url(url, base_url):
+            debug_log(debug_logger, "brave_result_skipped", url=url, rank=rank, reason="outside_scope")
+            continue
+        title = strip_search_markup(item.get("title"))
+        snippet = strip_search_markup(item.get("description"))
+        result = {
+            "url": url,
+            "title": title[:500] or filename_title(url),
+            "content_type": "search/api",
+            "status_code": None,
+            "search_source": "brave",
+            "score": max(5.0, 55.0 - rank),
+            "snippet": snippet[:1000],
+            "matched_terms": [query_text],
+        }
+        results.append(result)
+        debug_log(debug_logger, "brave_result", rank=rank, url=url, title=result["title"], snippet=result["snippet"])
+    return results
+
+
+def enqueue_brave_url(queue: OrderedDict[str, int], url: str, base_url: str, depth: int, max_size: int) -> None:
+    url = canonical_url(url)
+    if not url or len(queue) >= max_size:
+        return
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return
+    if not same_organization_url(url, base_url):
+        return
+    queue.setdefault(url, depth)
+
+
+def _search_district_brave(
+    district: dict[str, Any],
+    query_text: str,
+    settings: SearchSettings,
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+    debug_logger: RunDebugLogger | None = None,
+) -> list[dict[str, Any]]:
+    base_url = district.get("website_normalized") or normalize_website(district.get("website"))[0]
+    if not base_url:
+        debug_log(debug_logger, "district_skipped", district=district.get("agency_name"), reason="missing_website")
+        return []
+
+    api_results = brave_api_search(query_text, base_url, settings, debug_logger)
+    result_map: dict[str, dict[str, Any]] = {result["url"]: result for result in api_results}
+    session = make_session(settings)
+    robots, _robots_sitemaps = load_robots(session, base_url, settings)
+    queue: OrderedDict[str, int] = OrderedDict()
+    max_pages = max(1, settings.max_pages_per_district)
+    follow_depth = clamp_follow_depth(settings.follow_depth)
+    for result in api_results:
+        enqueue_brave_url(queue, result["url"], base_url, 0, max_pages * 4)
+
+    visited: set[str] = set()
+    fetched_final_urls: set[str] = set()
+    crawl_base_url = base_url
+    debug_log(
+        debug_logger,
+        "brave_fetch_start",
+        district=district.get("agency_name"),
+        api_results=len(api_results),
+        follow_depth=follow_depth,
+        max_pages=max_pages,
+    )
+    while queue and len(visited) < max_pages:
+        if cancel_requested and cancel_requested():
+            debug_log(debug_logger, "district_cancelled", district=district.get("agency_name"), visited=len(visited))
+            break
+        url, depth = queue.popitem(last=False)
+        url = canonical_url(url)
+        if url in visited:
+            continue
+        if not same_organization_url(url, crawl_base_url):
+            debug_log(debug_logger, "page_skipped", district=district.get("agency_name"), url=url, reason="outside_scope")
+            continue
+        if not can_fetch(robots, settings, url):
+            debug_log(debug_logger, "page_skipped", district=district.get("agency_name"), url=url, reason="robots")
+            continue
+        visited.add(url)
+
+        try:
+            response, content = fetch_limited(session, url, settings)
+            status_code = response.status_code
+            final_url = canonical_url(response.url)
+            if status_code >= 400:
+                debug_log(debug_logger, "page_fetched", url=url, final_url=final_url, status_code=status_code, matched=False)
+                continue
+            if final_url in fetched_final_urls:
+                continue
+            fetched_final_urls.add(final_url)
+            content_type_header = response.headers.get("Content-Type", "").casefold()
+            is_pdf = "application/pdf" in content_type_header or urlparse(final_url).path.casefold().endswith(".pdf")
+            if is_pdf:
+                content_type = "application/pdf"
+                title = filename_title(final_url)
+                headings: list[str] = []
+                try:
+                    text = parse_pdf(content)
+                except Exception as exc:
+                    debug_log(debug_logger, "page_fetched", url=url, final_url=final_url, status_code=status_code, matched=False, error=str(exc))
+                    continue
+            elif "html" in content_type_header or "text/plain" in content_type_header or not content_type_header:
+                content_type = "text/html"
+                title, headings, text, links = parse_html(content, final_url)
+                if depth < follow_depth:
+                    for link in links:
+                        enqueue_brave_url(queue, link, crawl_base_url, depth + 1, max_pages * 4)
+            else:
+                debug_log(
+                    debug_logger,
+                    "page_fetched",
+                    url=url,
+                    final_url=final_url,
+                    status_code=status_code,
+                    content_type=content_type_header,
+                    matched=False,
+                    reason="unsupported_content_type",
+                )
+                continue
+
+            match = score_match(query_text, title, headings, text, final_url, content_type)
+            if match:
+                match["status_code"] = status_code
+                match["search_source"] = "brave+fetch" if depth == 0 else "brave-follow"
+                match["score"] += 20 if depth == 0 else 8
+                result_map[match["url"]] = match
+                debug_log(
+                    debug_logger,
+                    "page_result",
+                    district=district.get("agency_name"),
+                    url=final_url,
+                    status_code=status_code,
+                    content_type=content_type,
+                    matched=True,
+                    depth=depth,
+                    score=match["score"],
+                )
+            else:
+                debug_log(
+                    debug_logger,
+                    "page_result",
+                    district=district.get("agency_name"),
+                    url=final_url,
+                    status_code=status_code,
+                    content_type=content_type,
+                    matched=False,
+                    depth=depth,
+                    title=title,
+                )
+        except Exception as exc:
+            LOGGER.info("Brave result fetch/search failed for %s: %s", url, exc)
+            debug_log(debug_logger, "page_error", district=district.get("agency_name"), url=url, error=str(exc))
+        finally:
+            if settings.delay_seconds:
+                time.sleep(settings.delay_seconds)
+
+    top_results = sorted(result_map.values(), key=lambda item: item["score"], reverse=True)[: settings.max_results_per_district]
+    debug_log(
+        debug_logger,
+        "district_finish",
+        district=district.get("agency_name"),
+        visited=len(visited),
+        stored_results=len(top_results),
+        result_urls=[result["url"] for result in top_results],
+    )
+    return top_results
+
+
+def search_district(
+    district: dict[str, Any],
+    query_text: str,
+    settings: SearchSettings | None = None,
+    *,
+    cancel_requested: Callable[[], bool] | None = None,
+    debug_logger: RunDebugLogger | None = None,
+) -> list[dict[str, Any]]:
+    settings = settings or SearchSettings()
+    method = normalize_search_method(settings.search_method)
+    if method == "crawler":
+        return _search_district_crawler(
+            district,
+            query_text,
+            settings,
+            cancel_requested=cancel_requested,
+            debug_logger=debug_logger,
+        )
+    if method == "brave":
+        return _search_district_brave(
+            district,
+            query_text,
+            settings,
+            cancel_requested=cancel_requested,
+            debug_logger=debug_logger,
+        )
+
+    try:
+        brave_results = _search_district_brave(
+            district,
+            query_text,
+            settings,
+            cancel_requested=cancel_requested,
+            debug_logger=debug_logger,
+        )
+        if brave_results:
+            return brave_results
+    except Exception as exc:
+        LOGGER.info("Brave search failed for %s; falling back to crawler: %s", district.get("agency_name"), exc)
+        debug_log(debug_logger, "brave_fallback", district=district.get("agency_name"), error=str(exc))
+    return _search_district_crawler(
+        district,
+        query_text,
+        settings,
+        cancel_requested=cancel_requested,
+        debug_logger=debug_logger,
+    )
+
+
 def create_search_run(
     query_text: str,
     states: list[str] | None = None,
@@ -683,6 +985,10 @@ def create_search_run(
     settings = settings or SearchSettings()
     cap = max_districts or settings.max_total_districts_per_run
     cap = max(1, min(cap, settings.max_total_districts_per_run))
+    search_method = normalize_search_method(settings.search_method)
+    search_provider = "brave" if search_method in {"brave", "hybrid"} else "crawler"
+    api_results_per_district = clamp_api_results(settings.api_results_per_district)
+    follow_depth = clamp_follow_depth(settings.follow_depth)
     states = _clean_list(states)
     agency_types = _clean_list(agency_types)
     matched_count = count_matching_districts(states, agency_types, min_enrollment, max_enrollment, db_path)
@@ -694,10 +1000,12 @@ def create_search_run(
             INSERT INTO search_runs (
                 query_text, states_json, agency_types_json, min_enrollment,
                 max_enrollment, max_districts, max_pages_per_district,
+                search_method, search_provider, api_results_per_district,
+                follow_depth,
                 cancel_requested, debug_logging, debug_log_path, status,
                 districts_matched, districts_searched, districts_failed, started_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, 0, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, 0, 0, ?)
             """,
             (
                 query_text,
@@ -707,6 +1015,10 @@ def create_search_run(
                 max_enrollment,
                 cap,
                 settings.max_pages_per_district,
+                search_method,
+                search_provider,
+                api_results_per_district,
+                follow_depth,
                 1 if debug_logging else 0,
                 status,
                 matched_count,
@@ -745,6 +1057,10 @@ def execute_search_run(
         max_enrollment = run["max_enrollment"]
         cap = run["max_districts"] or MAX_TOTAL_DISTRICTS_PER_RUN
         max_pages = run["max_pages_per_district"] or MAX_PAGES_PER_DISTRICT
+        search_method = normalize_search_method(run["search_method"])
+        search_provider = run["search_provider"] or ("brave" if search_method in {"brave", "hybrid"} else "crawler")
+        api_results_per_district = clamp_api_results(run["api_results_per_district"])
+        follow_depth = clamp_follow_depth(run["follow_depth"])
         matched_count = run["districts_matched"] or 0
         debug_enabled = bool(run["debug_logging"])
         already_cancelled = bool(run["cancel_requested"])
@@ -770,6 +1086,10 @@ def execute_search_run(
             max_enrollment=max_enrollment,
             max_districts=cap,
             max_pages_per_district=max_pages,
+            search_method=search_method,
+            search_provider=search_provider,
+            api_results_per_district=api_results_per_district,
+            follow_depth=follow_depth,
             matched_count=matched_count,
         )
 
@@ -801,6 +1121,12 @@ def execute_search_run(
         max_total_districts_per_run=max(cap, 1),
         user_agent=base_settings.user_agent,
         verify_ssl=base_settings.verify_ssl,
+        search_method=search_method,
+        search_provider=search_provider,
+        api_results_per_district=api_results_per_district,
+        follow_depth=follow_depth,
+        brave_api_key=base_settings.brave_api_key or get_local_setting(BRAVE_SEARCH_API_KEY_ENV),
+        brave_endpoint=base_settings.brave_endpoint,
     )
     districts = list_matching_districts(
         states,
@@ -854,9 +1180,9 @@ def execute_search_run(
                                 search_run_id, district_id, district_name, state,
                                 agency_type, total_enrollment_excludes_ae, website,
                                 result_rank, url, title, content_type, status_code,
-                                score, snippet, matched_terms_json, created_at
+                                search_source, score, snippet, matched_terms_json, created_at
                             )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 run_id,
@@ -871,6 +1197,7 @@ def execute_search_run(
                                 result.get("title"),
                                 result.get("content_type"),
                                 result.get("status_code"),
+                                result.get("search_source"),
                                 result.get("score", 0),
                                 result.get("snippet"),
                                 json_dumps(result.get("matched_terms", [])),
@@ -1025,6 +1352,7 @@ def export_search_run_csv(run_id: int, db_path: Path | str | None = None) -> str
             "url",
             "content_type",
             "status_code",
+            "search_source",
             "score",
             "snippet",
         ]
@@ -1055,6 +1383,7 @@ def export_search_run_csv(run_id: int, db_path: Path | str | None = None) -> str
                     row["url"],
                     row["content_type"],
                     row["status_code"],
+                    row["search_source"],
                     row["score"],
                     row["snippet"],
                 ]

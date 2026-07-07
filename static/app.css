@@ -221,6 +221,12 @@ form {
   gap: 14px;
 }
 
+.settings-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(180px, 1fr));
+  gap: 14px;
+}
+
 .inline-form {
   display: grid;
   grid-template-columns: minmax(140px, 180px) minmax(220px, 1fr) auto;
@@ -262,6 +268,23 @@ label {
 
 .checkbox-field label {
   margin-bottom: 0;
+}
+
+.field-note,
+.search-estimate {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.search-estimate {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff;
 }
 
 .label-row {

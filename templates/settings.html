@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}Settings - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Settings</h2>
+  </section>
+
+  <section class="tool-surface">
+    <form method="post" action="{{ url_for('settings_page') }}" class="settings-form">
+      <div class="full">
+        <label>Brave Search API key</label>
+        <p class="field-note">
+          Status:
+          {% if key_present %}
+            saved as <code>{{ env_key_name }}</code> ({{ masked_key }})
+          {% else %}
+            not saved
+          {% endif %}
+        </p>
+      </div>
+      <div class="full">
+        <label for="brave_api_key">New key</label>
+        <input id="brave_api_key" name="brave_api_key" type="password" autocomplete="off" placeholder="Paste key to save or replace">
+      </div>
+      <div class="form-actions full">
+        <button type="submit" name="action" value="save">Save key</button>
+        {% if key_present %}
+          <button type="submit" name="action" value="clear_brave_key" class="secondary">Clear key</button>
+        {% endif %}
+      </div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <h2>Search Provider</h2>
+    <table class="key-table">
+      <tbody>
+        <tr>
+          <th>Free fallback</th>
+          <td>Crawler mode does not require an API key.</td>
+        </tr>
+        <tr>
+          <th>API mode</th>
+          <td>Brave mode uses one API request per district searched, then fetches only returned pages and optional shallow follow-up links.</td>
+        </tr>
+        <tr>
+          <th>Storage</th>
+          <td>The key is saved only in the local <code>.env</code> file, which is ignored by Git.</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+{% endblock %}

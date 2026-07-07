@@ -100,6 +100,15 @@
           <td>{{ run.max_districts|fmt_int or "Default" }} districts, {{ run.max_pages_per_district|fmt_int or "Default" }} pages per district</td>
         </tr>
         <tr>
+          <th>Search method</th>
+          <td>
+            {{ run.search_method or "crawler" }}
+            {% if run.search_method in ["brave", "hybrid"] %}
+              via {{ run.search_provider or "brave" }}, {{ run.api_results_per_district|fmt_int or "Default" }} API results per district, follow depth {{ run.follow_depth|fmt_int }}
+            {% endif %}
+          </td>
+        </tr>
+        <tr>
           <th>Debug logging</th>
           <td>
             {% if run.debug_logging %}
@@ -139,6 +148,7 @@
               <tr>
                 <th>Rank</th>
                 <th>Title</th>
+                <th>Source</th>
                 <th>Score</th>
                 <th>Snippet</th>
                 <th>URL</th>
@@ -149,6 +159,7 @@
                 <tr>
                   <td>{{ result.result_rank }}</td>
                   <td>{{ result.title or "(untitled)" }}</td>
+                  <td>{{ result.search_source or "crawler" }}</td>
                   <td>{{ "%.1f"|format(result.score) }}</td>
                   <td class="snippet">{{ result.snippet|highlight(run.query_text) }}</td>
                   <td><a href="{{ result.url }}" target="_blank" rel="noopener">{{ result.url }}</a></td>

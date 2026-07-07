@@ -51,6 +51,9 @@ Use the Search page to enter a keyword or phrase and optional filters:
 - maximum enrollment
 - maximum districts for the run
 - maximum pages per district
+- search method
+- Brave API results per district
+- follow depth for API-returned pages
 
 Only districts with a normalized, searchable website are searched. Each search run stores matching pages in SQLite and can be exported to CSV from the run detail page.
 
@@ -63,6 +66,20 @@ Flask app. After submitting a search, the browser redirects to the run detail
 page, which auto-refreshes every 15 seconds while the run is queued or running.
 The browser does not need to stay open for the worker to continue, but the local
 Flask process must keep running.
+
+Search methods:
+
+- `Crawler only` uses the built-in same-domain crawler and does not require an API key.
+- `Brave API first` sends one Brave Search API request per district, stores returned results, fetches those pages, and optionally follows links one or two levels deeper.
+- `Brave with crawler fallback` uses Brave first and falls back to crawler mode if the API call fails or returns no results.
+
+The Settings page can save a local Brave Search API key to `.env`:
+
+```text
+BRAVE_SEARCH_API_KEY="..."
+```
+
+The `.env` file is ignored by Git.
 
 ## Configuration
 
@@ -77,6 +94,7 @@ $env:EDSCANNER_REQUEST_DELAY="0.75"
 $env:EDSCANNER_MAX_PDF_SIZE_MB="10"
 $env:EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN="25"
 $env:EDSCANNER_VERIFY_SSL="true"
+$env:BRAVE_SEARCH_API_KEY="..."
 ```
 
 Logs are written to:
