@@ -64,7 +64,7 @@ only rows with searchable websites are included in search runs.
 
 The header includes the Save Oregon Schools logo linking to
 `https://www.saveoregonschools.com/`, and the footer includes the Save Oregon
-Schools copyright and GitHub links.
+Schools copyright, source code, and license links.
 
 ## Settings
 
@@ -246,6 +246,19 @@ Run unit tests:
 The test suite includes local HTTP-server coverage for crawler mode, Brave API
 mode using a fake local endpoint, CSV export, debug-log creation, and
 cancellation before run start.
+
+## License
+
+EdScanner's software code is copyright (C) 2026 Save Oregon Schools, LLC and is
+licensed under the GNU Affero General Public License version 3. See
+`LICENSE` for the full license text.
+
+EdScanner is distributed without any warranty; without even the implied warranty
+of merchantability or fitness for a particular purpose.
+
+The Save Oregon Schools name, logo, and related branding are not licensed for
+reuse under the GNU Affero General Public License. See `TRADEMARKS.md` for the
+project's trademark and branding notice.
 
 ## Current Limitations
 
