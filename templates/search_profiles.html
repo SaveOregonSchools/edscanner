@@ -122,7 +122,8 @@
             <th>Processed</th>
             <th>Workers</th>
             <th>Working</th>
-            <th>Manual/JS review</th>
+            <th>Manual</th>
+            <th>Requires JS</th>
             <th>Failed</th>
             <th>Started</th>
           </tr>
@@ -138,6 +139,7 @@
               <td>{{ run.max_workers|fmt_int }}</td>
               <td>{{ run.profiles_working|fmt_int }}</td>
               <td>{{ run.profiles_manual_review|fmt_int }}</td>
+              <td>{{ run.profiles_requires_javascript|fmt_int }}</td>
               <td>{{ run.profiles_failed|fmt_int }}</td>
               <td>{{ run.started_at|fmt_dt }}</td>
             </tr>

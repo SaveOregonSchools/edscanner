@@ -456,6 +456,7 @@ def init_db(db_path: Path | str | None = None) -> None:
                 profiles_working INTEGER NOT NULL DEFAULT 0,
                 profiles_failed INTEGER NOT NULL DEFAULT 0,
                 profiles_manual_review INTEGER NOT NULL DEFAULT 0,
+                profiles_requires_javascript INTEGER NOT NULL DEFAULT 0,
                 started_at TEXT,
                 finished_at TEXT,
                 error_message TEXT,
@@ -503,6 +504,8 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;")
         if "max_workers" not in existing_discovery_columns:
             conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN max_workers INTEGER;")
+        if "profiles_requires_javascript" not in existing_discovery_columns:
+            conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN profiles_requires_javascript INTEGER NOT NULL DEFAULT 0;")
         conn.commit()
 
 

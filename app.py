@@ -347,9 +347,9 @@ def create_profile_discovery_run(
                 profile_status_filter, provider_guess_filter, max_districts,
                 max_workers, test_query, force, cancel_requested, status, districts_matched,
                 districts_planned, districts_processed, profiles_working,
-                profiles_failed, profiles_manual_review, started_at
+                profiles_failed, profiles_manual_review, profiles_requires_javascript, started_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'queued', ?, ?, 0, 0, 0, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'queued', ?, ?, 0, 0, 0, 0, 0, ?)
             """,
             (
                 json.dumps(states),
@@ -406,6 +406,7 @@ def execute_profile_discovery_run(run_id: int) -> None:
     working = 0
     failed = 0
     manual_review = 0
+    requires_javascript = 0
     cancelled = False
     settings = SearchSettings(max_pages_per_district=10)
     max_workers = clamp_int(run["max_workers"], PROFILE_DISCOVERY_WORKERS, 1, 8)
@@ -421,10 +422,11 @@ def execute_profile_discovery_run(run_id: int) -> None:
                 SET districts_processed = ?,
                     profiles_working = ?,
                     profiles_failed = ?,
-                    profiles_manual_review = ?
+                    profiles_manual_review = ?,
+                    profiles_requires_javascript = ?
                 WHERE id = ?
                 """,
-                (processed, working, failed, manual_review, run_id),
+                (processed, working, failed, manual_review, requires_javascript, run_id),
             )
             conn.commit()
 
@@ -451,6 +453,7 @@ def execute_profile_discovery_run(run_id: int) -> None:
                     profiles_working = 0,
                     profiles_failed = 0,
                     profiles_manual_review = 0,
+                    profiles_requires_javascript = 0,
                     finished_at = NULL,
                     error_message = NULL
                 WHERE id = ?
@@ -505,8 +508,10 @@ def execute_profile_discovery_run(run_id: int) -> None:
                     processed += 1
                     if status == "working":
                         working += 1
-                    elif status in {"manual_review", "requires_javascript"}:
+                    elif status == "manual_review":
                         manual_review += 1
+                    elif status == "requires_javascript":
+                        requires_javascript += 1
                     else:
                         failed += 1
                     update_run_progress()
@@ -525,11 +530,12 @@ def execute_profile_discovery_run(run_id: int) -> None:
                     profiles_working = ?,
                     profiles_failed = ?,
                     profiles_manual_review = ?,
+                    profiles_requires_javascript = ?,
                     finished_at = ?,
                     error_message = ?
                 WHERE id = ?
                 """,
-                (final_status, processed, working, failed, manual_review, utc_now_iso(), error_message, run_id),
+                (final_status, processed, working, failed, manual_review, requires_javascript, utc_now_iso(), error_message, run_id),
             )
             conn.commit()
         debug_log(
@@ -541,6 +547,7 @@ def execute_profile_discovery_run(run_id: int) -> None:
             working=working,
             failed=failed,
             manual_review=manual_review,
+            requires_javascript=requires_javascript,
         )
     except Exception as exc:
         with connect_db() as conn:
@@ -552,11 +559,12 @@ def execute_profile_discovery_run(run_id: int) -> None:
                     profiles_working = ?,
                     profiles_failed = ?,
                     profiles_manual_review = ?,
+                    profiles_requires_javascript = ?,
                     finished_at = ?,
                     error_message = ?
                 WHERE id = ?
                 """,
-                (processed, working, failed, manual_review, utc_now_iso(), str(exc), run_id),
+                (processed, working, failed, manual_review, requires_javascript, utc_now_iso(), str(exc), run_id),
             )
             conn.commit()
         raise
@@ -990,7 +998,8 @@ def search_profiles_page():
             """
             SELECT id, status, districts_matched, districts_planned,
                    districts_processed, profiles_working, profiles_failed,
-                   profiles_manual_review, max_workers, started_at, finished_at
+                   profiles_manual_review, profiles_requires_javascript,
+                   max_workers, started_at, finished_at
             FROM profile_discovery_runs
             ORDER BY id DESC
             LIMIT 10

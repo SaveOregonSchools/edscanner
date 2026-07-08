@@ -113,6 +113,14 @@ def build_search_url(template: str, query_text: str) -> str:
     return str(template or "").replace("{query}", quote_plus(str(query_text or "").strip()))
 
 
+def _cache_busted_url(url: str) -> str:
+    parsed = urlparse(url)
+    pairs = parse_qsl(parsed.query, keep_blank_values=True)
+    pairs.append(("_edscanner_probe", str(int(time.time() * 1000))))
+    query = urlencode(pairs)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.params, query, parsed.fragment))
+
+
 def _contains_search_word(text: str) -> bool:
     text_fold = collapse_ws(text).casefold()
     return any(word in text_fold for word in SEARCH_WORDS)
@@ -253,7 +261,7 @@ def _detect_provider_guess(html: bytes, final_url: str) -> str:
         ("Finalsite", ("finalsite", "fsresource")),
         ("Blackboard / Schoolwires", ("schoolwires", "blackboard")),
         ("Edlio", ("edlio",)),
-        ("Apptegy", ("apptegy",)),
+        ("Apptegy", ("apptegy", "thrillshare")),
         ("ParentSquare", ("parentsquare",)),
         ("Campus Suite", ("campussuite",)),
         ("SchoolMessenger", ("schoolmessenger",)),
@@ -268,6 +276,39 @@ def _detect_provider_guess(html: bytes, final_url: str) -> str:
         if any(marker in folded or marker in host for marker in markers):
             return provider
     return "Custom"
+
+
+def _provider_marker_hits(html: bytes, final_url: str) -> list[str]:
+    text = html.decode("utf-8", errors="ignore").casefold()
+    host = (urlparse(final_url).hostname or "").casefold()
+    markers = {
+        "finalsite": "Finalsite",
+        "fsresource": "Finalsite",
+        "schoolwires": "Blackboard / Schoolwires",
+        "blackboard": "Blackboard / Schoolwires",
+        "edlio": "Edlio",
+        "apptegy": "Apptegy",
+        "thrillshare": "Apptegy",
+        "parentsquare": "ParentSquare",
+        "campussuite": "Campus Suite",
+        "schoolmessenger": "SchoolMessenger",
+        "wp-content": "WordPress",
+        "wordpress": "WordPress",
+        "drupal": "Drupal",
+        "cse.google.com": "Google Programmable Search",
+        "google custom search": "Google Programmable Search",
+        "algolia": "Algolia",
+        "searchstax": "SearchStax / Solr",
+        "solr": "SearchStax / Solr",
+        "sharepoint": "SharePoint",
+    }
+    hits: list[str] = []
+    for marker, provider in markers.items():
+        if marker in text or marker in host:
+            label = f"{provider}:{marker}"
+            if label not in hits:
+                hits.append(label)
+    return hits
 
 
 def _discover_candidates_from_html(html: bytes, page_url: str, base_url: str) -> list[dict[str, Any]]:
@@ -290,10 +331,19 @@ def _edlio_config_value(text: str, key: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def _edlio_corp_data_value(text: str, key: str) -> str:
+    pattern = rf"['\"]{re.escape(key)}['\"]\s*:\s*['\"]([^'\"]*)['\"]"
+    match = re.search(pattern, text)
+    return match.group(1).strip() if match else ""
+
+
 def _extract_edlio_config(html: bytes) -> dict[str, str]:
     text = html.decode("utf-8", errors="ignore")
-    website_id = _edlio_config_value(text, "websiteId")
-    district_id = _edlio_config_value(text, "districtId")
+    website_id = _edlio_config_value(text, "websiteId") or _edlio_corp_data_value(text, "WebsiteId")
+    district_id = (
+        _edlio_config_value(text, "districtId")
+        or _edlio_corp_data_value(text, "DistrictWebsiteId")
+    )
     search_domain = _edlio_config_value(text, "searchDomain") or f"https://{EDLIO_SEARCH_HOST}/"
     if not website_id and not district_id:
         return {}
@@ -537,6 +587,44 @@ def _is_edlio_profile(profile: dict[str, Any]) -> bool:
     )
 
 
+def _is_suspicious_markerless_homepage(html: bytes, final_url: str, provider_guess: str) -> bool:
+    if provider_guess != "Custom" or _provider_marker_hits(html, final_url):
+        return False
+    hostname = (urlparse(final_url).hostname or "").casefold()
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return False
+    folded = html.decode("utf-8", errors="ignore").casefold()
+    if len(html) < 8000:
+        return True
+    return len(html) < 30000 and any(marker in folded for marker in ("404", "not found", "page not found"))
+
+
+def _profile_status_rank(status: str) -> int:
+    ranks = {
+        "working": 60,
+        "requires_javascript": 50,
+        "manual_review": 40,
+        "blocked_by_challenge": 30,
+        "blocked_by_robots": 25,
+        "search_found_but_failed": 10,
+        "no_search_found": 5,
+        "error": 0,
+    }
+    return ranks.get(status or "", 0)
+
+
+def select_best_profile_test_result(test_results: list[dict[str, Any]]) -> dict[str, Any]:
+    return sorted(
+        test_results,
+        key=lambda item: (
+            int(item.get("test_success") or 0),
+            _profile_status_rank(item.get("profile_status") or ""),
+            float(item.get("confidence") or 0),
+        ),
+        reverse=True,
+    )[0]
+
+
 def _fetch_and_score_result(
     session: requests.Session,
     url: str,
@@ -618,6 +706,7 @@ def _test_candidate(
     error_message = ""
     success = False
     is_edlio = _is_edlio_candidate(candidate)
+    result_provider_guess = provider_guess
 
     debug_log(debug_logger, "profile_candidate_test", district=district.get("agency_name"), url=attempted_url)
     if candidate.get("search_method") != "GET":
@@ -631,6 +720,11 @@ def _test_candidate(
             content_type = response.headers.get("Content-Type", "")
             raw["final_url"] = response.url
             raw["content_length"] = len(content)
+            response_provider_guess = _detect_provider_guess(content, response.url)
+            if result_provider_guess == "Custom" and response_provider_guess != "Custom":
+                result_provider_guess = response_provider_guess
+                raw["response_provider_guess"] = response_provider_guess
+                raw["response_provider_markers"] = _provider_marker_hits(content, response.url)
             if _looks_like_challenge_page(response.status_code, content, response.url):
                 confidence -= 50
                 error_message = "Site returned a challenge or CAPTCHA page."
@@ -757,7 +851,7 @@ def _test_candidate(
     return {
         **candidate,
         "website_normalized": base_url,
-        "provider_guess": provider_guess,
+        "provider_guess": result_provider_guess,
         "profile_status": status,
         "confidence": confidence,
         "test_query": test_query,
@@ -885,6 +979,74 @@ def _apptegy_requires_javascript_result(
     }
 
 
+def _markerless_homepage_requires_javascript_result(
+    *,
+    base_url: str,
+    final_home_url: str,
+    discovery_base_url: str,
+    test_query: str,
+    raw: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "website_normalized": base_url,
+        "profile_status": "requires_javascript",
+        "profile_type": "unknown_platform",
+        "provider_guess": "Custom",
+        "search_url_template": "",
+        "search_method": "",
+        "query_param": "",
+        "requires_javascript": 1,
+        "confidence": 0,
+        "test_query": test_query,
+        "test_result_count": 0,
+        "test_success": 0,
+        "error_message": "Homepage returned a tiny markerless fallback page after retry; discovery could not identify a static search endpoint.",
+        "raw": {
+            **(raw or {}),
+            "base_url": base_url,
+            "final_home_url": final_home_url,
+            "discovery_base_url": discovery_base_url,
+            "provider_guess": "Custom",
+            "diagnosis": "tiny_markerless_homepage_after_retry",
+        },
+    }
+
+
+def _known_platform_requires_javascript_result(
+    *,
+    base_url: str,
+    final_home_url: str,
+    discovery_base_url: str,
+    provider_guess: str,
+    test_query: str,
+    raw: dict[str, Any] | None = None,
+    confidence: float = 40.0,
+) -> dict[str, Any]:
+    return {
+        "website_normalized": base_url,
+        "profile_status": "requires_javascript",
+        "profile_type": "known_platform",
+        "provider_guess": provider_guess,
+        "search_url_template": "",
+        "search_method": "",
+        "query_param": "",
+        "requires_javascript": 1,
+        "confidence": confidence,
+        "test_query": test_query,
+        "test_result_count": 0,
+        "test_success": 0,
+        "error_message": f"{provider_guess} site did not expose a simple static search endpoint; use browser-backed search interaction or a provider-specific parser.",
+        "raw": {
+            **(raw or {}),
+            "base_url": base_url,
+            "final_home_url": final_home_url,
+            "discovery_base_url": discovery_base_url,
+            "provider_guess": provider_guess,
+            "diagnosis": "known_platform_requires_browser_or_provider_parser",
+        },
+    }
+
+
 def get_best_search_profile(
     district_id: int,
     db_path: Path | str | None = None,
@@ -960,36 +1122,56 @@ def discover_district_search_profile(
             replace_existing=True,
         )
 
-    try:
-        response, homepage = fetch_limited(session, base_url, settings)
-        if _looks_like_challenge_page(response.status_code, homepage, response.url):
-            return _save_profile_result(
-                district_id,
-                {
-                    "website_normalized": base_url,
-                    "profile_status": "blocked_by_challenge",
-                    "error_message": "Homepage returned a challenge or CAPTCHA page.",
-                    "test_query": test_query,
-                    "raw": {"base_url": base_url, "final_url": response.url, "status_code": response.status_code},
-                },
-                db_path=db_path,
-                replace_existing=True,
-            )
-        response.raise_for_status()
-    except Exception as exc:
+    response = None
+    homepage = b""
+    homepage_error: Exception | None = None
+    for attempt in range(1, 3):
+        try:
+            response, homepage = fetch_limited(session, base_url, settings)
+            if _looks_like_challenge_page(response.status_code, homepage, response.url):
+                return _save_profile_result(
+                    district_id,
+                    {
+                        "website_normalized": base_url,
+                        "profile_status": "blocked_by_challenge",
+                        "error_message": "Homepage returned a challenge or CAPTCHA page.",
+                        "test_query": test_query,
+                        "raw": {"base_url": base_url, "final_url": response.url, "status_code": response.status_code},
+                    },
+                    db_path=db_path,
+                    replace_existing=True,
+                )
+            response.raise_for_status()
+            homepage_error = None
+            break
+        except Exception as exc:
+            homepage_error = exc
+            if attempt < 2:
+                debug_log(
+                    debug_logger,
+                    "profile_homepage_fetch_retry",
+                    district=district.get("agency_name"),
+                    url=base_url,
+                    attempt=attempt + 1,
+                    error=str(exc),
+                )
+                if settings.delay_seconds:
+                    time.sleep(settings.delay_seconds)
+                continue
+    if homepage_error is not None or response is None:
         debug_log(
             debug_logger,
             "profile_homepage_failed",
             district=district.get("agency_name"),
             url=base_url,
-            error=str(exc),
+            error=str(homepage_error),
         )
         return _save_profile_result(
             district_id,
             {
                 "website_normalized": base_url,
                 "profile_status": "error",
-                "error_message": str(exc),
+                "error_message": str(homepage_error),
                 "test_query": test_query,
                 "raw": {"base_url": base_url},
             },
@@ -1000,6 +1182,95 @@ def discover_district_search_profile(
     final_home_url = response.url
     discovery_base_url = final_home_url if same_organization_url(final_home_url, base_url) else base_url
     provider_guess = _detect_provider_guess(homepage, final_home_url)
+    if _is_suspicious_markerless_homepage(homepage, final_home_url, provider_guess):
+        debug_log(
+            debug_logger,
+            "profile_homepage_suspicious",
+            district=district.get("agency_name"),
+            url=base_url,
+            final_url=final_home_url,
+            content_length=len(homepage),
+            provider_guess=provider_guess,
+        )
+        if settings.delay_seconds:
+            time.sleep(settings.delay_seconds)
+        try:
+            session.headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
+            retry_response, retry_homepage = fetch_limited(session, base_url, settings)
+            retry_provider_guess = _detect_provider_guess(retry_homepage, retry_response.url)
+            debug_log(
+                debug_logger,
+                "profile_homepage_retry",
+                district=district.get("agency_name"),
+                url=base_url,
+                final_url=retry_response.url,
+                content_length=len(retry_homepage),
+                provider_guess=retry_provider_guess,
+                provider_markers=_provider_marker_hits(retry_homepage, retry_response.url),
+            )
+            retry_is_better = not _is_suspicious_markerless_homepage(retry_homepage, retry_response.url, retry_provider_guess) or len(retry_homepage) > len(homepage)
+            if retry_is_better and not _looks_like_challenge_page(retry_response.status_code, retry_homepage, retry_response.url):
+                response = retry_response
+                homepage = retry_homepage
+                final_home_url = response.url
+                discovery_base_url = final_home_url if same_organization_url(final_home_url, base_url) else base_url
+                provider_guess = retry_provider_guess
+        except Exception as exc:
+            debug_log(
+                debug_logger,
+                "profile_homepage_retry_failed",
+                district=district.get("agency_name"),
+                url=base_url,
+                error=str(exc),
+            )
+        if _is_suspicious_markerless_homepage(homepage, final_home_url, provider_guess):
+            cache_busted_url = _cache_busted_url(base_url)
+            if settings.delay_seconds:
+                time.sleep(settings.delay_seconds)
+            try:
+                cache_response, cache_homepage = fetch_limited(session, cache_busted_url, settings)
+                cache_provider_guess = _detect_provider_guess(cache_homepage, cache_response.url)
+                debug_log(
+                    debug_logger,
+                    "profile_homepage_cache_busted_retry",
+                    district=district.get("agency_name"),
+                    url=cache_busted_url,
+                    final_url=cache_response.url,
+                    content_length=len(cache_homepage),
+                    provider_guess=cache_provider_guess,
+                    provider_markers=_provider_marker_hits(cache_homepage, cache_response.url),
+                )
+                cache_retry_is_better = not _is_suspicious_markerless_homepage(cache_homepage, cache_response.url, cache_provider_guess) or len(cache_homepage) > len(homepage)
+                if cache_retry_is_better and not _looks_like_challenge_page(cache_response.status_code, cache_homepage, cache_response.url):
+                    response = cache_response
+                    homepage = cache_homepage
+                    final_home_url = response.url
+                    discovery_base_url = final_home_url if same_organization_url(final_home_url, base_url) else base_url
+                    provider_guess = cache_provider_guess
+            except Exception as exc:
+                debug_log(
+                    debug_logger,
+                    "profile_homepage_cache_busted_retry_failed",
+                    district=district.get("agency_name"),
+                    url=cache_busted_url,
+                    error=str(exc),
+                )
+        if len(homepage) < 8000 and _is_suspicious_markerless_homepage(homepage, final_home_url, provider_guess):
+            return _save_profile_result(
+                district_id,
+                _markerless_homepage_requires_javascript_result(
+                    base_url=base_url,
+                    final_home_url=final_home_url,
+                    discovery_base_url=discovery_base_url,
+                    test_query=test_query,
+                    raw={
+                        "content_length": len(homepage),
+                        "provider_markers": _provider_marker_hits(homepage, final_home_url),
+                    },
+                ),
+                db_path=db_path,
+                replace_existing=True,
+            )
     debug_log(
         debug_logger,
         "profile_homepage_fetched",
@@ -1008,6 +1279,8 @@ def discover_district_search_profile(
         final_url=final_home_url,
         discovery_base_url=discovery_base_url,
         provider_guess=provider_guess,
+        content_length=len(homepage),
+        provider_markers=_provider_marker_hits(homepage, final_home_url),
     )
 
     discovered: list[dict[str, Any]] = []
@@ -1102,21 +1375,34 @@ def discover_district_search_profile(
         if settings.delay_seconds:
             time.sleep(settings.delay_seconds)
 
-    best = sorted(test_results, key=lambda item: (item.get("test_success") or 0, item.get("confidence") or 0), reverse=True)[0]
+    best = select_best_profile_test_result(test_results)
+    resolved_provider_guess = best.get("provider_guess") or provider_guess
     best["raw"] = {
         **(best.get("raw") or {}),
         "base_url": base_url,
         "final_home_url": final_home_url,
         "discovery_base_url": discovery_base_url,
-        "provider_guess": provider_guess,
+        "provider_guess": resolved_provider_guess,
+        "homepage_provider_guess": provider_guess,
         "candidate_count": len(candidates),
         "tested_count": len(test_results),
     }
-    if provider_guess == "Apptegy" and best.get("profile_status") != "working":
+    best["provider_guess"] = resolved_provider_guess
+    if resolved_provider_guess == "Apptegy" and best.get("profile_status") != "working":
         best = _apptegy_requires_javascript_result(
             base_url=base_url,
             final_home_url=final_home_url,
             discovery_base_url=discovery_base_url,
+            test_query=test_query,
+            raw=best.get("raw") or {},
+            confidence=max(40.0, float(best.get("confidence") or 0)),
+        )
+    elif resolved_provider_guess in {"ParentSquare"} and best.get("profile_status") != "working":
+        best = _known_platform_requires_javascript_result(
+            base_url=base_url,
+            final_home_url=final_home_url,
+            discovery_base_url=discovery_base_url,
+            provider_guess=resolved_provider_guess,
             test_query=test_query,
             raw=best.get("raw") or {},
             confidence=max(40.0, float(best.get("confidence") or 0)),
@@ -1150,6 +1436,7 @@ def discover_profiles_for_districts(
         "working_profiles": 0,
         "no_search_found": 0,
         "manual_review": 0,
+        "requires_javascript": 0,
         "errors": 0,
         "statuses": {},
         "provider_guesses": {},
@@ -1178,7 +1465,9 @@ def discover_profiles_for_districts(
             summary["no_search_found"] += 1
         elif status == "manual_review":
             summary["manual_review"] += 1
-        elif status in {"error", "blocked_by_robots", "search_found_but_failed"}:
+        elif status == "requires_javascript":
+            summary["requires_javascript"] += 1
+        elif status in {"error", "blocked_by_robots", "blocked_by_challenge", "search_found_but_failed"}:
             summary["errors"] += 1
     return summary
 

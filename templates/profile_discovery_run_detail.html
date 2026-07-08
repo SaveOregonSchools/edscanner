@@ -61,8 +61,12 @@
       <strong>{{ run.profiles_working|fmt_int }}</strong>
     </div>
     <div class="stat">
-      <span class="stat-label">Manual or JS review</span>
+      <span class="stat-label">Manual review</span>
       <strong>{{ run.profiles_manual_review|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Requires JS</span>
+      <strong>{{ run.profiles_requires_javascript|fmt_int }}</strong>
     </div>
     <div class="stat">
       <span class="stat-label">Failed or blocked</span>

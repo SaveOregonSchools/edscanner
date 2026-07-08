@@ -17,7 +17,13 @@ from search_engine import (
     run_search,
     search_district,
 )
-from site_search_discovery import discover_district_search_profile, get_best_search_profile, parse_edlio_search_results
+from site_search_discovery import (
+    _extract_edlio_config,
+    discover_district_search_profile,
+    get_best_search_profile,
+    parse_edlio_search_results,
+    select_best_profile_test_result,
+)
 
 
 class LocalSiteHandler(BaseHTTPRequestHandler):
@@ -177,6 +183,30 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(results[0]["source"], "edlio_search_api")
         self.assertEqual(results[0]["url"], "https://www.fgsdk12.org/apps/pages/calendar")
         self.assertEqual(results[0]["snippet"], "Calendar dates and family events")
+
+    def test_extract_edlio_config_from_corp_data_layer(self):
+        html = b"""
+        <script>
+        edlioCorpDataLayer = [{
+          "WebsiteName": "Newberg-Dundee Public Schools",
+          "WebsiteId": "NEWSDJ",
+          "DistrictWebsiteId": ""
+        }];
+        </script>
+        """
+        config = _extract_edlio_config(html)
+        self.assertEqual(config["website_id"], "NEWSDJ")
+        self.assertEqual(config["identifier"], "NEWSDJ")
+        self.assertEqual(config["search_domain"], "https://search.edlio.com/")
+
+    def test_select_best_profile_prefers_javascript_over_generic_failure(self):
+        best = select_best_profile_test_result(
+            [
+                {"profile_status": "search_found_but_failed", "confidence": 0, "test_success": 0},
+                {"profile_status": "requires_javascript", "confidence": 0, "test_success": 0},
+            ]
+        )
+        self.assertEqual(best["profile_status"], "requires_javascript")
 
     def test_search_district_finds_local_html_match(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), LocalSiteHandler)
