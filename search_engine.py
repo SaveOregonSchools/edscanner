@@ -37,6 +37,7 @@ from common import (
     init_db,
     json_dumps,
     normalize_website,
+    prefer_https_url,
     utc_now_iso,
 )
 
@@ -507,7 +508,7 @@ def _search_district_crawler(
     debug_logger: RunDebugLogger | None = None,
 ) -> list[dict[str, Any]]:
     settings = settings or SearchSettings()
-    base_url = district.get("website_normalized") or normalize_website(district.get("website"))[0]
+    base_url = prefer_https_url(district.get("website_normalized") or normalize_website(district.get("website"))[0])
     if not base_url:
         debug_log(debug_logger, "district_skipped", district=district.get("agency_name"), reason="missing_website")
         return []
@@ -800,7 +801,7 @@ def _search_district_brave(
     cancel_requested: Callable[[], bool] | None = None,
     debug_logger: RunDebugLogger | None = None,
 ) -> list[dict[str, Any]]:
-    base_url = district.get("website_normalized") or normalize_website(district.get("website"))[0]
+    base_url = prefer_https_url(district.get("website_normalized") or normalize_website(district.get("website"))[0])
     if not base_url:
         debug_log(debug_logger, "district_skipped", district=district.get("agency_name"), reason="missing_website")
         return []

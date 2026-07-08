@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -11,7 +12,7 @@ from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlparse, ur
 import requests
 from bs4 import BeautifulSoup, Tag
 
-from common import connect_db, init_db, json_dumps, normalize_website, utc_now_iso
+from common import connect_db, init_db, json_dumps, normalize_website, prefer_https_url, utc_now_iso
 from search_engine import (
     RunDebugLogger,
     SearchSettings,
@@ -101,6 +102,7 @@ NON_CONTENT_SUFFIXES = (
     ".pptx",
 )
 SEARCH_LOOP_MARKERS = ("/search", "search?", "query=", "SearchString=", "searchTerm=", "searchterm=")
+EDLIO_SEARCH_HOST = "search.edlio.com"
 
 
 def _row_to_dict(row: Any | None) -> dict[str, Any] | None:
@@ -282,6 +284,55 @@ def _discover_candidates_from_html(html: bytes, page_url: str, base_url: str) ->
     return candidates
 
 
+def _edlio_config_value(text: str, key: str) -> str:
+    pattern = rf"window\.edlio\.{re.escape(key)}\s*=\s*['\"]([^'\"]*)['\"]"
+    match = re.search(pattern, text)
+    return match.group(1).strip() if match else ""
+
+
+def _extract_edlio_config(html: bytes) -> dict[str, str]:
+    text = html.decode("utf-8", errors="ignore")
+    website_id = _edlio_config_value(text, "websiteId")
+    district_id = _edlio_config_value(text, "districtId")
+    search_domain = _edlio_config_value(text, "searchDomain") or f"https://{EDLIO_SEARCH_HOST}/"
+    if not website_id and not district_id:
+        return {}
+    identifier = district_id if district_id and district_id != "0" else website_id
+    if not identifier:
+        return {}
+    return {
+        "website_id": website_id,
+        "district_id": district_id,
+        "identifier": identifier,
+        "search_domain": search_domain,
+    }
+
+
+def _edlio_candidate_from_html(html: bytes, page_url: str, base_url: str) -> dict[str, Any] | None:
+    config = _extract_edlio_config(html)
+    if not config:
+        return None
+    search_domain = config["search_domain"].rstrip("/") + "/"
+    api_url = urljoin(search_domain, f"{config['identifier']}/search")
+    extra_params = {"offset": "0"}
+    if config.get("website_id"):
+        extra_params["boostWebsiteId"] = config["website_id"]
+    return {
+        "profile_type": "known_platform",
+        "search_method": "GET",
+        "query_param": "q",
+        "search_url_template": _template_from_url(api_url, "q", extra_params),
+        "extra_params": extra_params,
+        "source_url": page_url,
+        "provider_guess": "Edlio",
+        "result_format": "edlio_json",
+        "score_hint": 45,
+        "uses_external_provider": True,
+        "external_provider_host": EDLIO_SEARCH_HOST,
+        "raw_provider_config": config,
+    }
+
+
 def _common_template_candidates(base_url: str) -> list[dict[str, Any]]:
     candidates: list[dict[str, Any]] = []
     for template in COMMON_URL_TEMPLATES:
@@ -397,6 +448,95 @@ def parse_search_results_page(
     return results
 
 
+def _extract_edlio_items(payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    candidates = [
+        payload.get("items"),
+        payload.get("results"),
+        payload.get("hits"),
+    ]
+    hits = payload.get("hits")
+    if isinstance(hits, dict):
+        candidates.append(hits.get("hits"))
+    for candidate in candidates:
+        if isinstance(candidate, list):
+            return [item for item in candidate if isinstance(item, dict)]
+    return []
+
+
+def _edlio_text(value: Any) -> str:
+    text = str(value or "")
+    if "<" in text and ">" in text:
+        text = BeautifulSoup(text, "lxml").get_text(" ", strip=True)
+    return collapse_ws(text)
+
+
+def parse_edlio_search_results(
+    payload: bytes | dict[str, Any],
+    base_url: str,
+    generated_search_url: str,
+    *,
+    max_links: int = 10,
+) -> list[dict[str, Any]]:
+    if isinstance(payload, bytes):
+        try:
+            data = json.loads(payload.decode("utf-8", errors="ignore"))
+        except json.JSONDecodeError:
+            return []
+    else:
+        data = payload
+
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in _extract_edlio_items(data):
+        source = item.get("_source") if isinstance(item.get("_source"), dict) else item
+        href = str(
+            source.get("Url")
+            or source.get("url")
+            or source.get("URL")
+            or source.get("link")
+            or ""
+        ).strip()
+        if not href:
+            continue
+        url = canonical_url(urljoin(base_url, href))
+        if url in seen or not _valid_result_url(url, base_url, generated_search_url):
+            continue
+        title = _edlio_text(source.get("Title") or source.get("title") or source.get("Name") or filename_title(url))
+        snippet = _edlio_text(source.get("PreviewText") or source.get("previewText") or source.get("description") or source.get("Description"))
+        seen.add(url)
+        results.append(
+            {
+                "url": url,
+                "title": title[:500],
+                "snippet": snippet[:1000],
+                "rank": len(results) + 1,
+                "source": "edlio_search_api",
+            }
+        )
+        if len(results) >= max_links:
+            return results
+    return results
+
+
+def _is_edlio_candidate(candidate: dict[str, Any]) -> bool:
+    return (
+        candidate.get("result_format") == "edlio_json"
+        or (
+            candidate.get("provider_guess") == "Edlio"
+            and (urlparse(candidate.get("search_url_template") or "").hostname or "").casefold() == EDLIO_SEARCH_HOST
+        )
+    )
+
+
+def _is_edlio_profile(profile: dict[str, Any]) -> bool:
+    return (
+        profile.get("provider_guess") == "Edlio"
+        and (urlparse(profile.get("search_url_template") or "").hostname or "").casefold() == EDLIO_SEARCH_HOST
+    )
+
+
 def _fetch_and_score_result(
     session: requests.Session,
     url: str,
@@ -477,6 +617,7 @@ def _test_candidate(
     content_type = ""
     error_message = ""
     success = False
+    is_edlio = _is_edlio_candidate(candidate)
 
     debug_log(debug_logger, "profile_candidate_test", district=district.get("agency_name"), url=attempted_url)
     if candidate.get("search_method") != "GET":
@@ -496,10 +637,46 @@ def _test_candidate(
                 raw["diagnosis"] = "blocked_by_challenge"
             if response.status_code < 400:
                 confidence += 30
-                if _looks_like_homepage_redirect(response.url, base_url, test_query):
+                if not is_edlio and _looks_like_homepage_redirect(response.url, base_url, test_query):
                     confidence -= 50
                     error_message = "Search request redirected to the homepage without preserving the query."
                     raw["diagnosis"] = "redirected_to_homepage"
+                elif is_edlio:
+                    result_links = parse_edlio_search_results(
+                        content,
+                        base_url,
+                        attempted_url,
+                        max_links=10,
+                    )
+                    raw["result_links"] = result_links
+                    raw["result_format"] = "edlio_json"
+                    if result_links:
+                        confidence += 20
+                    if len(result_links) > 1:
+                        confidence += 10
+                    if any(same_organization_url(item["url"], base_url) for item in result_links):
+                        confidence += 20
+                    if not result_links:
+                        error_message = "Edlio search API returned no parseable same-domain result links."
+                        raw["diagnosis"] = "no_parseable_edlio_links"
+
+                    confirmed = 0
+                    for item in result_links[:5]:
+                        if not can_fetch(robots, settings, item["url"]):
+                            continue
+                        try:
+                            match = _fetch_and_score_result(session, item["url"], test_query, settings)
+                        except Exception as exc:
+                            raw.setdefault("result_errors", []).append({"url": item["url"], "error": str(exc)})
+                            continue
+                        if match:
+                            confirmed += 1
+                            raw["confirmed_urls"].append(match["url"])
+                            if confirmed == 1:
+                                confidence += 30
+                        if settings.delay_seconds:
+                            time.sleep(settings.delay_seconds)
+                    success = confirmed > 0
                 elif "html" in content_type.casefold() or not content_type:
                     result_links = parse_search_results_page(
                         content,
@@ -674,6 +851,40 @@ def _save_profile_result(
     return dict(saved)
 
 
+def _apptegy_requires_javascript_result(
+    *,
+    base_url: str,
+    final_home_url: str,
+    discovery_base_url: str,
+    test_query: str,
+    raw: dict[str, Any] | None = None,
+    confidence: float = 40.0,
+) -> dict[str, Any]:
+    return {
+        "website_normalized": base_url,
+        "profile_status": "requires_javascript",
+        "profile_type": "known_platform",
+        "provider_guess": "Apptegy",
+        "search_url_template": "",
+        "search_method": "",
+        "query_param": "",
+        "requires_javascript": 1,
+        "confidence": confidence,
+        "test_query": test_query,
+        "test_result_count": 0,
+        "test_success": 0,
+        "error_message": "Apptegy site did not expose a simple search endpoint; use browser-backed search interaction or an Apptegy-specific parser.",
+        "raw": {
+            **(raw or {}),
+            "base_url": base_url,
+            "final_home_url": final_home_url,
+            "discovery_base_url": discovery_base_url,
+            "provider_guess": "Apptegy",
+            "diagnosis": "apptegy_requires_browser_or_provider_parser",
+        },
+    }
+
+
 def get_best_search_profile(
     district_id: int,
     db_path: Path | str | None = None,
@@ -718,7 +929,7 @@ def discover_district_search_profile(
         if existing:
             return existing
 
-    base_url = district.get("website_normalized") or normalize_website(district.get("website"))[0]
+    base_url = prefer_https_url(district.get("website_normalized") or normalize_website(district.get("website"))[0])
     if not base_url:
         return _save_profile_result(
             district_id,
@@ -766,6 +977,13 @@ def discover_district_search_profile(
             )
         response.raise_for_status()
     except Exception as exc:
+        debug_log(
+            debug_logger,
+            "profile_homepage_failed",
+            district=district.get("agency_name"),
+            url=base_url,
+            error=str(exc),
+        )
         return _save_profile_result(
             district_id,
             {
@@ -780,6 +998,7 @@ def discover_district_search_profile(
         )
 
     final_home_url = response.url
+    discovery_base_url = final_home_url if same_organization_url(final_home_url, base_url) else base_url
     provider_guess = _detect_provider_guess(homepage, final_home_url)
     debug_log(
         debug_logger,
@@ -787,11 +1006,22 @@ def discover_district_search_profile(
         district=district.get("agency_name"),
         url=base_url,
         final_url=final_home_url,
+        discovery_base_url=discovery_base_url,
         provider_guess=provider_guess,
     )
 
     discovered: list[dict[str, Any]] = []
-    discovered.extend(_discover_candidates_from_html(homepage, final_home_url, base_url))
+    edlio_candidate = _edlio_candidate_from_html(homepage, final_home_url, discovery_base_url)
+    if edlio_candidate:
+        discovered.append(edlio_candidate)
+        debug_log(
+            debug_logger,
+            "profile_known_platform_candidate",
+            district=district.get("agency_name"),
+            provider="Edlio",
+            url_template=edlio_candidate.get("search_url_template"),
+        )
+    discovered.extend(_discover_candidates_from_html(homepage, final_home_url, discovery_base_url))
     search_page_urls = [
         candidate["search_page_url"]
         for candidate in discovered
@@ -803,14 +1033,17 @@ def discover_district_search_profile(
         try:
             page_response, page_html = fetch_limited(session, search_page_url, settings)
             if page_response.status_code < 400:
-                discovered.extend(_discover_candidates_from_html(page_html, page_response.url, base_url))
+                nested_edlio_candidate = _edlio_candidate_from_html(page_html, page_response.url, discovery_base_url)
+                if nested_edlio_candidate:
+                    discovered.append(nested_edlio_candidate)
+                discovered.extend(_discover_candidates_from_html(page_html, page_response.url, discovery_base_url))
                 debug_log(debug_logger, "profile_search_link_candidate", district=district.get("agency_name"), url=search_page_url)
         except Exception as exc:
             debug_log(debug_logger, "profile_candidate_failed", district=district.get("agency_name"), url=search_page_url, error=str(exc))
         finally:
             if settings.delay_seconds:
                 time.sleep(settings.delay_seconds)
-    discovered.extend(_common_template_candidates(base_url))
+    discovered.extend(_common_template_candidates(discovery_base_url))
 
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
@@ -834,6 +1067,19 @@ def discover_district_search_profile(
             break
 
     if not candidates:
+        if provider_guess == "Apptegy":
+            return _save_profile_result(
+                district_id,
+                _apptegy_requires_javascript_result(
+                    base_url=base_url,
+                    final_home_url=final_home_url,
+                    discovery_base_url=discovery_base_url,
+                    test_query=test_query,
+                    raw={"candidates": []},
+                ),
+                db_path=db_path,
+                replace_existing=True,
+            )
         return _save_profile_result(
             district_id,
             {
@@ -841,7 +1087,7 @@ def discover_district_search_profile(
                 "profile_status": "no_search_found",
                 "provider_guess": provider_guess,
                 "test_query": test_query,
-                "raw": {"base_url": base_url, "final_home_url": final_home_url, "candidates": []},
+                "raw": {"base_url": base_url, "final_home_url": final_home_url, "discovery_base_url": discovery_base_url, "candidates": []},
             },
             db_path=db_path,
             replace_existing=True,
@@ -849,7 +1095,7 @@ def discover_district_search_profile(
 
     test_results: list[dict[str, Any]] = []
     for candidate in candidates:
-        result = _test_candidate(candidate, district, base_url, test_query, session, settings, robots, provider_guess, debug_logger)
+        result = _test_candidate(candidate, district, discovery_base_url, test_query, session, settings, robots, provider_guess, debug_logger)
         test_results.append(result)
         if result["profile_status"] == "working" and result["confidence"] >= 80:
             break
@@ -861,10 +1107,20 @@ def discover_district_search_profile(
         **(best.get("raw") or {}),
         "base_url": base_url,
         "final_home_url": final_home_url,
+        "discovery_base_url": discovery_base_url,
         "provider_guess": provider_guess,
         "candidate_count": len(candidates),
         "tested_count": len(test_results),
     }
+    if provider_guess == "Apptegy" and best.get("profile_status") != "working":
+        best = _apptegy_requires_javascript_result(
+            base_url=base_url,
+            final_home_url=final_home_url,
+            discovery_base_url=discovery_base_url,
+            test_query=test_query,
+            raw=best.get("raw") or {},
+            confidence=max(40.0, float(best.get("confidence") or 0)),
+        )
     saved = _save_profile_result(district_id, best, db_path=db_path, replace_existing=True)
     debug_log(
         debug_logger,
@@ -938,7 +1194,7 @@ def search_with_district_profile(
     use_browser_for_javascript: bool = False,
 ) -> list[dict[str, Any]]:
     district_id = int(district.get("id") or 0)
-    base_url = district.get("website_normalized") or normalize_website(district.get("website"))[0]
+    base_url = prefer_https_url(district.get("website_normalized") or normalize_website(district.get("website"))[0])
     if not district_id or not base_url:
         debug_log(debug_logger, "district_skipped", district=district.get("agency_name"), reason="missing_profile_context")
         return []
@@ -987,14 +1243,23 @@ def search_with_district_profile(
                 matched=False,
             )
             return []
-        result_links = parse_search_results_page(
-            html,
-            final_url,
-            base_url,
-            query_text,
-            profile,
-            max_links=max(settings.max_results_per_district * 3, 10),
-        )
+        max_links = max(settings.max_results_per_district * 3, 10)
+        if _is_edlio_profile(profile):
+            result_links = parse_edlio_search_results(
+                html,
+                base_url,
+                search_url,
+                max_links=max_links,
+            )
+        else:
+            result_links = parse_search_results_page(
+                html,
+                final_url,
+                base_url,
+                query_text,
+                profile,
+                max_links=max_links,
+            )
         debug_log(
             debug_logger,
             "district_search_result_page_fetched",

@@ -62,11 +62,10 @@
       </div>
       <div>
         <label for="profile_status">Profile status</label>
-        <select id="profile_status" name="profile_status">
-          <option value="">Any status</option>
-          <option value="__never__" {% if profile_status == "__never__" %}selected{% endif %}>Never tested</option>
+        <select id="profile_status" name="profile_status" multiple size="8">
+          <option value="__never__" {% if "__never__" in profile_statuses_selected %}selected{% endif %}>Never tested</option>
           {% for status in profile_statuses %}
-            <option value="{{ status }}" {% if profile_status == status %}selected{% endif %}>{{ status }}</option>
+            <option value="{{ status }}" {% if status in profile_statuses_selected %}selected{% endif %}>{{ status }}</option>
           {% endfor %}
         </select>
       </div>
@@ -89,7 +88,11 @@
       </div>
       <div>
         <label for="max_districts">Max districts to discover</label>
-        <input id="max_districts" name="max_districts" type="number" min="1" max="100" value="{{ max_districts }}">
+        <input id="max_districts" name="max_districts" type="number" min="1" max="{{ profile_discovery_max_districts }}" value="{{ max_districts }}">
+      </div>
+      <div>
+        <label for="max_workers">Discovery workers</label>
+        <input id="max_workers" name="max_workers" type="number" min="1" max="8" value="{{ max_workers }}">
       </div>
       <div>
         <label for="test_query">Test query</label>
@@ -117,8 +120,9 @@
             <th>Matched</th>
             <th>Planned</th>
             <th>Processed</th>
+            <th>Workers</th>
             <th>Working</th>
-            <th>Manual review</th>
+            <th>Manual/JS review</th>
             <th>Failed</th>
             <th>Started</th>
           </tr>
@@ -131,6 +135,7 @@
               <td>{{ run.districts_matched|fmt_int }}</td>
               <td>{{ run.districts_planned|fmt_int }}</td>
               <td>{{ run.districts_processed|fmt_int }}</td>
+              <td>{{ run.max_workers|fmt_int }}</td>
               <td>{{ run.profiles_working|fmt_int }}</td>
               <td>{{ run.profiles_manual_review|fmt_int }}</td>
               <td>{{ run.profiles_failed|fmt_int }}</td>

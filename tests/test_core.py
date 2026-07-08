@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from tempfile import NamedTemporaryFile
 from urllib.parse import parse_qs, urlparse
 
-from common import clean_source_header, connect_db, init_db, normalize_website, utc_now_iso
+from common import clean_source_header, connect_db, init_db, normalize_website, prefer_https_url, utc_now_iso
 from search_engine import (
     SearchSettings,
     create_search_run,
@@ -17,7 +17,7 @@ from search_engine import (
     run_search,
     search_district,
 )
-from site_search_discovery import discover_district_search_profile, get_best_search_profile
+from site_search_discovery import discover_district_search_profile, get_best_search_profile, parse_edlio_search_results
 
 
 class LocalSiteHandler(BaseHTTPRequestHandler):
@@ -144,7 +144,39 @@ class CoreTests(unittest.TestCase):
             "Total Students All Grades (Excludes AE)",
         )
         self.assertEqual(normalize_website("example.k12.or.us"), ("https://example.k12.or.us", 1))
+        self.assertEqual(prefer_https_url("http://example.k12.or.us/path?q=1"), "https://example.k12.or.us/path?q=1")
+        self.assertEqual(prefer_https_url("http://127.0.0.1:5000/path"), "http://127.0.0.1:5000/path")
+        self.assertEqual(prefer_https_url("https://example.k12.or.us/path"), "https://example.k12.or.us/path")
         self.assertEqual(normalize_website("†"), ("", 0))
+
+    def test_parse_edlio_search_results_keeps_same_domain_results(self):
+        payload = {
+            "items": [
+                {
+                    "_source": {
+                        "Url": "https://www.fgsdk12.org/apps/pages/calendar",
+                        "Title": "District Calendar",
+                        "PreviewText": "<strong>Calendar</strong> dates and family events",
+                    }
+                },
+                {
+                    "_source": {
+                        "Url": "https://example.com/offsite",
+                        "Title": "External",
+                        "PreviewText": "Should not be trusted as a district result",
+                    }
+                },
+            ]
+        }
+        results = parse_edlio_search_results(
+            payload,
+            "https://www.fgsdk12.org/",
+            "https://search.edlio.com/FORGS/search?q=calendar&offset=0&boostWebsiteId=FORGS",
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source"], "edlio_search_api")
+        self.assertEqual(results[0]["url"], "https://www.fgsdk12.org/apps/pages/calendar")
+        self.assertEqual(results[0]["snippet"], "Calendar dates and family events")
 
     def test_search_district_finds_local_html_match(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), LocalSiteHandler)

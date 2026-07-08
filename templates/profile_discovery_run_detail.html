@@ -14,6 +14,9 @@
     <div class="action-row">
       <a class="button-link" href="{{ url_for('search_profiles_page') }}">Search Profiles</a>
       <a class="button-link" href="{{ url_for('profile_discovery_run_detail', run_id=run.id) }}">Refresh</a>
+      {% if run.debug_log_path %}
+        <a class="button-link" href="{{ url_for('profile_discovery_debug_log_file', run_id=run.id) }}" target="_blank" rel="noopener">Debug log</a>
+      {% endif %}
       {% if run.status in ["queued", "running"] and not run.cancel_requested %}
         <form method="post" action="{{ url_for('cancel_profile_discovery_run', run_id=run.id) }}" class="inline-action">
           <button type="submit" class="danger">Cancel</button>
@@ -58,7 +61,7 @@
       <strong>{{ run.profiles_working|fmt_int }}</strong>
     </div>
     <div class="stat">
-      <span class="stat-label">Manual review</span>
+      <span class="stat-label">Manual or JS review</span>
       <strong>{{ run.profiles_manual_review|fmt_int }}</strong>
     </div>
     <div class="stat">
@@ -89,11 +92,15 @@
         </tr>
         <tr>
           <th>Profile filters</th>
-          <td>{{ run.profile_status_filter or "Any status" }}{% if run.provider_guess_filter %}, {{ run.provider_guess_filter }}{% endif %}</td>
+          <td>{{ run.profile_status_filter|fmt_profile_status_filter }}{% if run.provider_guess_filter %}, {{ run.provider_guess_filter }}{% endif %}</td>
         </tr>
         <tr>
           <th>Test query</th>
           <td>{{ run.test_query }}</td>
+        </tr>
+        <tr>
+          <th>Discovery workers</th>
+          <td>{{ run.max_workers|fmt_int or "Default" }}</td>
         </tr>
         <tr>
           <th>Force rediscovery</th>

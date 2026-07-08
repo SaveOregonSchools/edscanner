@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -17,6 +17,7 @@ IMPORTS_DIR = APP_ROOT / "imports"
 EXPORTS_DIR = APP_ROOT / "exports"
 LOGS_DIR = APP_ROOT / "logs"
 SEARCH_RUN_LOGS_DIR = LOGS_DIR / "search_runs"
+PROFILE_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "profile_discovery_runs"
 ENV_PATH = APP_ROOT / ".env"
 
 
@@ -59,9 +60,14 @@ DB_PATH = Path(os.getenv("EDSCANNER_DB_PATH", DEFAULT_DB_PATH)).expanduser().res
 LOG_PATH = LOGS_DIR / "edscanner.log"
 
 APP_VERSION = "0.1"
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36"
+)
 USER_AGENT = os.getenv(
     "EDSCANNER_USER_AGENT",
-    "EdScanner/0.1 (+https://github.com/SaveOregonSchools/edscanner; public school district content search)",
+    DEFAULT_BROWSER_USER_AGENT,
 )
 
 
@@ -99,6 +105,7 @@ REQUEST_DELAY_SECONDS = _env_float("EDSCANNER_REQUEST_DELAY", 0.75, minimum=0.0)
 MAX_PDF_SIZE_BYTES = _env_int("EDSCANNER_MAX_PDF_SIZE_MB", 10, minimum=1) * 1024 * 1024
 MAX_HTML_SIZE_BYTES = _env_int("EDSCANNER_MAX_HTML_SIZE_MB", 5, minimum=1) * 1024 * 1024
 MAX_TOTAL_DISTRICTS_PER_RUN = _env_int("EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN", 25, minimum=1)
+PROFILE_DISCOVERY_WORKERS = _env_int("EDSCANNER_PROFILE_DISCOVERY_WORKERS", 3, minimum=1)
 VERIFY_SSL = _env_bool("EDSCANNER_VERIFY_SSL", True)
 RESPECT_ROBOTS = _env_bool("EDSCANNER_RESPECT_ROBOTS", False)
 BRAVE_SEARCH_API_KEY_ENV = "BRAVE_SEARCH_API_KEY"
@@ -221,7 +228,7 @@ INVALID_WEBSITE_VALUES = {
 
 
 def ensure_directories() -> None:
-    for path in (DATA_DIR, IMPORTS_DIR, EXPORTS_DIR, LOGS_DIR, SEARCH_RUN_LOGS_DIR):
+    for path in (DATA_DIR, IMPORTS_DIR, EXPORTS_DIR, LOGS_DIR, SEARCH_RUN_LOGS_DIR, PROFILE_DISCOVERY_RUN_LOGS_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -438,6 +445,7 @@ def init_db(db_path: Path | str | None = None) -> None:
                 profile_status_filter TEXT,
                 provider_guess_filter TEXT,
                 max_districts INTEGER,
+                max_workers INTEGER,
                 test_query TEXT,
                 force INTEGER NOT NULL DEFAULT 0,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
@@ -493,6 +501,8 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN provider_guess_filter TEXT;")
         if "cancel_requested" not in existing_discovery_columns:
             conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;")
+        if "max_workers" not in existing_discovery_columns:
+            conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN max_workers INTEGER;")
         conn.commit()
 
 
@@ -570,6 +580,19 @@ def normalize_website(value: Any) -> tuple[str, int]:
     if not _has_domain_shape(hostname):
         return "", 0
     return normalized, 1
+
+
+def prefer_https_url(value: str | None) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if parsed.scheme.casefold() != "http":
+        return url
+    hostname = (parsed.hostname or "").casefold()
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return url
+    return urlunparse(("https", parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
 
 
 def discover_import_files() -> list[Path]:

@@ -53,7 +53,9 @@ py import_districts.py --source imports\districts.csv --db data\edscanner.db
 The importer handles NCES/ELSI exports with metadata rows before the header.
 Source headers are cleaned so `[District]` and trailing year text are removed
 before mapping fields into the database. District websites are normalized, and
-only rows with searchable websites are included in search runs.
+only rows with searchable websites are included in search runs. Runtime website
+fetches prefer HTTPS even when an imported district URL was originally listed as
+HTTP.
 
 ## Pages
 
@@ -159,13 +161,22 @@ Result sources are saved with each hit:
 
 Use the Search Profiles page to filter districts, queue built-in district search
 profile discovery runs, and inspect coverage by status, provider guess,
-confidence, test result count, and last discovery date. Discovery runs process in
-a background worker with a progress page that auto-refreshes every 15 seconds.
-Discovery is intentionally conservative: it checks same-domain GET forms and a
-short list of common search URL patterns, avoids login/portal/payment forms, and
-confirms candidate results by fetching returned content pages. By default it
-does not enforce `robots.txt`; set `EDSCANNER_RESPECT_ROBOTS=true` to enable
-robots.txt checks.
+confidence, test result count, and last discovery date. The profile status
+filter supports selecting multiple statuses at once, including `Never tested`.
+Discovery runs process in a background worker with a progress page that
+auto-refreshes every 15 seconds. Each discovery run can include up to 1,000
+districts and uses a bounded worker pool, defaulting to 3 concurrent districts
+and configurable with `EDSCANNER_PROFILE_DISCOVERY_WORKERS` or the Search
+Profiles form. Discovery is intentionally conservative: it checks same-domain
+GET forms, a short list of common search URL patterns, and known platform APIs
+where available. Edlio sites are tested through Edlio's JSON search API while
+still requiring returned links to belong to the district site. Apptegy sites
+that do not expose a simple endpoint are recorded as JavaScript/platform parser
+cases instead of saving failed generic search URL guesses. Discovery avoids
+login/portal/payment forms and confirms candidate results by fetching returned
+content pages. By default it uses a Chrome-on-Windows style user agent and does
+not enforce `robots.txt`; set `EDSCANNER_USER_AGENT` to override the request
+identity, or `EDSCANNER_RESPECT_ROBOTS=true` to enable robots.txt checks.
 
 You can also run discovery from PowerShell:
 
@@ -186,6 +197,16 @@ py -m playwright install chromium
 
 Challenge/CAPTCHA pages are not bypassed. They are recorded as
 `blocked_by_challenge`, and hybrid modes can fall back to the crawler.
+
+Each profile discovery run writes a debug log under:
+
+```text
+logs\profile_discovery_runs\
+```
+
+The profile discovery run detail page links to that log. Logs include candidate
+URL tests, result parsing outcomes, saved statuses, provider guesses, and
+per-district completion events.
 
 ## Run Status
 
@@ -271,6 +292,8 @@ $env:EDSCANNER_REQUEST_DELAY="0.75"
 $env:EDSCANNER_MAX_PDF_SIZE_MB="10"
 $env:EDSCANNER_MAX_HTML_SIZE_MB="5"
 $env:EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN="25"
+$env:EDSCANNER_PROFILE_DISCOVERY_WORKERS="3"
+$env:EDSCANNER_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 $env:EDSCANNER_VERIFY_SSL="true"
 $env:EDSCANNER_RESPECT_ROBOTS="false"
 $env:EDSCANNER_FLASK_DEBUG="false"
