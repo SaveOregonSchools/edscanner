@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -17,6 +17,7 @@ IMPORTS_DIR = APP_ROOT / "imports"
 EXPORTS_DIR = APP_ROOT / "exports"
 LOGS_DIR = APP_ROOT / "logs"
 SEARCH_RUN_LOGS_DIR = LOGS_DIR / "search_runs"
+PROFILE_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "profile_discovery_runs"
 ENV_PATH = APP_ROOT / ".env"
 
 
@@ -59,9 +60,14 @@ DB_PATH = Path(os.getenv("EDSCANNER_DB_PATH", DEFAULT_DB_PATH)).expanduser().res
 LOG_PATH = LOGS_DIR / "edscanner.log"
 
 APP_VERSION = "0.1"
+DEFAULT_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/149.0.0.0 Safari/537.36"
+)
 USER_AGENT = os.getenv(
     "EDSCANNER_USER_AGENT",
-    "EdScanner/0.1 (+https://github.com/SaveOregonSchools/edscanner; public school district content search)",
+    DEFAULT_BROWSER_USER_AGENT,
 )
 
 
@@ -99,7 +105,9 @@ REQUEST_DELAY_SECONDS = _env_float("EDSCANNER_REQUEST_DELAY", 0.75, minimum=0.0)
 MAX_PDF_SIZE_BYTES = _env_int("EDSCANNER_MAX_PDF_SIZE_MB", 10, minimum=1) * 1024 * 1024
 MAX_HTML_SIZE_BYTES = _env_int("EDSCANNER_MAX_HTML_SIZE_MB", 5, minimum=1) * 1024 * 1024
 MAX_TOTAL_DISTRICTS_PER_RUN = _env_int("EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN", 25, minimum=1)
+PROFILE_DISCOVERY_WORKERS = _env_int("EDSCANNER_PROFILE_DISCOVERY_WORKERS", 3, minimum=1)
 VERIFY_SSL = _env_bool("EDSCANNER_VERIFY_SSL", True)
+RESPECT_ROBOTS = _env_bool("EDSCANNER_RESPECT_ROBOTS", False)
 BRAVE_SEARCH_API_KEY_ENV = "BRAVE_SEARCH_API_KEY"
 
 
@@ -220,7 +228,7 @@ INVALID_WEBSITE_VALUES = {
 
 
 def ensure_directories() -> None:
-    for path in (DATA_DIR, IMPORTS_DIR, EXPORTS_DIR, LOGS_DIR, SEARCH_RUN_LOGS_DIR):
+    for path in (DATA_DIR, IMPORTS_DIR, EXPORTS_DIR, LOGS_DIR, SEARCH_RUN_LOGS_DIR, PROFILE_DISCOVERY_RUN_LOGS_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -354,6 +362,106 @@ def init_db(db_path: Path | str | None = None) -> None:
                 ON search_results(search_run_id);
             CREATE INDEX IF NOT EXISTS idx_search_results_district
                 ON search_results(district_id);
+
+            CREATE TABLE IF NOT EXISTS district_search_profiles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                website_normalized TEXT,
+                profile_status TEXT NOT NULL,
+                profile_type TEXT,
+                provider_guess TEXT,
+                search_url_template TEXT,
+                search_method TEXT,
+                query_param TEXT,
+                extra_params_json TEXT,
+                result_selector TEXT,
+                result_link_selector TEXT,
+                result_title_selector TEXT,
+                result_snippet_selector TEXT,
+                same_domain_only INTEGER NOT NULL DEFAULT 1,
+                requires_javascript INTEGER NOT NULL DEFAULT 0,
+                uses_external_provider INTEGER NOT NULL DEFAULT 0,
+                external_provider_host TEXT,
+                confidence REAL NOT NULL DEFAULT 0,
+                test_query TEXT,
+                test_result_count INTEGER NOT NULL DEFAULT 0,
+                test_success INTEGER NOT NULL DEFAULT 0,
+                last_tested_at TEXT,
+                last_discovered_at TEXT,
+                error_message TEXT,
+                raw_discovery_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_district_search_profiles_district
+                ON district_search_profiles(district_id);
+            CREATE INDEX IF NOT EXISTS idx_district_search_profiles_status
+                ON district_search_profiles(profile_status);
+            CREATE INDEX IF NOT EXISTS idx_district_search_profiles_provider
+                ON district_search_profiles(provider_guess);
+
+            CREATE TABLE IF NOT EXISTS district_search_profile_tests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER REFERENCES district_search_profiles(id) ON DELETE SET NULL,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                test_query TEXT NOT NULL,
+                attempted_url TEXT,
+                status_code INTEGER,
+                content_type TEXT,
+                result_count INTEGER NOT NULL DEFAULT 0,
+                success INTEGER NOT NULL DEFAULT 0,
+                confidence REAL NOT NULL DEFAULT 0,
+                error_message TEXT,
+                raw_test_json TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_district_search_profile_tests_district
+                ON district_search_profile_tests(district_id);
+
+            CREATE TABLE IF NOT EXISTS search_provider_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_name TEXT NOT NULL,
+                pattern_name TEXT NOT NULL,
+                host_contains TEXT,
+                html_marker TEXT,
+                form_action_contains TEXT,
+                query_param_candidates_json TEXT,
+                url_templates_json TEXT,
+                result_link_selector TEXT,
+                notes TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS profile_discovery_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                states_json TEXT,
+                agency_types_json TEXT,
+                min_enrollment INTEGER,
+                max_enrollment INTEGER,
+                profile_status_filter TEXT,
+                provider_guess_filter TEXT,
+                max_districts INTEGER,
+                max_workers INTEGER,
+                test_query TEXT,
+                force INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                districts_matched INTEGER NOT NULL DEFAULT 0,
+                districts_planned INTEGER NOT NULL DEFAULT 0,
+                districts_processed INTEGER NOT NULL DEFAULT 0,
+                profiles_working INTEGER NOT NULL DEFAULT 0,
+                profiles_failed INTEGER NOT NULL DEFAULT 0,
+                profiles_manual_review INTEGER NOT NULL DEFAULT 0,
+                profiles_requires_javascript INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT,
+                finished_at TEXT,
+                error_message TEXT,
+                debug_log_path TEXT
+            );
             """
         )
         existing_columns = {
@@ -384,6 +492,20 @@ def init_db(db_path: Path | str | None = None) -> None:
         }
         if "search_source" not in existing_result_columns:
             conn.execute("ALTER TABLE search_results ADD COLUMN search_source TEXT;")
+        existing_discovery_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(profile_discovery_runs)")
+        }
+        if "profile_status_filter" not in existing_discovery_columns:
+            conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN profile_status_filter TEXT;")
+        if "provider_guess_filter" not in existing_discovery_columns:
+            conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN provider_guess_filter TEXT;")
+        if "cancel_requested" not in existing_discovery_columns:
+            conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;")
+        if "max_workers" not in existing_discovery_columns:
+            conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN max_workers INTEGER;")
+        if "profiles_requires_javascript" not in existing_discovery_columns:
+            conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN profiles_requires_javascript INTEGER NOT NULL DEFAULT 0;")
         conn.commit()
 
 
@@ -461,6 +583,19 @@ def normalize_website(value: Any) -> tuple[str, int]:
     if not _has_domain_shape(hostname):
         return "", 0
     return normalized, 1
+
+
+def prefer_https_url(value: str | None) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if parsed.scheme.casefold() != "http":
+        return url
+    hostname = (parsed.hostname or "").casefold()
+    if hostname in {"localhost", "127.0.0.1", "::1"}:
+        return url
+    return urlunparse(("https", parsed.netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
 
 
 def discover_import_files() -> list[Path]:

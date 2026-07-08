@@ -28,6 +28,7 @@ from common import (
     MAX_TOTAL_DISTRICTS_PER_RUN,
     REQUEST_DELAY_SECONDS,
     REQUEST_TIMEOUT_SECONDS,
+    RESPECT_ROBOTS,
     SEARCH_RUN_LOGS_DIR,
     USER_AGENT,
     VERIFY_SSL,
@@ -36,12 +37,21 @@ from common import (
     init_db,
     json_dumps,
     normalize_website,
+    prefer_https_url,
     utc_now_iso,
 )
 
 
 LOGGER = logging.getLogger(__name__)
-SEARCH_METHODS = {"crawler", "brave", "hybrid"}
+SEARCH_METHODS = {
+    "crawler",
+    "brave",
+    "hybrid",
+    "district_search",
+    "district_search_hybrid",
+    "district_search_browser",
+    "district_search_browser_hybrid",
+}
 MAX_API_RESULTS_PER_DISTRICT = 20
 MAX_FOLLOW_DEPTH = 2
 
@@ -57,10 +67,13 @@ class SearchSettings:
     max_total_districts_per_run: int = MAX_TOTAL_DISTRICTS_PER_RUN
     user_agent: str = USER_AGENT
     verify_ssl: bool = VERIFY_SSL
+    respect_robots: bool = RESPECT_ROBOTS
     search_method: str = "crawler"
     search_provider: str = "brave"
     api_results_per_district: int = 10
     follow_depth: int = 0
+    browser_for_javascript: bool = False
+    browser_render_timeout_seconds: float = 20.0
     brave_api_key: str = ""
     brave_endpoint: str = "https://api.search.brave.com/res/v1/web/search"
 
@@ -294,6 +307,8 @@ def load_robots(session: requests.Session, base_url: str, settings: SearchSettin
 
 
 def can_fetch(parser: robotparser.RobotFileParser | None, settings: SearchSettings, url: str) -> bool:
+    if not settings.respect_robots:
+        return True
     if parser is None:
         return True
     try:
@@ -493,7 +508,7 @@ def _search_district_crawler(
     debug_logger: RunDebugLogger | None = None,
 ) -> list[dict[str, Any]]:
     settings = settings or SearchSettings()
-    base_url = district.get("website_normalized") or normalize_website(district.get("website"))[0]
+    base_url = prefer_https_url(district.get("website_normalized") or normalize_website(district.get("website"))[0])
     if not base_url:
         debug_log(debug_logger, "district_skipped", district=district.get("agency_name"), reason="missing_website")
         return []
@@ -786,7 +801,7 @@ def _search_district_brave(
     cancel_requested: Callable[[], bool] | None = None,
     debug_logger: RunDebugLogger | None = None,
 ) -> list[dict[str, Any]]:
-    base_url = district.get("website_normalized") or normalize_website(district.get("website"))[0]
+    base_url = prefer_https_url(district.get("website_normalized") or normalize_website(district.get("website"))[0])
     if not base_url:
         debug_log(debug_logger, "district_skipped", district=district.get("agency_name"), reason="missing_website")
         return []
@@ -923,6 +938,7 @@ def search_district(
     *,
     cancel_requested: Callable[[], bool] | None = None,
     debug_logger: RunDebugLogger | None = None,
+    db_path: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     settings = settings or SearchSettings()
     method = normalize_search_method(settings.search_method)
@@ -942,6 +958,32 @@ def search_district(
             cancel_requested=cancel_requested,
             debug_logger=debug_logger,
         )
+    if method in {"district_search", "district_search_hybrid", "district_search_browser", "district_search_browser_hybrid"}:
+        from site_search_discovery import search_with_district_profile
+
+        use_browser = method in {"district_search_browser", "district_search_browser_hybrid"}
+        district_results = search_with_district_profile(
+            district,
+            query_text,
+            settings,
+            cancel_requested=cancel_requested,
+            debug_logger=debug_logger,
+            db_path=db_path,
+            use_browser_for_javascript=use_browser,
+        )
+        if district_results or method in {"district_search", "district_search_browser"}:
+            return district_results
+        debug_log(debug_logger, "district_search_fallback_crawler", district=district.get("agency_name"))
+        fallback_results = _search_district_crawler(
+            district,
+            query_text,
+            settings,
+            cancel_requested=cancel_requested,
+            debug_logger=debug_logger,
+        )
+        for result in fallback_results:
+            result["search_source"] = "district_search+fallback_crawler"
+        return fallback_results
 
     try:
         brave_results = _search_district_brave(
@@ -986,7 +1028,12 @@ def create_search_run(
     cap = max_districts or settings.max_total_districts_per_run
     cap = max(1, min(cap, settings.max_total_districts_per_run))
     search_method = normalize_search_method(settings.search_method)
-    search_provider = "brave" if search_method in {"brave", "hybrid"} else "crawler"
+    if search_method in {"brave", "hybrid"}:
+        search_provider = "brave"
+    elif search_method in {"district_search", "district_search_hybrid", "district_search_browser", "district_search_browser_hybrid"}:
+        search_provider = "district_search"
+    else:
+        search_provider = "crawler"
     api_results_per_district = clamp_api_results(settings.api_results_per_district)
     follow_depth = clamp_follow_depth(settings.follow_depth)
     states = _clean_list(states)
@@ -1058,7 +1105,13 @@ def execute_search_run(
         cap = run["max_districts"] or MAX_TOTAL_DISTRICTS_PER_RUN
         max_pages = run["max_pages_per_district"] or MAX_PAGES_PER_DISTRICT
         search_method = normalize_search_method(run["search_method"])
-        search_provider = run["search_provider"] or ("brave" if search_method in {"brave", "hybrid"} else "crawler")
+        search_provider = run["search_provider"] or (
+            "brave"
+            if search_method in {"brave", "hybrid"}
+            else "district_search"
+            if search_method in {"district_search", "district_search_hybrid", "district_search_browser", "district_search_browser_hybrid"}
+            else "crawler"
+        )
         api_results_per_district = clamp_api_results(run["api_results_per_district"])
         follow_depth = clamp_follow_depth(run["follow_depth"])
         matched_count = run["districts_matched"] or 0
@@ -1121,10 +1174,14 @@ def execute_search_run(
         max_total_districts_per_run=max(cap, 1),
         user_agent=base_settings.user_agent,
         verify_ssl=base_settings.verify_ssl,
+        respect_robots=base_settings.respect_robots,
         search_method=search_method,
         search_provider=search_provider,
         api_results_per_district=api_results_per_district,
         follow_depth=follow_depth,
+        browser_for_javascript=base_settings.browser_for_javascript
+        or search_method in {"district_search_browser", "district_search_browser_hybrid"},
+        browser_render_timeout_seconds=base_settings.browser_render_timeout_seconds,
         brave_api_key=base_settings.brave_api_key or get_local_setting(BRAVE_SEARCH_API_KEY_ENV),
         brave_endpoint=base_settings.brave_endpoint,
     )
@@ -1170,6 +1227,7 @@ def execute_search_run(
                         run_settings,
                         cancel_requested=lambda: is_cancel_requested(run_id, db_path),
                         debug_logger=debug_logger,
+                        db_path=db_path,
                     )
                     searched += 1
                     now = utc_now_iso()
