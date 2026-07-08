@@ -66,6 +66,10 @@
         <select id="search_method" name="search_method">
           <option value="brave" {% if search_method == "brave" %}selected{% endif %}>Brave API first</option>
           <option value="hybrid" {% if search_method == "hybrid" %}selected{% endif %}>Brave with crawler fallback</option>
+          <option value="district_search" {% if search_method == "district_search" %}selected{% endif %}>District site search</option>
+          <option value="district_search_hybrid" {% if search_method == "district_search_hybrid" %}selected{% endif %}>District site search with crawler fallback</option>
+          <option value="district_search_browser" {% if search_method == "district_search_browser" %}selected{% endif %}>District site search with browser for JS profiles</option>
+          <option value="district_search_browser_hybrid" {% if search_method == "district_search_browser_hybrid" %}selected{% endif %}>District site search with browser and crawler fallback</option>
           <option value="crawler" {% if search_method == "crawler" %}selected{% endif %}>Crawler only</option>
         </select>
       </div>
@@ -92,6 +96,16 @@
           <span>Estimated API calls: <strong>{{ estimated_api_calls|fmt_int }}</strong></span>
           <span>Approximate listed API cost: <strong>${{ "%.2f"|format(estimated_brave_cost) }}</strong></span>
           <a href="{{ url_for('settings_page') }}">Settings</a>
+        {% elif search_method in ["district_search", "district_search_hybrid", "district_search_browser", "district_search_browser_hybrid"] %}
+          <span>Working district profiles: <strong>{{ district_profile_coverage.working_count|fmt_int }}</strong> of <strong>{{ district_profile_coverage.matching_count|fmt_int }}</strong></span>
+          {% if search_method in ["district_search_browser", "district_search_browser_hybrid"] %}
+            <span>JS profiles available for browser search: <strong>{{ district_profile_coverage.javascript_count|fmt_int }}</strong></span>
+          {% endif %}
+          <span>Without profiles: <strong>{{ district_profile_coverage.missing_count|fmt_int }}</strong></span>
+          <a href="{{ url_for('search_profiles_page') }}">Search Profiles</a>
+          {% if search_method == "district_search" and district_profile_coverage.working_count < district_profile_coverage.matching_count %}
+            <span>Some selected districts do not yet have working search profiles.</span>
+          {% endif %}
         {% else %}
           <span>Crawler-only runs do not use search API calls.</span>
         {% endif %}

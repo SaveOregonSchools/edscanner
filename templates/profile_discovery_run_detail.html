@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+
+{% block title %}Profile Discovery #{{ run.id }} - EdScanner{% endblock %}
+
+{% block head_extra %}
+  {% if run.status in ["queued", "running"] %}
+    <meta http-equiv="refresh" content="15">
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Profile Discovery #{{ run.id }}</h2>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('search_profiles_page') }}">Search Profiles</a>
+      <a class="button-link" href="{{ url_for('profile_discovery_run_detail', run_id=run.id) }}">Refresh</a>
+      {% if run.status in ["queued", "running"] and not run.cancel_requested %}
+        <form method="post" action="{{ url_for('cancel_profile_discovery_run', run_id=run.id) }}" class="inline-action">
+          <button type="submit" class="danger">Cancel</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if run.cancel_requested and run.status in ["queued", "running"] %}
+    <p class="status-note">Cancellation has been requested. The current district will finish before the run stops.</p>
+  {% elif run.status in ["queued", "running"] %}
+    <p class="status-note">This page auto-refreshes every 15 seconds while profile discovery is queued or running.</p>
+  {% endif %}
+
+  <section class="stat-grid compact" aria-label="Profile discovery status">
+    <div class="stat">
+      <span class="stat-label">Status</span>
+      <strong>{{ run.status }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Matched by filters</span>
+      <strong>{{ run.districts_matched|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Planned this run</span>
+      <strong>{{ run.districts_planned|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Processed</span>
+      <strong>{{ run.districts_processed|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">In progress</span>
+      <strong>{{ in_progress_count|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Left to go</span>
+      <strong>{{ left_count|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Working</span>
+      <strong>{{ run.profiles_working|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Manual review</span>
+      <strong>{{ run.profiles_manual_review|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Failed or blocked</span>
+      <strong>{{ run.profiles_failed|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Elapsed</span>
+      <strong>{{ elapsed or "" }}</strong>
+    </div>
+  </section>
+
+  <section class="content-section">
+    <h2>Discovery Settings</h2>
+    <table class="key-table">
+      <tbody>
+        <tr>
+          <th>States</th>
+          <td>{{ states|join(", ") if states else "All" }}</td>
+        </tr>
+        <tr>
+          <th>Agency types</th>
+          <td>{{ agency_types|join(", ") if agency_types else "All" }}</td>
+        </tr>
+        <tr>
+          <th>Enrollment</th>
+          <td>{{ run.min_enrollment|fmt_int or "Any" }} to {{ run.max_enrollment|fmt_int or "Any" }}</td>
+        </tr>
+        <tr>
+          <th>Profile filters</th>
+          <td>{{ run.profile_status_filter or "Any status" }}{% if run.provider_guess_filter %}, {{ run.provider_guess_filter }}{% endif %}</td>
+        </tr>
+        <tr>
+          <th>Test query</th>
+          <td>{{ run.test_query }}</td>
+        </tr>
+        <tr>
+          <th>Force rediscovery</th>
+          <td>{{ "Yes" if run.force else "No" }}</td>
+        </tr>
+        <tr>
+          <th>Started</th>
+          <td>{{ run.started_at|fmt_dt }}</td>
+        </tr>
+        <tr>
+          <th>Finished</th>
+          <td>{{ run.finished_at|fmt_dt }}</td>
+        </tr>
+        {% if run.error_message %}
+          <tr>
+            <th>Message</th>
+            <td>{{ run.error_message }}</td>
+          </tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="content-section">
+    <h2>Recent Profiles From This Run</h2>
+    {% if recent_profiles %}
+      <table>
+        <thead>
+          <tr>
+            <th>District</th>
+            <th>Status</th>
+            <th>Provider</th>
+            <th>Confidence</th>
+            <th>Results</th>
+            <th>Template</th>
+            <th>Message</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for profile in recent_profiles %}
+            <tr>
+              <td>
+                <strong>{{ profile.agency_name }}</strong>
+                <div class="status-note">{{ profile.state }} · {{ profile.agency_type }}</div>
+              </td>
+              <td><span class="status {% if profile.profile_status == 'working' %}good{% elif profile.profile_status in ['manual_review', 'requires_javascript'] %}warn{% elif profile.profile_status in ['error', 'search_found_but_failed', 'blocked_by_robots', 'blocked_by_challenge'] %}error{% endif %}">{{ profile.profile_status }}</span></td>
+              <td>{{ profile.provider_guess or "" }}</td>
+              <td>{{ "%.0f"|format(profile.confidence or 0) }}</td>
+              <td>{{ profile.test_result_count or 0 }}</td>
+              <td class="snippet">{{ profile.search_url_template or "" }}</td>
+              <td>{{ profile.error_message or "" }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No profiles have been saved for this run yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

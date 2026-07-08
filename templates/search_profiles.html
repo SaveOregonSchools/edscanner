@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+
+{% block title %}Search Profiles - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Search Profiles</h2>
+    <div class="metric-inline">
+      <span>Filtered districts</span>
+      <strong>{{ total|fmt_int }}</strong>
+    </div>
+  </section>
+
+  <section class="stat-grid compact">
+    <div class="stat">
+      <span class="stat-label">Searchable districts</span>
+      <strong>{{ summary.total_searchable|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Profiles discovered</span>
+      <strong>{{ summary.profiles_discovered|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Working</span>
+      <strong>{{ summary.working|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Never tested</span>
+      <strong>{{ summary.never_tested|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Manual review</span>
+      <strong>{{ summary.manual_review|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Requires JavaScript</span>
+      <strong>{{ summary.requires_javascript|fmt_int }}</strong>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Failed or blocked</span>
+      <strong>{{ summary.errors|fmt_int }}</strong>
+    </div>
+  </section>
+
+  <section class="tool-surface">
+    <form method="get" action="{{ url_for('search_profiles_page') }}" class="search-form">
+      <div>
+        <label for="states">States</label>
+        <select id="states" name="states" multiple size="8">
+          {% for state in options.states %}
+            <option value="{{ state }}" {% if state in selected_states %}selected{% endif %}>{{ state }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="agency_types">Agency types</label>
+        <select id="agency_types" name="agency_types" multiple size="8">
+          {% for agency_type in options.agency_types %}
+            <option value="{{ agency_type }}" {% if agency_type in selected_agency_types %}selected{% endif %}>{{ agency_type }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="profile_status">Profile status</label>
+        <select id="profile_status" name="profile_status">
+          <option value="">Any status</option>
+          <option value="__never__" {% if profile_status == "__never__" %}selected{% endif %}>Never tested</option>
+          {% for status in profile_statuses %}
+            <option value="{{ status }}" {% if profile_status == status %}selected{% endif %}>{{ status }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="provider_guess">Provider guess</label>
+        <select id="provider_guess" name="provider_guess">
+          <option value="">Any provider</option>
+          {% for provider in providers %}
+            <option value="{{ provider }}" {% if provider_guess == provider %}selected{% endif %}>{{ provider }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="min_enrollment">Min enrollment</label>
+        <input id="min_enrollment" name="min_enrollment" type="number" value="{{ min_enrollment or '' }}">
+      </div>
+      <div>
+        <label for="max_enrollment">Max enrollment</label>
+        <input id="max_enrollment" name="max_enrollment" type="number" value="{{ max_enrollment or '' }}">
+      </div>
+      <div>
+        <label for="max_districts">Max districts to discover</label>
+        <input id="max_districts" name="max_districts" type="number" min="1" max="100" value="{{ max_districts }}">
+      </div>
+      <div>
+        <label for="test_query">Test query</label>
+        <input id="test_query" name="test_query" value="{{ test_query }}">
+      </div>
+      <div class="checkbox-field">
+        <input id="force" name="force" type="checkbox" value="1" {% if force %}checked{% endif %}>
+        <label for="force">Rediscover existing profiles</label>
+      </div>
+      <div class="form-actions full">
+        <button type="submit" class="secondary">Apply filters</button>
+        <button type="submit" formaction="{{ url_for('search_profiles_page') }}" formmethod="post">Discover profiles</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <h2>Recent Discovery Runs</h2>
+    {% if recent_profile_runs %}
+      <table>
+        <thead>
+          <tr>
+            <th>Run</th>
+            <th>Status</th>
+            <th>Matched</th>
+            <th>Planned</th>
+            <th>Processed</th>
+            <th>Working</th>
+            <th>Manual review</th>
+            <th>Failed</th>
+            <th>Started</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for run in recent_profile_runs %}
+            <tr>
+              <td><a href="{{ url_for('profile_discovery_run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
+              <td><span class="status {{ run.status }}">{{ run.status }}</span></td>
+              <td>{{ run.districts_matched|fmt_int }}</td>
+              <td>{{ run.districts_planned|fmt_int }}</td>
+              <td>{{ run.districts_processed|fmt_int }}</td>
+              <td>{{ run.profiles_working|fmt_int }}</td>
+              <td>{{ run.profiles_manual_review|fmt_int }}</td>
+              <td>{{ run.profiles_failed|fmt_int }}</td>
+              <td>{{ run.started_at|fmt_dt }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No profile discovery runs yet.</p>
+    {% endif %}
+  </section>
+
+  <section class="content-section">
+    <h2>District Profiles</h2>
+    {% if summary.last_discovered_at %}
+      <p class="status-note">Last discovery: {{ summary.last_discovered_at|fmt_dt }}</p>
+    {% endif %}
+    {% if rows %}
+      <table>
+        <thead>
+          <tr>
+            <th>District</th>
+            <th>State</th>
+            <th>Status</th>
+            <th>Provider</th>
+            <th>Confidence</th>
+            <th>Results</th>
+            <th>Search URL Template</th>
+            <th>Last Discovery</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td>
+                <strong>{{ row.agency_name }}</strong>
+                <div class="status-note">{{ row.agency_type }}</div>
+              </td>
+              <td>{{ row.state }}</td>
+              <td>
+                {% if row.profile_status %}
+                  <span class="status {% if row.profile_status == 'working' %}good{% elif row.profile_status in ['manual_review', 'requires_javascript'] %}warn{% elif row.profile_status in ['error', 'search_found_but_failed', 'blocked_by_robots', 'blocked_by_challenge'] %}error{% endif %}">{{ row.profile_status }}</span>
+                {% else %}
+                  <span class="status">never tested</span>
+                {% endif %}
+                {% if row.error_message %}
+                  <div class="status-note">{{ row.error_message }}</div>
+                {% endif %}
+              </td>
+              <td>{{ row.provider_guess or "" }}</td>
+              <td>{{ "%.0f"|format(row.confidence or 0) }}</td>
+              <td>{{ row.test_result_count or 0 }}</td>
+              <td class="snippet">{{ row.search_url_template or "" }}</td>
+              <td>{{ row.last_discovered_at|fmt_dt }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No districts match these filters.</p>
+    {% endif %}
+  </section>
+{% endblock %}

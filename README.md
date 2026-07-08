@@ -6,7 +6,8 @@ data and searching district websites for keywords or exact text strings.
 The current version imports NCES/ELSI district exports into SQLite, provides
 dashboard and district-browsing views, queues website searches in a background
 worker, and supports both conservative same-domain crawling and optional Brave
-Search API-assisted discovery.
+Search API-assisted discovery. It can also discover and reuse district website
+built-in search profiles to reduce dependence on third-party search APIs.
 
 ## Local Setup
 
@@ -59,6 +60,7 @@ only rows with searchable websites are included in search runs.
 - Home: database summary, state coverage, import status, and recent runs.
 - Import: load district source files from `imports\`.
 - Search: configure filters and run website searches.
+- Search Profiles: discover and inspect district built-in search profiles.
 - Districts: browse imported districts, filter by state/name, and sort columns.
 - Settings: save or clear the local Brave Search API key.
 
@@ -101,14 +103,16 @@ wildcards, and quote parsing are not currently supported.
 
 The Search page previews the matching district count. For Brave or Hybrid runs,
 it also estimates API calls and approximate listed API cost based on the current
-district cap.
+district cap. For district site search runs, it shows how many matching
+districts already have working built-in search profiles.
 
 ## Search Methods
 
 `Crawler only` uses the built-in same-domain crawler. It does not require an API
-key. It starts with the district homepage and sitemap hints, respects
-`robots.txt` where it can be fetched and parsed, and stores pages where the query
-appears in the title, headings, or body.
+key. It starts with the district homepage and sitemap hints, and stores pages
+where the query appears in the title, headings, or body. By default EdScanner
+does not enforce `robots.txt`; set `EDSCANNER_RESPECT_ROBOTS=true` to opt back
+into robots.txt checks.
 
 `Brave API first` sends one Brave Search API request per district using a
 domain-limited query such as:
@@ -124,12 +128,64 @@ deeper.
 `Brave with crawler fallback` tries Brave first. If Brave fails or returns no
 results for a district, the district falls back to crawler mode.
 
+`District site search` uses a previously discovered built-in district search
+profile. It requests the district search results page, extracts same-domain
+result links, fetches those pages, and stores only pages where the query is
+confirmed in the actual page content. Districts without a working profile are
+skipped in this mode.
+
+`District site search with crawler fallback` tries the stored district search
+profile first. If no working profile exists or no confirmed results are found,
+the district falls back to crawler mode. It does not fall back to Brave.
+
+`District site search with browser for JS profiles` also uses stored district
+search profiles. For profiles marked `requires_javascript`, it renders the
+search results page in headless Chromium with Playwright, extracts links from
+the rendered DOM, then fetches and scores target pages normally.
+
+`District site search with browser and crawler fallback` adds crawler fallback
+when no district-search result can be confirmed. It does not fall back to Brave.
+
 Result sources are saved with each hit:
 
 - `brave`: result returned by the Brave API
 - `brave+fetch`: Brave result page fetched and confirmed
 - `brave-follow`: same-domain page found by following links from a Brave result
 - `crawler`: page found by crawler-only or fallback crawling
+- `district_search+fetch`: district search result page link fetched and confirmed
+- `district_search+fallback_crawler`: crawler result found after district search fallback
+
+## Search Profile Discovery
+
+Use the Search Profiles page to filter districts, queue built-in district search
+profile discovery runs, and inspect coverage by status, provider guess,
+confidence, test result count, and last discovery date. Discovery runs process in
+a background worker with a progress page that auto-refreshes every 15 seconds.
+Discovery is intentionally conservative: it checks same-domain GET forms and a
+short list of common search URL patterns, avoids login/portal/payment forms, and
+confirms candidate results by fetching returned content pages. By default it
+does not enforce `robots.txt`; set `EDSCANNER_RESPECT_ROBOTS=true` to enable
+robots.txt checks.
+
+You can also run discovery from PowerShell:
+
+```powershell
+py discover_search_profiles.py --state OR --limit 100
+py discover_search_profiles.py --state OR --agency-type "Regular local school district" --force
+py discover_search_profiles.py --district-id 12345 --debug
+```
+
+Profiles and test attempts are stored in SQLite in
+`district_search_profiles` and `district_search_profile_tests`.
+
+Browser-backed JavaScript profile searches require Playwright's browser runtime:
+
+```powershell
+py -m playwright install chromium
+```
+
+Challenge/CAPTCHA pages are not bypassed. They are recorded as
+`blocked_by_challenge`, and hybrid modes can fall back to the crawler.
 
 ## Run Status
 
@@ -216,6 +272,7 @@ $env:EDSCANNER_MAX_PDF_SIZE_MB="10"
 $env:EDSCANNER_MAX_HTML_SIZE_MB="5"
 $env:EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN="25"
 $env:EDSCANNER_VERIFY_SSL="true"
+$env:EDSCANNER_RESPECT_ROBOTS="false"
 $env:EDSCANNER_FLASK_DEBUG="false"
 $env:BRAVE_SEARCH_API_KEY="..."
 ```
@@ -234,7 +291,7 @@ logs\edscanner.log
 Run compile checks:
 
 ```powershell
-.\.venv\Scripts\python -m py_compile app.py common.py import_districts.py search_engine.py ai_matcher.py
+.\.venv\Scripts\python -m py_compile app.py common.py import_districts.py search_engine.py site_search_discovery.py discover_search_profiles.py ai_matcher.py
 ```
 
 Run unit tests:
@@ -244,8 +301,8 @@ Run unit tests:
 ```
 
 The test suite includes local HTTP-server coverage for crawler mode, Brave API
-mode using a fake local endpoint, CSV export, debug-log creation, and
-cancellation before run start.
+mode using a fake local endpoint, district search profile discovery and reuse,
+CSV export, debug-log creation, and cancellation before run start.
 
 ## License
 
@@ -263,6 +320,8 @@ project's trademark and branding notice.
 ## Current Limitations
 
 - Searches depend on the local Flask worker process staying open.
+- Search profile discovery batches launched from the web UI are capped and run
+  through the local Flask worker process.
 - Search matching is simple case-insensitive word or phrase matching.
 - Boolean operators, wildcards, and quote parsing are not implemented.
 - Brave mode consumes one API request per district searched.

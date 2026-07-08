@@ -4,3 +4,4 @@ beautifulsoup4>=4.12,<5
 lxml>=5.0,<7
 openpyxl>=3.1,<4
 pypdf>=5.0,<7
+playwright>=1.45,<2
