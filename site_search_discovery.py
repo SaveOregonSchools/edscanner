@@ -10,6 +10,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qsl, quote_plus, urlencode, urljoin, urlparse, urlunparse
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup, Tag
 
 from common import connect_db, init_db, json_dumps, normalize_website, prefer_https_url, utc_now_iso
@@ -454,6 +455,69 @@ def _valid_result_url(url: str, base_url: str, generated_search_url: str) -> boo
     return same_organization_url(url, base_url)
 
 
+def _result_container_score(node: Tag) -> int:
+    descriptor = " ".join([str(node.get("id") or ""), " ".join(str(item) for item in node.get("class") or [])]).casefold()
+    text = collapse_ws(node.get_text(" ", strip=True)).casefold()
+    score = 0
+    if any(marker in descriptor for marker in ("result", "search-result", "results", "site-search")):
+        score += 3
+    if any(marker in descriptor for marker in ("item", "card", "listing", "entry", "summary")):
+        score += 1
+    if any(marker in text for marker in ("read more", "learn more", "view page")):
+        score += 1
+    return score
+
+
+def _anchor_context_score(anchor: Tag, query_text: str) -> int:
+    score = 0
+    query_folded = collapse_ws(query_text).casefold()
+    anchor_text = collapse_ws(anchor.get_text(" ", strip=True))
+    if anchor_text:
+        score += 2
+    if len(anchor_text) >= 8:
+        score += 1
+    for parent in anchor.parents:
+        if not isinstance(parent, Tag):
+            continue
+        score += _result_container_score(parent)
+        parent_text = collapse_ws(parent.get_text(" ", strip=True)).casefold()
+        if query_folded and query_folded in parent_text:
+            score += 3
+        if parent.name in {"article", "li"}:
+            score += 1
+        break
+    return score
+
+
+def _looks_like_navigation_link(anchor: Tag, url: str, query_text: str) -> bool:
+    text = collapse_ws(anchor.get_text(" ", strip=True)).casefold()
+    href = url.casefold()
+    path = urlparse(url).path.casefold().strip("/")
+    if not text and not path:
+        return True
+    navigation_text = {
+        "home",
+        "search",
+        "menu",
+        "close",
+        "login",
+        "log in",
+        "facebook",
+        "twitter",
+        "x",
+        "instagram",
+        "youtube",
+        "linkedin",
+    }
+    if text in navigation_text:
+        return True
+    if any(marker in href for marker in ("/login", "/privacy", "/terms", "facebook.com", "twitter.com", "instagram.com", "youtube.com", "linkedin.com")):
+        return True
+    if query_text and text == collapse_ws(query_text).casefold():
+        return True
+    return False
+
+
 def parse_search_results_page(
     html: bytes,
     final_url: str,
@@ -465,36 +529,56 @@ def parse_search_results_page(
 ) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "lxml")
     generated_search_url = build_search_url(profile.get("search_url_template") or final_url, query_text)
-    likely_containers: list[Tag] = []
+    has_finalsite_algolia_search = bool(
+        soup.find(
+            attrs={
+                "data-app-id": True,
+                "data-index-prefix": True,
+                "data-api-key": True,
+            }
+        )
+    )
+    likely_containers: list[tuple[int, Tag]] = []
     for node in soup.find_all(True):
-        descriptor = " ".join([str(node.get("id") or ""), " ".join(str(item) for item in node.get("class") or [])])
-        if any(marker in descriptor.casefold() for marker in ("result", "search-result", "results", "site-search")):
-            likely_containers.append(node)
-    containers = likely_containers or [soup]
+        score = _result_container_score(node)
+        if score:
+            likely_containers.append((score, node))
+    likely_containers.sort(key=lambda item: item[0], reverse=True)
+    containers = [node for _score, node in likely_containers[:20]]
+    if not containers and not has_finalsite_algolia_search:
+        containers = [soup]
 
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for container in containers:
+    candidates: list[dict[str, Any]] = []
+    global_fallback = [] if has_finalsite_algolia_search else [soup]
+    for container in [*containers, *global_fallback]:
         for anchor in container.find_all("a", href=True):
             href = str(anchor.get("href") or "").strip()
             url = canonical_url(urljoin(final_url, href))
             if url in seen or not _valid_result_url(url, base_url, generated_search_url):
                 continue
+            if _looks_like_navigation_link(anchor, url, query_text):
+                continue
             parent_text = collapse_ws(anchor.parent.get_text(" ", strip=True) if anchor.parent else "")
             title = collapse_ws(anchor.get_text(" ", strip=True)) or filename_title(url)
             snippet = parent_text
             seen.add(url)
-            results.append(
+            candidates.append(
                 {
                     "url": url,
                     "title": title[:500],
                     "snippet": snippet[:1000],
-                    "rank": len(results) + 1,
+                    "rank": len(candidates) + 1,
+                    "context_score": _anchor_context_score(anchor, query_text),
                     "source": "search_results_page",
                 }
             )
-            if len(results) >= max_links:
-                return results
+    candidates.sort(key=lambda item: (-int(item.get("context_score") or 0), int(item.get("rank") or 0)))
+    for item in candidates[:max_links]:
+        item.pop("context_score", None)
+        item["rank"] = len(results) + 1
+        results.append(item)
     return results
 
 
@@ -567,6 +651,112 @@ def parse_edlio_search_results(
         )
         if len(results) >= max_links:
             return results
+    return results
+
+
+def parse_finalsite_algolia_search_results(
+    html: bytes,
+    base_url: str,
+    query_text: str,
+    session: requests.Session,
+    settings: SearchSettings,
+    *,
+    max_links: int = 10,
+) -> list[dict[str, Any]]:
+    soup = BeautifulSoup(html, "lxml")
+    search_elements = soup.find_all(
+        attrs={
+            "data-app-id": True,
+            "data-index-prefix": True,
+            "data-api-key": True,
+        }
+    )
+    if not search_elements:
+        return []
+
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for element in search_elements:
+        app_id = str(element.get("data-app-id") or "").strip()
+        index_prefix = str(element.get("data-index-prefix") or "").strip()
+        api_key = str(element.get("data-api-key") or "").strip()
+        if not app_id or not index_prefix or not api_key:
+            continue
+        try:
+            domains = json.loads(str(element.get("data-domains") or "{}"))
+        except json.JSONDecodeError:
+            domains = {}
+
+        endpoint = f"https://{app_id}-dsn.algolia.net/1/indexes/{index_prefix}pages/query"
+        headers = {
+            "X-Algolia-Application-Id": app_id,
+            "X-Algolia-API-Key": api_key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "params": urlencode(
+                {
+                    "query": query_text,
+                    "hitsPerPage": max(max_links * 2, 10),
+                }
+            )
+        }
+        try:
+            response = session.post(
+                endpoint,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=settings.request_timeout_seconds,
+                verify=settings.verify_ssl,
+            )
+        except requests.exceptions.SSLError:
+            if not settings.verify_ssl:
+                raise
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            response = session.post(
+                endpoint,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=settings.request_timeout_seconds,
+                verify=False,
+            )
+        if response.status_code >= 400:
+            continue
+        try:
+            data = response.json()
+        except ValueError:
+            continue
+        for hit in data.get("hits") or []:
+            if not isinstance(hit, dict):
+                continue
+            page_path = str(hit.get("page_path") or hit.get("url") or "").strip()
+            if not page_path:
+                continue
+            domain = domains.get(str(hit.get("domain_id") or "")) if isinstance(domains, dict) else ""
+            page_base_url = f"https://{domain}" if domain else base_url
+            url = canonical_url(urljoin(page_base_url, page_path))
+            if url in seen or not _valid_result_url(url, base_url, build_search_url(str(element.get("action") or ""), query_text)):
+                continue
+            snippet_value = ""
+            snippet_result = hit.get("_snippetResult")
+            if isinstance(snippet_result, dict):
+                content_result = snippet_result.get("content")
+                if isinstance(content_result, dict):
+                    snippet_value = _edlio_text(content_result.get("value"))
+            title = collapse_ws(str(hit.get("page_name") or hit.get("title") or filename_title(url)))
+            snippet = snippet_value or collapse_ws(str(hit.get("content") or ""))[:1000]
+            seen.add(url)
+            results.append(
+                {
+                    "url": url,
+                    "title": title[:500],
+                    "snippet": snippet[:1000],
+                    "rank": len(results) + 1,
+                    "source": "finalsite_algolia",
+                }
+            )
+            if len(results) >= max_links:
+                return results
     return results
 
 
@@ -651,6 +841,17 @@ def _fetch_and_score_result(
     if not match:
         return None
     match["status_code"] = response.status_code
+    return match
+
+
+def _score_search_result_item(item: dict[str, Any], query_text: str) -> dict[str, Any] | None:
+    url = str(item.get("url") or "")
+    title = str(item.get("title") or filename_title(url))
+    snippet = str(item.get("snippet") or "")
+    match = score_match(query_text, title, [], snippet, url, "text/html")
+    if not match:
+        return None
+    match["status_code"] = None
     return match
 
 
@@ -762,7 +963,9 @@ def _test_candidate(
                             match = _fetch_and_score_result(session, item["url"], test_query, settings)
                         except Exception as exc:
                             raw.setdefault("result_errors", []).append({"url": item["url"], "error": str(exc)})
-                            continue
+                            match = _score_search_result_item(item, test_query)
+                        if not match and item.get("source") in {"finalsite_algolia", "edlio_search_api"}:
+                            match = _score_search_result_item(item, test_query)
                         if match:
                             confirmed += 1
                             raw["confirmed_urls"].append(match["url"])
@@ -780,6 +983,15 @@ def _test_candidate(
                         candidate,
                         max_links=10,
                     )
+                    if not result_links:
+                        result_links = parse_finalsite_algolia_search_results(
+                            content,
+                            base_url,
+                            test_query,
+                            session,
+                            settings,
+                            max_links=10,
+                        )
                     raw["result_links"] = result_links
                     if result_links:
                         confidence += 20
@@ -806,7 +1018,9 @@ def _test_candidate(
                             match = _fetch_and_score_result(session, item["url"], test_query, settings)
                         except Exception as exc:
                             raw.setdefault("result_errors", []).append({"url": item["url"], "error": str(exc)})
-                            continue
+                            match = _score_search_result_item(item, test_query)
+                        if not match and item.get("source") in {"finalsite_algolia", "edlio_search_api"}:
+                            match = _score_search_result_item(item, test_query)
                         if match:
                             confirmed += 1
                             raw["confirmed_urls"].append(match["url"])
@@ -1549,6 +1763,22 @@ def search_with_district_profile(
                 profile,
                 max_links=max_links,
             )
+            if not result_links:
+                result_links = parse_finalsite_algolia_search_results(
+                    html,
+                    base_url,
+                    query_text,
+                    session,
+                    settings,
+                    max_links=max_links,
+                )
+                if result_links:
+                    debug_log(
+                        debug_logger,
+                        "district_search_finalsite_algolia_results",
+                        district=district.get("agency_name"),
+                        result_links=len(result_links),
+                    )
         debug_log(
             debug_logger,
             "district_search_result_page_fetched",
@@ -1575,9 +1805,11 @@ def search_with_district_profile(
             match = _fetch_and_score_result(session, url, query_text, settings)
         except Exception as exc:
             debug_log(debug_logger, "district_search_result_rejected", district=district.get("agency_name"), url=url, reason=str(exc))
-            match = None
+            match = _score_search_result_item(item, query_text)
+        if not match and item.get("source") in {"finalsite_algolia", "edlio_search_api"}:
+            match = _score_search_result_item(item, query_text)
         if match:
-            match["search_source"] = "district_search+fetch"
+            match["search_source"] = "district_search+fetch" if match.get("status_code") else f"district_search+{item.get('source') or 'search_result'}"
             match["score"] += max(0, 20 - int(item.get("rank") or 1))
             result_map[match["url"]] = match
             debug_log(

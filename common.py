@@ -106,6 +106,7 @@ MAX_PDF_SIZE_BYTES = _env_int("EDSCANNER_MAX_PDF_SIZE_MB", 10, minimum=1) * 1024
 MAX_HTML_SIZE_BYTES = _env_int("EDSCANNER_MAX_HTML_SIZE_MB", 5, minimum=1) * 1024 * 1024
 MAX_TOTAL_DISTRICTS_PER_RUN = _env_int("EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN", 25, minimum=1)
 PROFILE_DISCOVERY_WORKERS = _env_int("EDSCANNER_PROFILE_DISCOVERY_WORKERS", 3, minimum=1)
+SEARCH_RUN_WORKERS = _env_int("EDSCANNER_SEARCH_RUN_WORKERS", 4, minimum=1)
 VERIFY_SSL = _env_bool("EDSCANNER_VERIFY_SSL", True)
 RESPECT_ROBOTS = _env_bool("EDSCANNER_RESPECT_ROBOTS", False)
 BRAVE_SEARCH_API_KEY_ENV = "BRAVE_SEARCH_API_KEY"
@@ -325,6 +326,7 @@ def init_db(db_path: Path | str | None = None) -> None:
                 search_provider TEXT,
                 api_results_per_district INTEGER,
                 follow_depth INTEGER NOT NULL DEFAULT 0,
+                max_workers INTEGER,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
                 debug_logging INTEGER NOT NULL DEFAULT 0,
                 debug_log_path TEXT,
@@ -480,6 +482,8 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE search_runs ADD COLUMN api_results_per_district INTEGER;")
         if "follow_depth" not in existing_columns:
             conn.execute("ALTER TABLE search_runs ADD COLUMN follow_depth INTEGER NOT NULL DEFAULT 0;")
+        if "max_workers" not in existing_columns:
+            conn.execute("ALTER TABLE search_runs ADD COLUMN max_workers INTEGER;")
         if "cancel_requested" not in existing_columns:
             conn.execute("ALTER TABLE search_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;")
         if "debug_logging" not in existing_columns:

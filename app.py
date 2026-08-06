@@ -23,6 +23,7 @@ from common import (
     PROFILE_DISCOVERY_WORKERS,
     MAX_TOTAL_DISTRICTS_PER_RUN,
     SEARCH_RUN_LOGS_DIR,
+    SEARCH_RUN_WORKERS,
     collect_db_stats,
     configure_logging,
     connect_db,
@@ -827,6 +828,7 @@ def search_page():
     max_enrollment = parse_optional_int(request.args.get("max_enrollment"))
     max_districts = parse_optional_int(request.args.get("max_districts")) or MAX_TOTAL_DISTRICTS_PER_RUN
     max_pages_per_district = parse_optional_int(request.args.get("max_pages_per_district")) or MAX_PAGES_PER_DISTRICT
+    max_workers = clamp_int(parse_optional_int(request.values.get("max_workers")), SEARCH_RUN_WORKERS, 1, 8)
     brave_key_present = has_brave_search_api_key()
     default_method = "brave" if brave_key_present else "crawler"
     search_method = normalize_search_method(request.values.get("search_method") or default_method)
@@ -855,6 +857,7 @@ def search_page():
         max_enrollment=max_enrollment,
         max_districts=max_districts,
         max_pages_per_district=max_pages_per_district,
+        max_workers=max_workers,
         search_method=search_method,
         api_results_per_district=api_results_per_district,
         follow_depth=follow_depth,
@@ -1162,6 +1165,7 @@ def run_search_route():
     search_method = normalize_search_method(request.form.get("search_method"))
     api_results_per_district = clamp_int(parse_optional_int(request.form.get("api_results_per_district")), 10, 1, 20)
     follow_depth = clamp_int(parse_optional_int(request.form.get("follow_depth")), 0, 0, 2)
+    max_workers = clamp_int(parse_optional_int(request.form.get("max_workers")), SEARCH_RUN_WORKERS, 1, 8)
     debug_logging = request.form.get("debug_logging", "").casefold() in {"1", "true", "yes", "on"}
     if not query_text:
         flash("Search text is required.", "error")
@@ -1177,6 +1181,7 @@ def run_search_route():
             min_enrollment=min_enrollment,
             max_enrollment=max_enrollment,
             max_districts=max_districts,
+            max_workers=max_workers,
             debug_logging=debug_logging,
             settings=SearchSettings(
                 max_pages_per_district=max_pages_per_district,
@@ -1222,7 +1227,9 @@ def run_detail(run_id: int):
         int(run["districts_matched"] or 0),
         int(run["max_districts"] or run["districts_matched"] or 0),
     )
-    in_progress_count = 1 if run["status"] == "running" and int(run["districts_searched"] or 0) < planned_districts else 0
+    in_progress_count = 0
+    if run["status"] == "running" and int(run["districts_searched"] or 0) < planned_districts:
+        in_progress_count = min(int(run["max_workers"] or SEARCH_RUN_WORKERS), planned_districts - int(run["districts_searched"] or 0))
     left_count = max(0, planned_districts - int(run["districts_searched"] or 0) - in_progress_count)
     return render_template(
         "run_detail.html",
@@ -1315,4 +1322,5 @@ def export_run(run_id: int):
 
 if __name__ == "__main__":
     debug = os.getenv("EDSCANNER_FLASK_DEBUG", "").casefold() in {"1", "true", "yes", "on"}
-    app.run(host="127.0.0.1", port=5000, debug=debug, use_reloader=False)
+    port = clamp_int(parse_optional_int(os.getenv("EDSCANNER_PORT")), 8765, 1, 65535)
+    app.run(host="127.0.0.1", port=port, debug=debug, use_reloader=False)

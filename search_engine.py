@@ -5,9 +5,11 @@ import gzip
 import io
 import json
 import logging
+import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -30,6 +32,7 @@ from common import (
     REQUEST_TIMEOUT_SECONDS,
     RESPECT_ROBOTS,
     SEARCH_RUN_LOGS_DIR,
+    SEARCH_RUN_WORKERS,
     USER_AGENT,
     VERIFY_SSL,
     connect_db,
@@ -54,6 +57,7 @@ SEARCH_METHODS = {
 }
 MAX_API_RESULTS_PER_DISTRICT = 20
 MAX_FOLLOW_DEPTH = 2
+MAX_SEARCH_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -81,6 +85,7 @@ class SearchSettings:
 class RunDebugLogger:
     def __init__(self, path: Path):
         self.path = path
+        self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def log(self, event: str, **fields: Any) -> None:
@@ -91,8 +96,9 @@ class RunDebugLogger:
         line = f"{utc_now_iso()} {event}"
         if payload:
             line = f"{line} {payload}"
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
 
 
 def debug_log(debug_logger: RunDebugLogger | None, event: str, **fields: Any) -> None:
@@ -108,6 +114,12 @@ def parse_optional_int(value: Any) -> int | None:
         return int(text)
     except ValueError:
         return None
+
+
+def clamp_int(value: int | None, default: int, minimum: int, maximum: int) -> int:
+    if value is None:
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def _clean_list(values: list[str] | tuple[str, ...] | None) -> list[str]:
@@ -1015,6 +1027,7 @@ def create_search_run(
     max_enrollment: int | None = None,
     *,
     max_districts: int | None = None,
+    max_workers: int | None = None,
     debug_logging: bool = False,
     db_path: Path | str | None = None,
     settings: SearchSettings | None = None,
@@ -1036,6 +1049,7 @@ def create_search_run(
         search_provider = "crawler"
     api_results_per_district = clamp_api_results(settings.api_results_per_district)
     follow_depth = clamp_follow_depth(settings.follow_depth)
+    worker_count = clamp_int(max_workers, SEARCH_RUN_WORKERS, 1, MAX_SEARCH_WORKERS)
     states = _clean_list(states)
     agency_types = _clean_list(agency_types)
     matched_count = count_matching_districts(states, agency_types, min_enrollment, max_enrollment, db_path)
@@ -1048,11 +1062,11 @@ def create_search_run(
                 query_text, states_json, agency_types_json, min_enrollment,
                 max_enrollment, max_districts, max_pages_per_district,
                 search_method, search_provider, api_results_per_district,
-                follow_depth,
+                follow_depth, max_workers,
                 cancel_requested, debug_logging, debug_log_path, status,
                 districts_matched, districts_searched, districts_failed, started_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, 0, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, 0, 0, ?)
             """,
             (
                 query_text,
@@ -1066,6 +1080,7 @@ def create_search_run(
                 search_provider,
                 api_results_per_district,
                 follow_depth,
+                worker_count,
                 1 if debug_logging else 0,
                 status,
                 matched_count,
@@ -1114,6 +1129,7 @@ def execute_search_run(
         )
         api_results_per_district = clamp_api_results(run["api_results_per_district"])
         follow_depth = clamp_follow_depth(run["follow_depth"])
+        max_workers = clamp_int(run["max_workers"], SEARCH_RUN_WORKERS, 1, MAX_SEARCH_WORKERS)
         matched_count = run["districts_matched"] or 0
         debug_enabled = bool(run["debug_logging"])
         already_cancelled = bool(run["cancel_requested"])
@@ -1143,6 +1159,7 @@ def execute_search_run(
             search_provider=search_provider,
             api_results_per_district=api_results_per_district,
             follow_depth=follow_depth,
+            max_workers=max_workers,
             matched_count=matched_count,
         )
 
@@ -1199,85 +1216,106 @@ def execute_search_run(
     cancelled = False
     try:
         LOGGER.info("Search run %s started: query=%r matched=%s cap=%s", run_id, query_text, matched_count, cap)
-        debug_log(debug_logger, "run_start", run_id=run_id, district_count=len(districts))
+        debug_log(debug_logger, "run_start", run_id=run_id, district_count=len(districts), max_workers=max_workers)
         with connect_db(db_path) as conn:
             conn.execute(
                 """
                 UPDATE search_runs
                 SET status = 'running',
+                    max_workers = ?,
                     districts_searched = 0,
                     districts_failed = 0,
                     finished_at = NULL,
                     error_message = NULL
                 WHERE id = ?
                 """,
-                (run_id,),
+                (max_workers, run_id),
             )
             conn.execute("DELETE FROM search_results WHERE search_run_id = ?", (run_id,))
             conn.commit()
+
+        def search_one(district: dict[str, Any]) -> list[dict[str, Any]]:
+            return search_district(
+                district,
+                query_text,
+                run_settings,
+                cancel_requested=lambda: is_cancel_requested(run_id, db_path),
+                debug_logger=debug_logger,
+                db_path=db_path,
+            )
+
+        def store_district_results(district: dict[str, Any], district_results: list[dict[str, Any]]) -> None:
+            now = utc_now_iso()
+            with connect_db(db_path) as conn:
+                for rank, result in enumerate(district_results, start=1):
+                    conn.execute(
+                        """
+                        INSERT INTO search_results (
+                            search_run_id, district_id, district_name, state,
+                            agency_type, total_enrollment_excludes_ae, website,
+                            result_rank, url, title, content_type, status_code,
+                            search_source, score, snippet, matched_terms_json, created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            district["id"],
+                            district["agency_name"],
+                            district["state"],
+                            district["agency_type"],
+                            district["total_enrollment_excludes_ae"],
+                            district["website_normalized"] or district["website"],
+                            rank,
+                            result["url"],
+                            result.get("title"),
+                            result.get("content_type"),
+                            result.get("status_code"),
+                            result.get("search_source"),
+                            result.get("score", 0),
+                            result.get("snippet"),
+                            json_dumps(result.get("matched_terms", [])),
+                            now,
+                        ),
+                    )
+                debug_log(
+                    debug_logger,
+                    "district_results_stored",
+                    run_id=run_id,
+                    district=district.get("agency_name"),
+                    stored_results=len(district_results),
+                )
+                conn.execute(
+                    """
+                    UPDATE search_runs
+                    SET districts_searched = ?, districts_failed = ?
+                    WHERE id = ?
+                    """,
+                    (searched, failed, run_id),
+                )
+                conn.commit()
+
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="SearchRun") as executor:
+            future_to_district = {}
             for district in districts:
                 if is_cancel_requested(run_id, db_path):
                     cancelled = True
                     debug_log(debug_logger, "run_cancel_requested", run_id=run_id, before_district=district.get("agency_name"))
                     break
+                future_to_district[executor.submit(search_one, district)] = district
+
+            for future in as_completed(future_to_district):
+                district = future_to_district[future]
+                if is_cancel_requested(run_id, db_path):
+                    cancelled = True
+                    for pending in future_to_district:
+                        pending.cancel()
+                    debug_log(debug_logger, "run_cancel_requested", run_id=run_id, before_district=district.get("agency_name"))
+                    break
                 try:
-                    district_results = search_district(
-                        district,
-                        query_text,
-                        run_settings,
-                        cancel_requested=lambda: is_cancel_requested(run_id, db_path),
-                        debug_logger=debug_logger,
-                        db_path=db_path,
-                    )
+                    district_results = future.result()
                     searched += 1
-                    now = utc_now_iso()
-                    for rank, result in enumerate(district_results, start=1):
-                        conn.execute(
-                            """
-                            INSERT INTO search_results (
-                                search_run_id, district_id, district_name, state,
-                                agency_type, total_enrollment_excludes_ae, website,
-                                result_rank, url, title, content_type, status_code,
-                                search_source, score, snippet, matched_terms_json, created_at
-                            )
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                            (
-                                run_id,
-                                district["id"],
-                                district["agency_name"],
-                                district["state"],
-                                district["agency_type"],
-                                district["total_enrollment_excludes_ae"],
-                                district["website_normalized"] or district["website"],
-                                rank,
-                                result["url"],
-                                result.get("title"),
-                                result.get("content_type"),
-                                result.get("status_code"),
-                                result.get("search_source"),
-                                result.get("score", 0),
-                                result.get("snippet"),
-                                json_dumps(result.get("matched_terms", [])),
-                                now,
-                            ),
-                        )
-                    debug_log(
-                        debug_logger,
-                        "district_results_stored",
-                        run_id=run_id,
-                        district=district.get("agency_name"),
-                        stored_results=len(district_results),
-                    )
-                    conn.execute(
-                        """
-                        UPDATE search_runs
-                        SET districts_searched = ?, districts_failed = ?
-                        WHERE id = ?
-                        """,
-                        (searched, failed, run_id),
-                    )
-                    conn.commit()
+                    store_district_results(district, district_results)
                     if is_cancel_requested(run_id, db_path):
                         cancelled = True
                         debug_log(
@@ -1298,15 +1336,16 @@ def execute_search_run(
                         district=district.get("agency_name"),
                         error=str(exc),
                     )
-                    conn.execute(
-                        """
-                        UPDATE search_runs
-                        SET districts_searched = ?, districts_failed = ?
-                        WHERE id = ?
-                        """,
-                        (searched, failed, run_id),
-                    )
-                    conn.commit()
+                    with connect_db(db_path) as conn:
+                        conn.execute(
+                            """
+                            UPDATE search_runs
+                            SET districts_searched = ?, districts_failed = ?
+                            WHERE id = ?
+                            """,
+                            (searched, failed, run_id),
+                        )
+                        conn.commit()
                     if is_cancel_requested(run_id, db_path):
                         cancelled = True
                         debug_log(
@@ -1317,8 +1356,9 @@ def execute_search_run(
                         )
                         break
 
-            final_status = "cancelled" if cancelled else "completed"
-            error_message = "Cancelled by user." if cancelled else None
+        final_status = "cancelled" if cancelled else "completed"
+        error_message = "Cancelled by user." if cancelled else None
+        with connect_db(db_path) as conn:
             conn.execute(
                 """
                 UPDATE search_runs
@@ -1372,6 +1412,7 @@ def run_search(
     max_enrollment: int | None = None,
     *,
     max_districts: int | None = None,
+    max_workers: int | None = None,
     debug_logging: bool = False,
     db_path: Path | str | None = None,
     settings: SearchSettings | None = None,
@@ -1383,6 +1424,7 @@ def run_search(
         min_enrollment=min_enrollment,
         max_enrollment=max_enrollment,
         max_districts=max_districts,
+        max_workers=max_workers,
         debug_logging=debug_logging,
         db_path=db_path,
         settings=settings,
