@@ -22,6 +22,8 @@ from site_search_discovery import (
     discover_district_search_profile,
     get_best_search_profile,
     parse_edlio_search_results,
+    parse_finalsite_algolia_search_results,
+    parse_search_results_page,
     select_best_profile_test_result,
 )
 
@@ -143,6 +145,25 @@ class LocalSiteHandler(BaseHTTPRequestHandler):
         return
 
 
+class FakeResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+
+class FakeSession:
+    def __init__(self, payload):
+        self.payload = payload
+        self.posts = []
+
+    def post(self, url, **kwargs):
+        self.posts.append((url, kwargs))
+        return FakeResponse(self.payload)
+
+
 class CoreTests(unittest.TestCase):
     def test_header_and_website_normalization(self):
         self.assertEqual(
@@ -183,6 +204,80 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(results[0]["source"], "edlio_search_api")
         self.assertEqual(results[0]["url"], "https://www.fgsdk12.org/apps/pages/calendar")
         self.assertEqual(results[0]["snippet"], "Calendar dates and family events")
+
+    def test_parse_search_results_page_falls_back_to_generic_rendered_links(self):
+        html = b"""
+        <html>
+          <body>
+            <nav>
+              <a href="/">Home</a>
+              <a href="/search-results?q=restorative">Search</a>
+            </nav>
+            <main>
+              <div class="fsElement fsContent">
+                <h2><a href="/departments/student-services/restorative-practices">Restorative Practices</a></h2>
+                <p>Resources about restorative practices and student support.</p>
+              </div>
+              <div class="card">
+                <a href="https://example.com/offsite">External restorative result</a>
+              </div>
+            </main>
+          </body>
+        </html>
+        """
+        results = parse_search_results_page(
+            html,
+            "https://district.example/search-results?q=restorative",
+            "https://district.example/",
+            "restorative",
+            {"search_url_template": "https://district.example/search-results?q={query}"},
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(
+            results[0]["url"],
+            "https://district.example/departments/student-services/restorative-practices",
+        )
+        self.assertEqual(results[0]["title"], "Restorative Practices")
+
+    def test_parse_finalsite_algolia_search_results_uses_page_config(self):
+        html = b"""
+        <section class="fsElement fsSearchElement"
+                 data-app-id="APPID"
+                 data-index-prefix="district_"
+                 data-api-key="public-key"
+                 data-domains='{"4094":"district.example"}'
+                 data-search-term="restorative">
+        </section>
+        """
+        session = FakeSession(
+            {
+                "hits": [
+                    {
+                        "domain_id": 4094,
+                        "page_name": "Belonging",
+                        "page_path": "/departments/belonging",
+                        "content": "Honor culture, identity and restorative healing.",
+                        "_snippetResult": {
+                            "content": {
+                                "value": "identity and <em>restorative</em> healing"
+                            }
+                        },
+                    }
+                ]
+            }
+        )
+        results = parse_finalsite_algolia_search_results(
+            html,
+            "https://district.example/",
+            "restorative",
+            session,
+            SearchSettings(request_timeout_seconds=2, delay_seconds=0),
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["source"], "finalsite_algolia")
+        self.assertEqual(results[0]["url"], "https://district.example/departments/belonging")
+        self.assertEqual(results[0]["snippet"], "identity and restorative healing")
+        self.assertIn("/district_pages/query", session.posts[0][0])
 
     def test_extract_edlio_config_from_corp_data_layer(self):
         html = b"""

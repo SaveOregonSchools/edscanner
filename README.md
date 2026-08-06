@@ -27,10 +27,11 @@ py app.py
 Open:
 
 ```text
-http://127.0.0.1:5000
+http://127.0.0.1:8765
 ```
 
-The app runs as a local development server on `127.0.0.1:5000`. Search jobs run
+The app runs as a local development server on `127.0.0.1:8765` by default. Set
+`EDSCANNER_PORT` before starting the app to use a different port. Search jobs run
 inside the same Flask process, so keep the app process running while queued or
 active searches are in progress. The browser page can be closed; the worker does
 not depend on the browser staying open.
@@ -297,6 +298,7 @@ $env:EDSCANNER_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit
 $env:EDSCANNER_VERIFY_SSL="true"
 $env:EDSCANNER_RESPECT_ROBOTS="false"
 $env:EDSCANNER_FLASK_DEBUG="false"
+$env:EDSCANNER_PORT="8765"
 $env:BRAVE_SEARCH_API_KEY="..."
 ```
 

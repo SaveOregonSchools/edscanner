@@ -85,6 +85,10 @@
           <option value="2" {% if follow_depth == 2 %}selected{% endif %}>2 - two pages deeper</option>
         </select>
       </div>
+      <div>
+        <label for="max_workers">Search workers</label>
+        <input id="max_workers" name="max_workers" type="number" min="1" max="8" value="{{ max_workers }}">
+      </div>
       <div class="checkbox-field">
         <input id="debug_logging" name="debug_logging" type="checkbox" value="1">
         <label for="debug_logging">Capture debug log</label>
