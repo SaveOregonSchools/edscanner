@@ -1322,5 +1322,6 @@ def export_run(run_id: int):
 
 if __name__ == "__main__":
     debug = os.getenv("EDSCANNER_FLASK_DEBUG", "").casefold() in {"1", "true", "yes", "on"}
+    host = (os.getenv("EDSCANNER_HOST") or "127.0.0.1").strip() or "127.0.0.1"
     port = clamp_int(parse_optional_int(os.getenv("EDSCANNER_PORT")), 8765, 1, 65535)
-    app.run(host="127.0.0.1", port=port, debug=debug, use_reloader=False)
+    app.run(host=host, port=port, debug=debug, use_reloader=False)
