@@ -15,9 +15,12 @@ APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = APP_ROOT / "data"
 IMPORTS_DIR = APP_ROOT / "imports"
 EXPORTS_DIR = APP_ROOT / "exports"
+DOWNLOADS_DIR = APP_ROOT / "downloads"
+CONTRACT_ARCHIVE_DIR = DOWNLOADS_DIR / "contracts"
 LOGS_DIR = APP_ROOT / "logs"
 SEARCH_RUN_LOGS_DIR = LOGS_DIR / "search_runs"
 PROFILE_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "profile_discovery_runs"
+CONTRACT_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "contract_discovery_runs"
 ENV_PATH = APP_ROOT / ".env"
 
 
@@ -31,7 +34,10 @@ def parse_env_line(line: str) -> tuple[str, str] | None:
         return None
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        quote = value[0]
         value = value[1:-1]
+        if quote == '"':
+            value = value.replace('\\"', '"').replace("\\\\", "\\")
     return key, value
 
 
@@ -106,10 +112,20 @@ MAX_PDF_SIZE_BYTES = _env_int("EDSCANNER_MAX_PDF_SIZE_MB", 10, minimum=1) * 1024
 MAX_HTML_SIZE_BYTES = _env_int("EDSCANNER_MAX_HTML_SIZE_MB", 5, minimum=1) * 1024 * 1024
 MAX_TOTAL_DISTRICTS_PER_RUN = _env_int("EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN", 25, minimum=1)
 PROFILE_DISCOVERY_WORKERS = _env_int("EDSCANNER_PROFILE_DISCOVERY_WORKERS", 3, minimum=1)
+CONTRACT_DISCOVERY_WORKERS = _env_int("EDSCANNER_CONTRACT_DISCOVERY_WORKERS", 3, minimum=1)
+CONTRACT_RESCAN_DAYS = _env_int("EDSCANNER_CONTRACT_RESCAN_DAYS", 180, minimum=0)
+CONTRACT_DISTRICT_DIR_NAME_MAX = _env_int("EDSCANNER_CONTRACT_DISTRICT_DIR_NAME_MAX", 50, minimum=20)
 SEARCH_RUN_WORKERS = _env_int("EDSCANNER_SEARCH_RUN_WORKERS", 4, minimum=1)
 VERIFY_SSL = _env_bool("EDSCANNER_VERIFY_SSL", True)
 RESPECT_ROBOTS = _env_bool("EDSCANNER_RESPECT_ROBOTS", False)
 BRAVE_SEARCH_API_KEY_ENV = "BRAVE_SEARCH_API_KEY"
+# Native Ollama configuration. Endpoints are stored as a JSON array in priority
+# order; the older OpenAI-compatible names remain readable for compatibility.
+OLLAMA_ENDPOINTS_ENV = "EDSCANNER_OLLAMA_ENDPOINTS"
+OLLAMA_MODEL_ENV = "EDSCANNER_OLLAMA_MODEL"
+LLM_BASE_URL_ENV = "EDSCANNER_LLM_BASE_URL"
+LLM_MODEL_ENV = "EDSCANNER_LLM_MODEL"
+LLM_API_KEY_ENV = "EDSCANNER_LLM_API_KEY"
 
 
 def quote_env_value(value: str) -> str:
@@ -229,7 +245,17 @@ INVALID_WEBSITE_VALUES = {
 
 
 def ensure_directories() -> None:
-    for path in (DATA_DIR, IMPORTS_DIR, EXPORTS_DIR, LOGS_DIR, SEARCH_RUN_LOGS_DIR, PROFILE_DISCOVERY_RUN_LOGS_DIR):
+    for path in (
+        DATA_DIR,
+        DOWNLOADS_DIR,
+        CONTRACT_ARCHIVE_DIR,
+        IMPORTS_DIR,
+        EXPORTS_DIR,
+        LOGS_DIR,
+        SEARCH_RUN_LOGS_DIR,
+        PROFILE_DISCOVERY_RUN_LOGS_DIR,
+        CONTRACT_DISCOVERY_RUN_LOGS_DIR,
+    ):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -464,6 +490,118 @@ def init_db(db_path: Path | str | None = None) -> None:
                 error_message TEXT,
                 debug_log_path TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS contract_discovery_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                states_json TEXT,
+                agency_types_json TEXT,
+                min_enrollment INTEGER,
+                max_enrollment INTEGER,
+                max_districts INTEGER NOT NULL,
+                max_pages_per_district INTEGER NOT NULL DEFAULT 20,
+                max_workers INTEGER NOT NULL DEFAULT 3,
+                use_llm INTEGER NOT NULL DEFAULT 0,
+                include_salary_schedules INTEGER NOT NULL DEFAULT 1,
+                archive_documents INTEGER NOT NULL DEFAULT 1,
+                store_extracted_text INTEGER NOT NULL DEFAULT 1,
+                rescan_after_days INTEGER NOT NULL DEFAULT 180,
+                recheck_expired INTEGER NOT NULL DEFAULT 1,
+                force_rescan INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                districts_matched INTEGER NOT NULL DEFAULT 0,
+                districts_planned INTEGER NOT NULL DEFAULT 0,
+                districts_processed INTEGER NOT NULL DEFAULT 0,
+                districts_failed INTEGER NOT NULL DEFAULT 0,
+                districts_skipped_recent INTEGER NOT NULL DEFAULT 0,
+                packages_found INTEGER NOT NULL DEFAULT 0,
+                documents_found INTEGER NOT NULL DEFAULT 0,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                error_message TEXT,
+                debug_log_path TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS district_contract_packages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                discovery_run_id INTEGER NOT NULL REFERENCES contract_discovery_runs(id) ON DELETE CASCADE,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                district_name TEXT,
+                state TEXT,
+                website TEXT,
+                bargaining_unit_type TEXT NOT NULL DEFAULT 'unknown',
+                bargaining_unit_name TEXT,
+                union_name TEXT,
+                effective_date TEXT,
+                expiration_date TEXT,
+                agreement_status TEXT NOT NULL DEFAULT 'unknown',
+                review_status TEXT NOT NULL DEFAULT 'unreviewed',
+                confidence REAL NOT NULL DEFAULT 0,
+                source_page_url TEXT,
+                current_as_of TEXT NOT NULL,
+                notes TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_contract_packages_run
+                ON district_contract_packages(discovery_run_id);
+            CREATE INDEX IF NOT EXISTS idx_contract_packages_district
+                ON district_contract_packages(district_id);
+            CREATE INDEX IF NOT EXISTS idx_contract_packages_unit
+                ON district_contract_packages(bargaining_unit_type);
+            CREATE INDEX IF NOT EXISTS idx_contract_packages_expiration
+                ON district_contract_packages(district_id, expiration_date, bargaining_unit_type);
+
+            CREATE TABLE IF NOT EXISTS district_contract_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                package_id INTEGER NOT NULL REFERENCES district_contract_packages(id) ON DELETE CASCADE,
+                discovery_run_id INTEGER NOT NULL REFERENCES contract_discovery_runs(id) ON DELETE CASCADE,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                document_type TEXT NOT NULL DEFAULT 'other',
+                title TEXT,
+                url TEXT NOT NULL,
+                parent_page_url TEXT,
+                content_type TEXT,
+                status_code INTEGER,
+                discovery_source TEXT,
+                effective_date TEXT,
+                expiration_date TEXT,
+                agreement_status TEXT NOT NULL DEFAULT 'unknown',
+                confidence REAL NOT NULL DEFAULT 0,
+                snippet TEXT,
+                content_sha256 TEXT,
+                file_size_bytes INTEGER,
+                local_file_path TEXT,
+                extracted_text_path TEXT,
+                archived_at TEXT,
+                llm_analysis_json TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(discovery_run_id, district_id, url)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_contract_documents_package
+                ON district_contract_documents(package_id);
+            CREATE INDEX IF NOT EXISTS idx_contract_documents_run
+                ON district_contract_documents(discovery_run_id);
+
+            CREATE INDEX IF NOT EXISTS idx_contract_documents_hash
+                ON district_contract_documents(content_sha256);
+
+            CREATE TABLE IF NOT EXISTS district_contract_scan_status (
+                district_id INTEGER PRIMARY KEY REFERENCES districts(id) ON DELETE CASCADE,
+                last_run_id INTEGER REFERENCES contract_discovery_runs(id) ON DELETE SET NULL,
+                last_attempted_at TEXT,
+                last_successful_scan_at TEXT,
+                last_status TEXT NOT NULL DEFAULT 'never',
+                last_error TEXT,
+                packages_found INTEGER NOT NULL DEFAULT 0,
+                documents_found INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_contract_scan_status_success
+                ON district_contract_scan_status(last_successful_scan_at);
             """
         )
         existing_columns = {
@@ -510,6 +648,34 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN max_workers INTEGER;")
         if "profiles_requires_javascript" not in existing_discovery_columns:
             conn.execute("ALTER TABLE profile_discovery_runs ADD COLUMN profiles_requires_javascript INTEGER NOT NULL DEFAULT 0;")
+        existing_contract_run_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(contract_discovery_runs)")
+        }
+        contract_run_migrations = {
+            "archive_documents": "INTEGER NOT NULL DEFAULT 1",
+            "store_extracted_text": "INTEGER NOT NULL DEFAULT 1",
+            "rescan_after_days": "INTEGER NOT NULL DEFAULT 180",
+            "recheck_expired": "INTEGER NOT NULL DEFAULT 1",
+            "force_rescan": "INTEGER NOT NULL DEFAULT 0",
+            "districts_skipped_recent": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, declaration in contract_run_migrations.items():
+            if column not in existing_contract_run_columns:
+                conn.execute(f"ALTER TABLE contract_discovery_runs ADD COLUMN {column} {declaration};")
+        existing_contract_document_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(district_contract_documents)")
+        }
+        contract_document_migrations = {
+            "file_size_bytes": "INTEGER",
+            "local_file_path": "TEXT",
+            "extracted_text_path": "TEXT",
+            "archived_at": "TEXT",
+        }
+        for column, declaration in contract_document_migrations.items():
+            if column not in existing_contract_document_columns:
+                conn.execute(f"ALTER TABLE district_contract_documents ADD COLUMN {column} {declaration};")
         conn.commit()
 
 

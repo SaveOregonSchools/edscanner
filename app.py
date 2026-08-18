@@ -8,7 +8,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,16 @@ from markupsafe import Markup, escape
 
 from common import (
     BRAVE_SEARCH_API_KEY_ENV,
+    CONTRACT_ARCHIVE_DIR,
+    CONTRACT_DISCOVERY_RUN_LOGS_DIR,
+    CONTRACT_DISCOVERY_WORKERS,
+    CONTRACT_RESCAN_DAYS,
     IMPORTS_DIR,
+    LLM_API_KEY_ENV,
+    LLM_BASE_URL_ENV,
+    LLM_MODEL_ENV,
+    OLLAMA_ENDPOINTS_ENV,
+    OLLAMA_MODEL_ENV,
     MAX_PAGES_PER_DISTRICT,
     PROFILE_DISCOVERY_RUN_LOGS_DIR,
     PROFILE_DISCOVERY_WORKERS,
@@ -35,6 +44,19 @@ from common import (
     list_filter_options,
     set_local_setting,
     utc_now_iso,
+)
+from contract_discovery import (
+    UNIT_TYPES,
+    create_contract_discovery_run,
+    execute_contract_discovery_run,
+    export_contract_discovery_csv,
+)
+from ai_matcher import (
+    get_ollama_endpoints,
+    get_ollama_model,
+    local_llm_is_configured,
+    parse_ollama_endpoints,
+    test_ollama_endpoints,
 )
 from import_districts import ImportErrorWithContext, import_districts
 from search_engine import (
@@ -58,8 +80,10 @@ app.config["SECRET_KEY"] = "edscanner-local-dev"
 LOGGER = logging.getLogger(__name__)
 SEARCH_QUEUE: queue.Queue[int] = queue.Queue()
 PROFILE_DISCOVERY_QUEUE: queue.Queue[int] = queue.Queue()
+CONTRACT_DISCOVERY_QUEUE: queue.Queue[int] = queue.Queue()
 WORKER_STARTED = False
 PROFILE_DISCOVERY_WORKER_STARTED = False
+CONTRACT_DISCOVERY_WORKER_STARTED = False
 
 
 PROFILE_STATUSES = [
@@ -587,6 +611,11 @@ def enqueue_profile_discovery_run(run_id: int) -> None:
     LOGGER.info("Queued profile discovery run %s", run_id)
 
 
+def enqueue_contract_discovery_run(run_id: int) -> None:
+    CONTRACT_DISCOVERY_QUEUE.put(run_id)
+    LOGGER.info("Queued contract discovery run %s", run_id)
+
+
 def search_worker() -> None:
     while True:
         run_id = SEARCH_QUEUE.get()
@@ -615,6 +644,21 @@ def profile_discovery_worker() -> None:
             LOGGER.exception("Queued profile discovery run %s failed", run_id)
         finally:
             PROFILE_DISCOVERY_QUEUE.task_done()
+
+
+def contract_discovery_worker() -> None:
+    while True:
+        run_id = CONTRACT_DISCOVERY_QUEUE.get()
+        try:
+            with connect_db() as conn:
+                run = conn.execute("SELECT status FROM contract_discovery_runs WHERE id = ?", (run_id,)).fetchone()
+            if run is None or run["status"] not in {"queued", "running"}:
+                continue
+            execute_contract_discovery_run(run_id)
+        except Exception:
+            LOGGER.exception("Queued contract discovery run %s failed", run_id)
+        finally:
+            CONTRACT_DISCOVERY_QUEUE.task_done()
 
 
 def start_search_worker() -> None:
@@ -671,9 +715,34 @@ def start_profile_discovery_worker() -> None:
         enqueue_profile_discovery_run(run_id)
 
 
+def start_contract_discovery_worker() -> None:
+    global CONTRACT_DISCOVERY_WORKER_STARTED
+    if CONTRACT_DISCOVERY_WORKER_STARTED:
+        return
+    with connect_db() as conn:
+        conn.execute(
+            """
+            UPDATE contract_discovery_runs
+            SET status = 'queued', error_message = 'Run was queued again after app restart.'
+            WHERE status = 'running'
+            """
+        )
+        queued_ids = [
+            row["id"]
+            for row in conn.execute("SELECT id FROM contract_discovery_runs WHERE status = 'queued' ORDER BY id")
+        ]
+        conn.commit()
+    thread = threading.Thread(target=contract_discovery_worker, name="EdScannerContractDiscoveryWorker", daemon=True)
+    thread.start()
+    CONTRACT_DISCOVERY_WORKER_STARTED = True
+    for run_id in queued_ids:
+        enqueue_contract_discovery_run(run_id)
+
+
 if os.getenv("EDSCANNER_DISABLE_WORKER", "").casefold() not in {"1", "true", "yes", "on"}:
     start_search_worker()
     start_profile_discovery_worker()
+    start_contract_discovery_worker()
 
 
 @app.context_processor
@@ -735,28 +804,392 @@ def import_page():
 @app.route("/settings", methods=["GET", "POST"])
 def settings_page():
     if request.method == "POST":
-        action = request.form.get("action", "save")
+        action = request.form.get("action", "save_brave")
         if action == "clear_brave_key":
             set_local_setting(BRAVE_SEARCH_API_KEY_ENV, "")
             flash("Brave Search API key cleared.", "success")
-        else:
+        elif action == "save_brave":
             api_key = request.form.get("brave_api_key", "").strip()
             if not api_key:
                 flash("Enter a Brave Search API key or use Clear key.", "error")
             else:
                 set_local_setting(BRAVE_SEARCH_API_KEY_ENV, api_key)
                 flash("Brave Search API key saved to the local .env file.", "success")
+        elif action in {"clear_llm", "clear_ollama"}:
+            set_local_setting(OLLAMA_ENDPOINTS_ENV, "")
+            set_local_setting(OLLAMA_MODEL_ENV, "")
+            set_local_setting(LLM_BASE_URL_ENV, "")
+            set_local_setting(LLM_MODEL_ENV, "")
+            set_local_setting(LLM_API_KEY_ENV, "")
+            flash("Ollama server settings cleared.", "success")
+        elif action in {"save_llm", "save_ollama", "save_test_ollama"}:
+            raw_endpoints = request.form.get("ollama_endpoints", "").strip()
+            if not raw_endpoints:
+                raw_endpoints = request.form.get("llm_base_url", "").strip()
+            endpoints = parse_ollama_endpoints(raw_endpoints)
+            model = (
+                request.form.get("ollama_model", "").strip()
+                or request.form.get("llm_model", "").strip()
+            )
+            api_key = request.form.get("llm_api_key", "").strip()
+            invalid_endpoints = [
+                value
+                for value in endpoints
+                if not re.match(r"^https?://", value, re.IGNORECASE)
+            ]
+            if not endpoints or invalid_endpoints or not model:
+                flash("Enter one or more HTTP(S) Ollama server URLs and a model name.", "error")
+            else:
+                set_local_setting(OLLAMA_ENDPOINTS_ENV, json.dumps(endpoints, separators=(",", ":")))
+                set_local_setting(OLLAMA_MODEL_ENV, model)
+                set_local_setting(LLM_BASE_URL_ENV, "")
+                set_local_setting(LLM_MODEL_ENV, "")
+                if api_key:
+                    set_local_setting(LLM_API_KEY_ENV, api_key)
+                flash(f"Saved {len(endpoints)} Ollama server(s) in priority order.", "success")
+                if action == "save_test_ollama":
+                    results = test_ollama_endpoints(endpoints, timeout_seconds=5)
+                    reachable = [item for item in results if item["ok"]]
+                    model_hosts = [item for item in reachable if model in item["models"]]
+                    if model_hosts:
+                        flash(
+                            f"Connection successful. {model} is available on "
+                            f"{model_hosts[0]['endpoint']}; {len(reachable)} of "
+                            f"{len(results)} server(s) reachable.",
+                            "success",
+                        )
+                    elif reachable:
+                        flash(
+                            f"Reached {len(reachable)} server(s), but {model} was not "
+                            "found in their installed model lists.",
+                            "error",
+                        )
+                    else:
+                        flash("No configured Ollama server could be reached.", "error")
         return redirect(url_for("settings_page"))
 
     key_present = has_brave_search_api_key()
     key = get_local_setting(BRAVE_SEARCH_API_KEY_ENV)
     masked_key = f"{key[:6]}...{key[-4:]}" if len(key) > 12 else "saved" if key_present else ""
+    llm_key = get_local_setting(LLM_API_KEY_ENV)
     return render_template(
         "settings.html",
         key_present=key_present,
         masked_key=masked_key,
         env_key_name=BRAVE_SEARCH_API_KEY_ENV,
+        llm_configured=local_llm_is_configured(),
+        ollama_endpoints_text="\n".join(get_ollama_endpoints()),
+        llm_model=get_ollama_model(),
+        llm_key_present=bool(llm_key),
+        llm_masked_key=(f"{llm_key[:4]}...{llm_key[-4:]}" if len(llm_key) > 10 else "saved" if llm_key else ""),
     )
+
+
+@app.route("/contracts", methods=["GET", "POST"])
+def contracts_page():
+    options = list_filter_options()
+    states = selected_values("states")
+    if request.method == "GET" and not request.query_string and "OR" in options["states"]:
+        states = ["OR"]
+    agency_types = selected_values("agency_types")
+    min_enrollment = parse_optional_int(request.values.get("min_enrollment"))
+    max_enrollment = parse_optional_int(request.values.get("max_enrollment"))
+    max_districts = clamp_int(parse_optional_int(request.values.get("max_districts")), 20, 1, 100)
+    max_pages_per_district = clamp_int(parse_optional_int(request.values.get("max_pages_per_district")), 20, 3, 60)
+    max_workers = clamp_int(parse_optional_int(request.values.get("max_workers")), CONTRACT_DISCOVERY_WORKERS, 1, 8)
+    rescan_after_days = clamp_int(
+        parse_optional_int(request.values.get("rescan_after_days")),
+        CONTRACT_RESCAN_DAYS,
+        0,
+        3650,
+    )
+    use_llm = request.values.get("use_llm", "").casefold() in {"1", "true", "yes", "on"}
+    checked_default = "" if request.method == "POST" else "1"
+    include_salary_schedules = request.values.get("include_salary_schedules", checked_default).casefold() in {"1", "true", "yes", "on"}
+    archive_documents = request.values.get("archive_documents", checked_default).casefold() in {"1", "true", "yes", "on"}
+    store_extracted_text = request.values.get("store_extracted_text", checked_default).casefold() in {"1", "true", "yes", "on"}
+    recheck_expired = request.values.get("recheck_expired", checked_default).casefold() in {"1", "true", "yes", "on"}
+    force_rescan = request.values.get("force_rescan", "").casefold() in {"1", "true", "yes", "on"}
+
+    if request.method == "POST":
+        if use_llm and not local_llm_is_configured():
+            flash("Configure the local AI server in Settings or run without AI classification.", "error")
+            return redirect(url_for("contracts_page"))
+        run_id = create_contract_discovery_run(
+            states=states,
+            agency_types=agency_types,
+            min_enrollment=min_enrollment,
+            max_enrollment=max_enrollment,
+            max_districts=max_districts,
+            max_pages_per_district=max_pages_per_district,
+            max_workers=max_workers,
+            use_llm=use_llm,
+            include_salary_schedules=include_salary_schedules,
+            archive_documents=archive_documents,
+            store_extracted_text=store_extracted_text,
+            rescan_after_days=rescan_after_days,
+            recheck_expired=recheck_expired,
+            force_rescan=force_rescan,
+        )
+        enqueue_contract_discovery_run(run_id)
+        return redirect(url_for("contract_discovery_run_detail", run_id=run_id))
+
+    with connect_db() as conn:
+        recent_runs = conn.execute(
+            """
+            SELECT id, status, districts_planned, districts_processed, districts_failed,
+                   districts_skipped_recent, packages_found, documents_found,
+                   use_llm, archive_documents, started_at, finished_at
+            FROM contract_discovery_runs ORDER BY id DESC LIMIT 10
+            """
+        ).fetchall()
+        totals = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM district_contract_packages) AS packages,
+                (SELECT COUNT(*) FROM district_contract_packages WHERE agreement_status = 'current') AS current_packages,
+                (SELECT COUNT(*) FROM district_contract_packages WHERE review_status = 'needs_review') AS needs_review,
+                (SELECT COUNT(DISTINCT district_id) FROM district_contract_packages) AS districts,
+                (SELECT COUNT(*) FROM district_contract_scan_status WHERE last_successful_scan_at IS NOT NULL) AS successful_scans,
+                (SELECT COUNT(DISTINCT district_id) FROM district_contract_documents WHERE local_file_path IS NOT NULL) AS archived_districts
+            """
+        ).fetchone()
+        today = date.today().isoformat()
+        district_scan_statuses = conn.execute(
+            """
+            SELECT s.*, d.agency_name, d.state,
+                   EXISTS (
+                       SELECT 1 FROM district_contract_packages expired
+                       WHERE expired.district_id = d.id
+                         AND expired.review_status != 'rejected'
+                         AND expired.expiration_date IS NOT NULL
+                         AND expired.expiration_date < ?
+                         AND NOT EXISTS (
+                             SELECT 1 FROM district_contract_packages successor
+                             WHERE successor.district_id = expired.district_id
+                               AND successor.bargaining_unit_type = expired.bargaining_unit_type
+                               AND successor.review_status != 'rejected'
+                               AND successor.expiration_date > ?
+                         )
+                   ) AS has_expired_contract,
+                   (
+                       SELECT MIN(p.expiration_date)
+                       FROM district_contract_packages p
+                       WHERE p.district_id = d.id
+                         AND p.review_status != 'rejected'
+                         AND p.expiration_date > ?
+                   ) AS next_expiration_date
+            FROM district_contract_scan_status s
+            JOIN districts d ON d.id = s.district_id
+            ORDER BY COALESCE(s.last_successful_scan_at, s.last_attempted_at) DESC
+            LIMIT 30
+            """,
+            (today, today, today),
+        ).fetchall()
+    return render_template(
+        "contracts.html",
+        options=options,
+        selected_states=states,
+        selected_agency_types=agency_types,
+        min_enrollment=min_enrollment,
+        max_enrollment=max_enrollment,
+        max_districts=max_districts,
+        max_pages_per_district=max_pages_per_district,
+        max_workers=max_workers,
+        rescan_after_days=rescan_after_days,
+        use_llm=use_llm,
+        include_salary_schedules=include_salary_schedules,
+        archive_documents=archive_documents,
+        store_extracted_text=store_extracted_text,
+        recheck_expired=recheck_expired,
+        force_rescan=force_rescan,
+        contract_archive_dir=str(CONTRACT_ARCHIVE_DIR),
+        llm_configured=local_llm_is_configured(),
+        recent_runs=recent_runs,
+        totals=totals,
+        district_scan_statuses=district_scan_statuses,
+    )
+
+
+@app.route("/contracts/runs/<int:run_id>")
+def contract_discovery_run_detail(run_id: int):
+    with connect_db() as conn:
+        run = conn.execute("SELECT * FROM contract_discovery_runs WHERE id = ?", (run_id,)).fetchone()
+        if run is None:
+            abort(404)
+        packages = conn.execute(
+            """
+            SELECT * FROM district_contract_packages
+            WHERE discovery_run_id = ?
+            ORDER BY district_name, bargaining_unit_type, COALESCE(union_name, '')
+            """,
+            (run_id,),
+        ).fetchall()
+        documents = conn.execute(
+            """
+            SELECT * FROM district_contract_documents
+            WHERE discovery_run_id = ?
+            ORDER BY package_id, document_type, title
+            """,
+            (run_id,),
+        ).fetchall()
+    documents_by_package: dict[int, list[Any]] = {}
+    for document in documents:
+        documents_by_package.setdefault(int(document["package_id"]), []).append(document)
+    planned = int(run["districts_planned"] or 0)
+    processed = int(run["districts_processed"] or 0)
+    in_progress_count = min(int(run["max_workers"] or 1), max(0, planned - processed)) if run["status"] == "running" else 0
+    return render_template(
+        "contract_run_detail.html",
+        run=run,
+        packages=packages,
+        documents_by_package=documents_by_package,
+        unit_types=UNIT_TYPES,
+        states=json.loads(run["states_json"] or "[]"),
+        agency_types=json.loads(run["agency_types_json"] or "[]"),
+        elapsed=elapsed_seconds(run["started_at"], run["finished_at"]),
+        in_progress_count=in_progress_count,
+        left_count=max(0, planned - processed - in_progress_count),
+    )
+
+
+def _send_archived_contract_file(document_id: int, column: str, *, extracted_text: bool = False):
+    if column not in {"local_file_path", "extracted_text_path"}:
+        abort(404)
+    with connect_db() as conn:
+        document = conn.execute(
+            f"SELECT title, content_type, {column} AS archive_path FROM district_contract_documents WHERE id = ?",
+            (document_id,),
+        ).fetchone()
+    if document is None or not document["archive_path"]:
+        abort(404)
+    path = Path(document["archive_path"]).expanduser().resolve()
+    archive_root = CONTRACT_ARCHIVE_DIR.resolve()
+    if archive_root not in path.parents or not path.is_file():
+        abort(404)
+    source_type = str(document["content_type"] or "").split(";", 1)[0].casefold()
+    force_download = not extracted_text and source_type in {"text/html", "application/xhtml+xml", "image/svg+xml"}
+    return send_file(
+        path,
+        mimetype=(
+            "text/plain; charset=utf-8"
+            if extracted_text
+            else "application/octet-stream"
+            if force_download
+            else document["content_type"] or None
+        ),
+        as_attachment=force_download,
+        download_name=path.name,
+    )
+
+
+@app.route("/contracts/documents/<int:document_id>/archive")
+def archived_contract_document(document_id: int):
+    return _send_archived_contract_file(document_id, "local_file_path")
+
+
+@app.route("/contracts/documents/<int:document_id>/text")
+def archived_contract_text(document_id: int):
+    return _send_archived_contract_file(document_id, "extracted_text_path", extracted_text=True)
+
+
+@app.route("/contracts/runs/<int:run_id>/cancel", methods=["POST"])
+def cancel_contract_discovery_run(run_id: int):
+    with connect_db() as conn:
+        run = conn.execute("SELECT status FROM contract_discovery_runs WHERE id = ?", (run_id,)).fetchone()
+        if run is None:
+            abort(404)
+        if run["status"] == "queued":
+            conn.execute(
+                "UPDATE contract_discovery_runs SET cancel_requested = 1, status = 'cancelled', finished_at = ?, error_message = 'Cancelled before start.' WHERE id = ?",
+                (utc_now_iso(), run_id),
+            )
+            flash("Contract discovery run cancelled.", "success")
+        elif run["status"] == "running":
+            conn.execute(
+                "UPDATE contract_discovery_runs SET cancel_requested = 1, error_message = 'Cancellation requested.' WHERE id = ?",
+                (run_id,),
+            )
+            flash("Cancellation requested. Results already found will be kept.", "success")
+        else:
+            flash(f"Contract discovery run #{run_id} is already {run['status']}.", "info")
+        conn.commit()
+    return redirect(url_for("contract_discovery_run_detail", run_id=run_id))
+
+
+@app.route("/contracts/packages/<int:package_id>/review", methods=["POST"])
+def review_contract_package(package_id: int):
+    unit_type = request.form.get("bargaining_unit_type", "unknown").strip()
+    if unit_type not in UNIT_TYPES:
+        abort(400)
+    agreement_status = request.form.get("agreement_status", "unknown").strip()
+    review_status = request.form.get("review_status", "unreviewed").strip()
+    if agreement_status not in {"current", "expired", "future", "unknown"}:
+        abort(400)
+    if review_status not in {"unreviewed", "needs_review", "verified", "rejected"}:
+        abort(400)
+    effective_date = request.form.get("effective_date", "").strip() or None
+    expiration_date = request.form.get("expiration_date", "").strip() or None
+    for value in (effective_date, expiration_date):
+        if value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            abort(400)
+    with connect_db() as conn:
+        package = conn.execute("SELECT discovery_run_id FROM district_contract_packages WHERE id = ?", (package_id,)).fetchone()
+        if package is None:
+            abort(404)
+        conn.execute(
+            """
+            UPDATE district_contract_packages
+            SET bargaining_unit_type = ?, bargaining_unit_name = ?, union_name = ?,
+                effective_date = ?, expiration_date = ?, agreement_status = ?,
+                review_status = ?, notes = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                unit_type,
+                request.form.get("bargaining_unit_name", "").strip(),
+                request.form.get("union_name", "").strip() or None,
+                effective_date,
+                expiration_date,
+                agreement_status,
+                review_status,
+                request.form.get("notes", "").strip(),
+                utc_now_iso(),
+                package_id,
+            ),
+        )
+        conn.commit()
+        run_id = int(package["discovery_run_id"])
+    flash("Contract package review saved.", "success")
+    return redirect(url_for("contract_discovery_run_detail", run_id=run_id) + f"#package-{package_id}")
+
+
+@app.route("/contracts/runs/<int:run_id>/export.csv")
+def export_contract_discovery_run(run_id: int):
+    with connect_db() as conn:
+        run = conn.execute("SELECT id FROM contract_discovery_runs WHERE id = ?", (run_id,)).fetchone()
+    if run is None:
+        abort(404)
+    return Response(
+        export_contract_discovery_csv(run_id),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=edscanner-contract-run-{run_id}.csv"},
+    )
+
+
+@app.route("/contracts/runs/<int:run_id>/debug-log")
+def contract_discovery_debug_log_file(run_id: int):
+    with connect_db() as conn:
+        run = conn.execute("SELECT debug_log_path FROM contract_discovery_runs WHERE id = ?", (run_id,)).fetchone()
+    if run is None or not run["debug_log_path"]:
+        abort(404)
+    log_path = Path(run["debug_log_path"]).resolve()
+    log_root = CONTRACT_DISCOVERY_RUN_LOGS_DIR.resolve()
+    if log_path != log_root and log_root not in log_path.parents:
+        abort(404)
+    if not log_path.is_file():
+        abort(404)
+    return send_file(log_path, mimetype="text/plain; charset=utf-8", as_attachment=False, download_name=log_path.name)
 
 
 @app.route("/districts")
