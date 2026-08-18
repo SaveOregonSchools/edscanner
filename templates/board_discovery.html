@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Discover Board Sources - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div><h2>Discover Board Sources</h2><p class="status-note">Follow district governance links and allowlisted public board-platform hosts.</p></div>
+    <div class="metric-inline"><span>Matching districts</span><strong>{{ matching_count|fmt_int }}</strong></div>
+  </section>
+  {% include "_board_nav.html" %}
+
+  <section class="tool-surface">
+    <form method="post" class="search-form">
+      <div><label for="states">States</label><select id="states" name="states" multiple size="8">{% for value in options.states %}<option value="{{ value }}" {% if value in selected_states %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+      <div><label for="agency_types">Agency types</label><select id="agency_types" name="agency_types" multiple size="8">{% for value in options.agency_types %}<option value="{{ value }}" {% if value in selected_agency_types %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+      <div><label for="status_filter">Current source status</label><select id="status_filter" name="status_filter"><option value="">Any status</option><option value="__unchecked__" {% if status_filter == '__unchecked__' %}selected{% endif %}>Not yet checked</option>{% for value in source_statuses %}<option value="{{ value }}" {% if status_filter == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+      <div><label for="platform_filter">Current platform</label><select id="platform_filter" name="platform_filter"><option value="">Any platform</option>{% for value in platforms %}<option value="{{ value }}" {% if platform_filter == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+      <div><label for="min_enrollment">Min enrollment</label><input id="min_enrollment" name="min_enrollment" type="number" value="{{ min_enrollment or '' }}"></div>
+      <div><label for="max_enrollment">Max enrollment</label><input id="max_enrollment" name="max_enrollment" type="number" value="{{ max_enrollment or '' }}"></div>
+      <div><label for="max_districts">Maximum districts</label><input id="max_districts" name="max_districts" type="number" min="1" max="1000" value="{{ max_districts }}"></div>
+      <div><label for="max_workers">District workers</label><input id="max_workers" name="max_workers" type="number" min="1" max="8" value="{{ max_workers }}"><p class="field-note">Vendor requests are also limited per host.</p></div>
+      <div class="checkbox-field"><input id="force" name="force" type="checkbox" value="1" {% if force %}checked{% endif %}><label for="force">Recheck existing sources</label></div>
+      <div class="checkbox-field"><input id="debug_logging" name="debug_logging" type="checkbox" value="1" {% if debug_logging %}checked{% endif %}><label for="debug_logging">Capture debug log</label></div>
+      <div class="form-actions full"><button type="submit">Queue source discovery</button></div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <h2>Recent Discovery Runs</h2>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Run</th><th>Status</th><th>Matched</th><th>Planned</th><th>Processed</th><th>Working</th><th>Not found</th><th>Manual</th><th>Failed</th><th>Queued</th></tr></thead>
+      <tbody>{% for run in recent_runs %}<tr><td><a href="{{ url_for('boards.discovery_run_detail', run_id=run.id) }}">#{{ run.id }}</a></td><td><span class="status {{ run.status }}">{{ run.status }}</span></td><td>{{ run.districts_matched|fmt_int }}</td><td>{{ run.districts_planned|fmt_int }}</td><td>{{ run.districts_processed|fmt_int }}</td><td>{{ run.sources_working|fmt_int }}</td><td>{{ run.sources_not_found|fmt_int }}</td><td>{{ run.sources_manual_review|fmt_int }}</td><td>{{ run.sources_failed|fmt_int }}</td><td>{{ run.queued_at|fmt_dt }}</td></tr>{% else %}<tr><td colspan="10" class="empty">No discovery runs yet.</td></tr>{% endfor %}</tbody>
+    </table></div>
+  </section>
+{% endblock %}

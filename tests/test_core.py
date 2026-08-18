@@ -1,14 +1,27 @@
 from __future__ import annotations
 
 import json
+import io
 import threading
 import unittest
+from unittest.mock import Mock, patch
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from urllib.parse import parse_qs, urlparse
 
-from common import clean_source_header, connect_db, init_db, normalize_website, prefer_https_url, utc_now_iso
+from pypdf import PdfWriter
+
+from common import (
+    clean_source_header,
+    connect_db,
+    init_db,
+    normalize_website,
+    parse_env_line,
+    prefer_https_url,
+    quote_env_value,
+    utc_now_iso,
+)
 from search_engine import (
     SearchSettings,
     create_search_run,
@@ -26,6 +39,18 @@ from site_search_discovery import (
     parse_search_results_page,
     select_best_profile_test_result,
 )
+from contract_discovery import (
+    ContractDiscoverySettings,
+    archive_document_files,
+    classify_bargaining_unit,
+    create_contract_discovery_run,
+    district_archive_directory,
+    execute_contract_discovery_run,
+    export_contract_discovery_csv,
+    extract_agreement_dates,
+    select_contract_districts,
+)
+from ai_matcher import analyze_contract_candidate, parse_ollama_endpoints
 
 
 class LocalSiteHandler(BaseHTTPRequestHandler):
@@ -145,6 +170,53 @@ class LocalSiteHandler(BaseHTTPRequestHandler):
         return
 
 
+class ContractSiteHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/":
+            body = b"""
+            <html><head><title>Example District</title></head><body>
+              <a href="/human-resources">Human Resources</a>
+            </body></html>
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path == "/human-resources":
+            body = b"""
+            <html><head><title>Contracts and Salary Schedules</title></head><body>
+              <h1>Collective Bargaining Agreements</h1>
+              <a href="/licensed-2024-2027.pdf">Licensed Collective Bargaining Agreement 2024-2027</a>
+              <a href="/osea-classified-2025-2028.pdf">OSEA Classified Collective Bargaining Agreement 2025-2028</a>
+            </body></html>
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.endswith(".pdf"):
+            stream = io.BytesIO()
+            writer = PdfWriter()
+            writer.add_blank_page(width=612, height=792)
+            writer.write(stream)
+            body = stream.getvalue()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_response(404)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+
 class FakeResponse:
     def __init__(self, payload, status_code=200):
         self._payload = payload
@@ -165,6 +237,278 @@ class FakeSession:
 
 
 class CoreTests(unittest.TestCase):
+    def test_contract_archive_paths_are_bounded_unique_and_store_text(self):
+        first = {"id": 101, "agency_id_nces": "4100010", "agency_name": "A" * 120, "state": "OR"}
+        second = {"id": 102, "agency_id_nces": "4100020", "agency_name": "A" * 120, "state": "OR"}
+        with TemporaryDirectory() as archive_temp:
+            archive_root = Path(archive_temp)
+            first_dir = district_archive_directory(first, archive_root, 40)
+            second_dir = district_archive_directory(second, archive_root, 40)
+            settings = ContractDiscoverySettings(
+                archive_root=archive_root,
+                district_dir_name_max=40,
+            )
+            archived = archive_document_files(
+                first,
+                {
+                    "bargaining_unit_type": "classified",
+                    "document_type": "base_agreement",
+                    "title": "Classified Staff Agreement 2025-2028",
+                    "url": "https://example.test/contract.pdf",
+                    "content_type": "application/pdf",
+                },
+                b"%PDF archived contract test",
+                "Extracted agreement text",
+                settings,
+            )
+
+            self.assertNotEqual(first_dir, second_dir)
+            self.assertEqual(first_dir.parent.name, "OR")
+            self.assertLessEqual(len(first_dir.name.split("--", 1)[0]), 40)
+            self.assertTrue(Path(archived["local_file_path"]).is_file())
+            self.assertTrue(Path(archived["extracted_text_path"]).is_file())
+            self.assertEqual(
+                Path(archived["extracted_text_path"]).read_text(encoding="utf-8"),
+                "Extracted agreement text",
+            )
+
+    def test_recent_contract_scan_is_skipped_unless_expired_or_forced(self):
+        temp_db = NamedTemporaryFile(suffix=".db", delete=False)
+        temp_db_path = Path(temp_db.name)
+        temp_db.close()
+        try:
+            init_db(temp_db_path)
+            now = utc_now_iso()
+            with connect_db(temp_db_path) as conn:
+                cursor = conn.execute(
+                    """
+                    INSERT INTO districts (
+                        source_file, source_row_number, agency_id_nces, agency_name,
+                        state, agency_type, total_enrollment_excludes_ae, website,
+                        website_normalized, has_searchable_website, raw_json,
+                        created_at, updated_at
+                    ) VALUES ('test.csv', 1, '4109999', 'Rescan District', 'OR',
+                              '1-Regular local school district', 5000,
+                              'https://example.test', 'https://example.test', 1, '{}', ?, ?)
+                    """,
+                    (now, now),
+                )
+                district_id = int(cursor.lastrowid)
+                conn.commit()
+            run_id = create_contract_discovery_run(
+                states=["OR"],
+                max_districts=1,
+                force_rescan=True,
+                db_path=temp_db_path,
+            )
+            with connect_db(temp_db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO district_contract_scan_status (
+                        district_id, last_run_id, last_attempted_at,
+                        last_successful_scan_at, last_status, updated_at
+                    ) VALUES (?, ?, ?, ?, 'success', ?)
+                    """,
+                    (district_id, run_id, now, now, now),
+                )
+                conn.commit()
+
+            selected, matched, skipped = select_contract_districts(
+                ["OR"], [], None, None, 10, temp_db_path,
+                rescan_after_days=180,
+                recheck_expired=False,
+            )
+            self.assertEqual((len(selected), matched, skipped), (0, 1, 1))
+
+            forced, _, _ = select_contract_districts(
+                ["OR"], [], None, None, 10, temp_db_path,
+                rescan_after_days=180,
+                recheck_expired=False,
+                force_rescan=True,
+            )
+            self.assertEqual(len(forced), 1)
+
+            with connect_db(temp_db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO district_contract_packages (
+                        discovery_run_id, district_id, district_name, state,
+                        bargaining_unit_type, expiration_date, agreement_status,
+                        current_as_of, created_at, updated_at
+                    ) VALUES (?, ?, 'Rescan District', 'OR', 'classified',
+                              '2025-06-30', 'expired', '2026-08-08', ?, ?)
+                    """,
+                    (run_id, district_id, now, now),
+                )
+                conn.commit()
+            expired_due, _, expired_skipped = select_contract_districts(
+                ["OR"], [], None, None, 10, temp_db_path,
+                rescan_after_days=180,
+                recheck_expired=True,
+            )
+            self.assertEqual(len(expired_due), 1)
+            self.assertEqual(expired_skipped, 0)
+
+            with connect_db(temp_db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO district_contract_packages (
+                        discovery_run_id, district_id, district_name, state,
+                        bargaining_unit_type, expiration_date, agreement_status,
+                        current_as_of, created_at, updated_at
+                    ) VALUES (?, ?, 'Rescan District', 'OR', 'classified',
+                              '2999-06-30', 'current', '2026-08-08', ?, ?)
+                    """,
+                    (run_id, district_id, now, now),
+                )
+                conn.commit()
+            successor_found, _, successor_skipped = select_contract_districts(
+                ["OR"], [], None, None, 10, temp_db_path,
+                rescan_after_days=180,
+                recheck_expired=True,
+            )
+            self.assertEqual(len(successor_found), 0)
+            self.assertEqual(successor_skipped, 1)
+        finally:
+            temp_db_path.unlink(missing_ok=True)
+
+    def test_parse_ollama_endpoints_preserves_priority_and_normalizes_api_paths(self):
+        endpoints = parse_ollama_endpoints(
+            '["http://primary.test:11434/api/chat","http://fallback.test:11434/","http://primary.test:11434"]'
+        )
+
+        self.assertEqual(
+            endpoints,
+            ["http://primary.test:11434", "http://fallback.test:11434"],
+        )
+        encoded = quote_env_value(json.dumps(endpoints, separators=(",", ":")))
+        self.assertEqual(
+            parse_env_line(f"ENDPOINTS={encoded}")[1],
+            json.dumps(endpoints, separators=(",", ":")),
+        )
+
+    def test_ollama_contract_classification_fails_over_to_second_server(self):
+        successful_response = Mock()
+        successful_response.raise_for_status.return_value = None
+        successful_response.json.return_value = {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "is_labor_agreement_document": True,
+                        "bargaining_unit_type": "classified",
+                        "union_name": "Example Classified Association",
+                        "confidence": 0.94,
+                    }
+                )
+            }
+        }
+
+        with (
+            patch(
+                "ai_matcher.get_ollama_endpoints",
+                return_value=["http://primary.test:11434", "http://fallback.test:11434"],
+            ),
+            patch("ai_matcher.get_ollama_model", return_value="gemma4:12b"),
+            patch(
+                "ai_matcher.requests.post",
+                side_effect=[OSError("primary offline"), successful_response],
+            ) as post,
+        ):
+            result = analyze_contract_candidate(
+                district_name="Example District",
+                title="Classified Agreement 2025-2028",
+                url="https://example.test/classified.pdf",
+                parent_context="Collective bargaining agreements",
+                text_excerpt="Agreement between the district and classified association.",
+            )
+
+        self.assertEqual(result["bargaining_unit_type"], "classified")
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(post.call_args_list[0].args[0], "http://primary.test:11434/api/chat")
+        self.assertEqual(post.call_args_list[1].args[0], "http://fallback.test:11434/api/chat")
+        self.assertEqual(post.call_args_list[1].kwargs["json"]["model"], "gemma4:12b")
+
+    def test_contract_classification_keeps_units_separate(self):
+        self.assertEqual(classify_bargaining_unit("Licensed Collective Bargaining Agreement")[0], "licensed")
+        self.assertEqual(classify_bargaining_unit("OSEA Classified Collective Bargaining Agreement")[0], "classified")
+        self.assertEqual(classify_bargaining_unit("Substitute Teacher Agreement")[0], "substitute")
+        self.assertEqual(
+            extract_agreement_dates("Collective Bargaining Agreement 2024-2027")[:2],
+            ("2024-07-01", "2027-06-30"),
+        )
+
+    def test_contract_discovery_stores_distinct_bargaining_unit_packages(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ContractSiteHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        temp_db = NamedTemporaryFile(suffix=".db", delete=False)
+        temp_db_path = Path(temp_db.name)
+        temp_db.close()
+        archive_temp = TemporaryDirectory()
+        try:
+            init_db(temp_db_path)
+            now = utc_now_iso()
+            with connect_db(temp_db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO districts (
+                        source_file, source_row_number, agency_id_nces, agency_name,
+                        state, agency_type, total_enrollment_excludes_ae, website,
+                        website_normalized, has_searchable_website, raw_json,
+                        created_at, updated_at
+                    ) VALUES ('test.csv', 1, 'contract-test', 'Example District',
+                              'OR', '1-Regular local school district', 1000, ?, ?, 1, '{}', ?, ?)
+                    """,
+                    (f"http://127.0.0.1:{server.server_port}", f"http://127.0.0.1:{server.server_port}", now, now),
+                )
+                conn.commit()
+            run_id = create_contract_discovery_run(
+                states=["OR"],
+                max_districts=1,
+                max_pages_per_district=5,
+                max_workers=1,
+                db_path=temp_db_path,
+            )
+            execute_contract_discovery_run(
+                run_id,
+                db_path=temp_db_path,
+                settings=ContractDiscoverySettings(
+                    max_pages_per_district=5,
+                    max_candidates_per_district=10,
+                    request_timeout_seconds=2,
+                    delay_seconds=0,
+                    archive_root=Path(archive_temp.name),
+                ),
+            )
+            with connect_db(temp_db_path) as conn:
+                run = conn.execute("SELECT * FROM contract_discovery_runs WHERE id = ?", (run_id,)).fetchone()
+                packages = conn.execute(
+                    "SELECT bargaining_unit_type, union_name FROM district_contract_packages WHERE discovery_run_id = ? ORDER BY bargaining_unit_type",
+                    (run_id,),
+                ).fetchall()
+                document_rows = conn.execute(
+                    "SELECT local_file_path, extracted_text_path FROM district_contract_documents WHERE discovery_run_id = ?",
+                    (run_id,),
+                ).fetchall()
+                scan_status = conn.execute(
+                    "SELECT * FROM district_contract_scan_status WHERE district_id = (SELECT id FROM districts LIMIT 1)"
+                ).fetchone()
+            self.assertEqual(run["status"], "completed")
+            self.assertEqual([row["bargaining_unit_type"] for row in packages], ["classified", "licensed"])
+            self.assertEqual(len(document_rows), 2)
+            self.assertTrue(all(Path(row["local_file_path"]).is_file() for row in document_rows))
+            self.assertEqual(scan_status["last_status"], "success")
+            self.assertIsNotNone(scan_status["last_successful_scan_at"])
+            csv_text = export_contract_discovery_csv(run_id, temp_db_path)
+            self.assertIn("classified", csv_text)
+            self.assertIn("licensed", csv_text)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+            temp_db_path.unlink(missing_ok=True)
+            archive_temp.cleanup()
+
     def test_header_and_website_normalization(self):
         self.assertEqual(
             clean_source_header("Total Students All Grades (Excludes AE) [District] 2024-25"),
@@ -589,3 +933,4 @@ class CoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+    district_archive_directory,

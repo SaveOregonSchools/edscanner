@@ -1,0 +1,37 @@
+{
+  "Documents": [
+    {
+      "DocumentType": 1,
+      "Format": "HTML",
+      "Html": "<ul><li class=\"agenda-item\" data-agenda-item-id=\"agenda-1\"><strong>1. Call to Order</strong><p>Opening business.</p><a href=\"/document/ATTACHMENT-1\">Opening Memo</a></li></ul>",
+      "Id": 6001,
+      "IsPublic": true,
+      "MeetingId": 128,
+      "Name": "Agenda HTML",
+      "Type": "Agenda"
+    },
+    {
+      "DocumentType": 4,
+      "Format": "PDF",
+      "Html": "",
+      "Id": 6002,
+      "IsPublic": true,
+      "MeetingId": 128,
+      "Name": "Agenda PDF",
+      "Type": "Agenda"
+    },
+    {
+      "DocumentType": 10,
+      "Format": "PDF",
+      "Html": "",
+      "Id": 6003,
+      "IsPublic": true,
+      "MeetingId": 128,
+      "Name": "Approved Minutes",
+      "Type": "Minutes"
+    }
+  ],
+  "MeetingDateFormatted": "August 25, 2026",
+  "MeetingIncludeMinutesAttachments": true,
+  "MeetingOnPublishShowDraftMinutes": false
+}

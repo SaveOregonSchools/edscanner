@@ -7,7 +7,11 @@ The current version imports NCES/ELSI district exports into SQLite, provides
 dashboard and district-browsing views, queues website searches in a background
 worker, and supports both conservative same-domain crawling and optional Brave
 Search API-assisted discovery. It can also discover and reuse district website
-built-in search profiles to reduce dependence on third-party search APIs.
+built-in search profiles to reduce dependence on third-party search APIs. A
+labor-agreement discovery workflow finds and keeps separate contract packages
+for each district bargaining unit. A School Boards module discovers public
+meeting portals, incrementally collects structured agendas and documents,
+preserves revisions, and exposes cross-district full-text search.
 
 ## Local Setup
 
@@ -65,8 +69,13 @@ HTTP.
 - Import: load district source files from `imports\`.
 - Search: configure filters and run website searches.
 - Search Profiles: discover and inspect district built-in search profiles.
+- Contracts: discover licensed, classified, substitute, administrator,
+  transportation, service, and other bargaining-unit agreement packages.
+- School Boards: discover public meeting sources, run incremental or historical
+  syncs, inspect meetings and evidence, review run history, and search collected
+  agenda items and documents.
 - Districts: browse imported districts, filter by state/name, and sort columns.
-- Settings: save or clear the local Brave Search API key.
+- Settings: configure Brave Search and optional ordered Ollama server endpoints.
 
 The header includes the Save Oregon Schools logo linking to
 `https://www.saveoregonschools.com/`, and the footer includes the Save Oregon
@@ -233,6 +242,138 @@ Queued or running searches can be cancelled from the run detail page.
 Cancellation is saved in SQLite. Already stored results are kept, and a running
 search stops at the next page or district boundary.
 
+## School Board Monitoring
+
+Open **School Boards** from the main navigation. The module provides a complete
+workflow for public school-board records:
+
+1. **Discover Sources** follows high-signal governance links on district sites
+   and permits known external board-platform hosts without weakening the normal
+   district crawler's same-domain boundary.
+2. **Sync** reads public meeting listings, compares stable meeting IDs with
+   SQLite, refreshes new/recent/incomplete meetings, and downloads bounded
+   public documents.
+3. **Meetings** shows normalized metadata, hierarchical agenda items,
+   attachments, approved minutes, video links, and revision history.
+4. **Search** uses SQLite FTS5 when available (with a LIKE fallback) across
+   meetings, agenda items, motions/votes, and extracted document text. Every hit
+   retains its district, meeting, entity, retrieval date, and original URL.
+
+Source and sync runs are persisted before they enter the in-process board queue.
+Their per-district/source work items make restart recovery and historical
+backfills idempotent. Cancellation keeps records and versions already saved.
+Requests use shared global and per-host concurrency gates, a configurable delay,
+finite timeouts, bounded retries, `Retry-After`, within-run URL caching, and
+conditional `ETag`/`Last-Modified` document requests where servers support them.
+
+The adapter status for this release is:
+
+- **BoardBook Premier:** end-to-end public listing, structured agenda hierarchy,
+  attachments, minutes, video, document download, text extraction, versioning,
+  and search.
+- **Diligent Community / iCompass and modern CivicClerk:** anonymous public JSON
+  listing/detail/document adapters.
+- **Legacy BoardDocs and Simbli/eBOARDsolutions:** rendered-public-page parsers
+  are included. Sites that return a WAF/Incapsula challenge to ordinary HTTP are
+  recorded for JavaScript/manual review; EdScanner does not bypass challenges.
+- **Generic:** conservative fallback for obvious public meeting/agenda links.
+
+Monitoring mode prioritizes future meetings, meetings from the configured recent
+window, and meetings still lacking approved minutes. Historical backfill accepts
+an explicit date range and can be rerun without duplicating meetings, documents,
+or versions. Changed normalized agendas and changed document bytes create new
+version rows; prior evidence is never silently overwritten.
+
+Board documents are content-addressed on disk rather than stored as SQLite
+BLOBs. PDF, HTML, plain text, and DOCX extraction are supported. Image-only PDFs
+are retained with a `no_text` status so OCR can be added later; unsupported and
+oversized documents are recorded with explicit extraction statuses.
+
+An optional read-only developer probe verifies a public source without writing
+meeting or document rows:
+
+```powershell
+py board_probe.py --url https://meetings.boardbook.org/Public/Organization/2221
+py board_probe.py --district-id 1234 --since 2026-01-01
+py board_probe.py --district-id 1234 --browser
+```
+
+The browser option requires the Playwright Chromium runtime described under
+Search Profile Discovery. Probes and normal collection use only public listing
+pages and links; they do not authenticate or enumerate unpublished object IDs.
+
+## Labor Agreement Discovery
+
+Use the Contracts page to select states and district filters, then scan the
+largest matching districts. Discovery follows high-signal Human Resources,
+staff, careers, labor-relations, contract, and bargaining links and also checks
+district sitemaps. It downloads linked documents, extracts PDF text, identifies
+agreement dates, and assembles one package per bargaining unit.
+
+A package never represents the district as a whole. It represents one distinct
+unit, such as:
+
+- licensed or certified educators
+- classified staff
+- substitute educators
+- administrators or supervisors
+- transportation staff
+- service staff
+- another or not-yet-identified unit
+
+Each package can contain a base agreement plus extensions, MOUs, amendments,
+tentative agreements, and salary schedules. Salary-only pages do not create a
+package. When the unit or current status cannot be supported, the package is
+marked for review instead of being merged into a known unit. The run detail page
+provides the source documents, extracted evidence, editable review fields, and a
+CSV export.
+
+Agreement status is evaluated as of the discovery date. An expired agreement is
+not assumed to remain operative merely because no successor was found.
+
+### Local Contract Archive and Rescanning
+
+Source documents and extracted-text sidecars are archived by default under:
+
+```text
+downloads\contracts\<STATE>\<bounded-district-name>--<NCES-or-database-id>\
+```
+
+The state segment is always a two-letter code (or `XX` for malformed source
+data). District-name segments are normalized and capped at 50 characters, and a
+stable district identifier is appended to prevent collisions. Document names
+also include a content-hash suffix. The database records the absolute source and
+text paths, byte size, content hash, and archive timestamp, and the run detail
+page links to both local copies.
+
+Each completed district scan updates `district_contract_scan_status`, including
+the last attempt, last successful scan, result, package count, and document
+count. New runs skip districts successfully scanned inside the configured age
+threshold (180 days by default). The expired-contract option overrides that age
+rule when a bargaining unit has an expired agreement and no newer current
+agreement. A force-rescan option bypasses all prior-scan checks.
+
+### Optional Local AI Classification
+
+Contract discovery works without AI. To add a second classification pass,
+configure one or more native Ollama servers on the Settings page. Servers are
+tried in order, so a Tailscale address can be primary with a LAN address as a
+fallback:
+
+```text
+EDSCANNER_OLLAMA_ENDPOINTS='["http://server-name:11434","http://192.168.1.10:11434"]'
+EDSCANNER_OLLAMA_MODEL="gemma4:12b"
+EDSCANNER_LLM_API_KEY="optional"
+```
+
+Enable `Use local AI classification` for an individual run. EdScanner sends a
+bounded candidate excerpt, link context, title, and URL and requests structured
+JSON describing the bargaining unit, union, document role, and effective dates.
+EdScanner calls Ollama's native `/api/chat` API. If a server is unavailable or
+returns invalid output, the next configured server is tried. If all servers fail,
+deterministic results are retained. The bounded excerpt is sent only when local AI
+classification is enabled for a run.
+
 ## Debug Logs
 
 Enable `Capture debug log` on the Search page to create a per-run text log under:
@@ -271,8 +412,13 @@ Runtime files are intentionally local and ignored by Git:
 data\edscanner.db
 imports\*
 exports\*
+downloads\contracts\*
+data\board_documents\*
+data\board_snapshots\*
 logs\*.log
 logs\search_runs\*
+logs\board_discovery_runs\*
+logs\board_sync_runs\*
 .venv\
 __pycache__\
 ```
@@ -295,6 +441,24 @@ $env:EDSCANNER_MAX_PDF_SIZE_MB="10"
 $env:EDSCANNER_MAX_HTML_SIZE_MB="5"
 $env:EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN="25"
 $env:EDSCANNER_PROFILE_DISCOVERY_WORKERS="3"
+$env:EDSCANNER_CONTRACT_DISCOVERY_WORKERS="3"
+$env:EDSCANNER_CONTRACT_RESCAN_DAYS="180"
+$env:EDSCANNER_CONTRACT_DISTRICT_DIR_NAME_MAX="50"
+$env:EDSCANNER_BOARD_WORKERS="4"
+$env:EDSCANNER_BOARD_PER_HOST_WORKERS="2"
+$env:EDSCANNER_BOARD_REQUEST_DELAY="0.75"
+$env:EDSCANNER_BOARD_HTTP_MAX_REDIRECTS="5"
+$env:EDSCANNER_BOARD_HTTP_CACHE_MAX_ENTRIES="128"
+$env:EDSCANNER_BOARD_HTTP_CACHE_MAX_MB="32"
+$env:EDSCANNER_BOARD_ALLOW_PRIVATE_NETWORKS="false"
+$env:EDSCANNER_BOARD_ALLOW_INSECURE_SSL_FALLBACK="false"
+$env:EDSCANNER_BOARD_INSECURE_SSL_HOSTS="legacy-board.example.org"
+$env:EDSCANNER_BOARD_MAX_DOCUMENT_MB="25"
+$env:EDSCANNER_BOARD_MAX_DOCUMENTS_PER_MEETING="100"
+$env:EDSCANNER_BOARD_MAX_MEETINGS_PER_SOURCE="250"
+$env:EDSCANNER_BOARD_RECENT_RECHECK_DAYS="60"
+$env:EDSCANNER_BOARD_INCOMPLETE_RECHECK_DAYS="14"
+$env:EDSCANNER_BOARD_OLD_RECHECK_DAYS="90"
 $env:EDSCANNER_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 $env:EDSCANNER_VERIFY_SSL="true"
 $env:EDSCANNER_RESPECT_ROBOTS="false"
@@ -302,7 +466,23 @@ $env:EDSCANNER_FLASK_DEBUG="false"
 $env:EDSCANNER_HOST="127.0.0.1"
 $env:EDSCANNER_PORT="8765"
 $env:BRAVE_SEARCH_API_KEY="..."
+$env:EDSCANNER_OLLAMA_ENDPOINTS='["http://server-name:11434","http://192.168.1.10:11434"]'
+$env:EDSCANNER_OLLAMA_MODEL="gemma4:12b"
+$env:EDSCANNER_LLM_API_KEY="optional"
 ```
+
+Board collection rejects localhost, private, link-local, and reserved network
+targets by default, validates each bounded redirect hop, and does not retry with
+TLS verification disabled. Each ordinary connection is pinned to its validated
+DNS answer while retaining the public hostname for HTTP Host, TLS SNI, and
+certificate verification. Playwright fallback uses a loopback SOCKS proxy that
+applies the same address validation/pinning to every browser tunnel; unnecessary
+WebSockets and non-HTTP network schemes are blocked. `EDSCANNER_BOARD_ALLOW_PRIVATE_NETWORKS=true`
+is intended only for deterministic local-server tests. Insecure TLS fallback
+also requires both an explicit opt-in and a comma-separated exact/domain-suffix
+host allowlist in `EDSCANNER_BOARD_INSECURE_SSL_HOSTS`; affected responses are
+logged and marked with `insecure_tls` provenance. The per-client board response
+cache is an LRU bounded by both entry count and total bytes.
 
 Use `EDSCANNER_DISABLE_WORKER=1` only for tests or diagnostics when the
 background worker should not start automatically.
@@ -318,7 +498,7 @@ logs\edscanner.log
 Run compile checks:
 
 ```powershell
-.\.venv\Scripts\python -m py_compile app.py common.py import_districts.py search_engine.py site_search_discovery.py discover_search_profiles.py ai_matcher.py
+.\.venv\Scripts\python -m compileall -q app.py common.py import_districts.py search_engine.py site_search_discovery.py discover_search_profiles.py contract_discovery.py ai_matcher.py board board_probe.py
 ```
 
 Run unit tests:
@@ -329,7 +509,12 @@ Run unit tests:
 
 The test suite includes local HTTP-server coverage for crawler mode, Brave API
 mode using a fake local endpoint, district search profile discovery and reuse,
-CSV export, debug-log creation, and cancellation before run start.
+CSV export, debug-log creation, and cancellation before run start. School-board
+tests use checked-in HTML/JSON fixtures and local/fake HTTP only; they cover all
+platform detectors/parsers plus source discovery boundaries, BoardBook
+normalization, persistence, revision history, document extraction, FTS, sync
+idempotency, cancellation, and Flask routes. Live websites are never required by
+the ordinary test suite.
 
 ## License
 
@@ -353,7 +538,14 @@ project's trademark and branding notice.
 - Boolean operators, wildcards, and quote parsing are not implemented.
 - Brave mode consumes one API request per district searched.
 - PDF parsing is basic and limited by file size.
-- Robots.txt is respected where it can be fetched and parsed.
+- Scanned image-only agreements are flagged by their missing extracted text;
+  OCR is not yet built in.
+- Scanned image-only board documents are retained but are not OCR'd.
+- Legacy BoardDocs and some Simbli sites may require Playwright or manual review
+  because their public pages are JavaScript-driven or protected by bot
+  challenges. Challenges and authenticated portals are never bypassed.
+- `robots.txt` is enforced when `EDSCANNER_RESPECT_ROBOTS=true`; the default is
+  disabled consistently across existing and board collectors.
 - The crawler is intentionally conservative and uses per-run district and page
   caps.
 
@@ -364,5 +556,5 @@ project's trademark and branding notice.
 - AI-assisted match classification
 - semantic search
 - richer PDF-first search workflows
-- school board agenda and policy document detection
+- scheduled school-board monitoring and saved board-record watchlists
 - saved search projects and watchlists

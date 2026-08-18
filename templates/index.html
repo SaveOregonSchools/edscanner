@@ -47,6 +47,23 @@
   </section>
 
   <section class="content-section">
+    <div class="page-heading compact-heading">
+      <div>
+        <h2>School Board Monitoring</h2>
+        <p class="status-note">Public meeting sources, structured agendas, documents, revisions, and full-text search.</p>
+      </div>
+      <a class="button-link" href="{{ url_for('boards.overview') }}">Open School Boards</a>
+    </div>
+    <section class="stat-grid compact" aria-label="School board status">
+      <div class="stat"><span class="stat-label">Districts with working sources</span><strong>{{ stats.board_source_districts|fmt_int }}</strong></div>
+      <div class="stat"><span class="stat-label">Working sources</span><strong>{{ stats.board_working_sources|fmt_int }}</strong></div>
+      <div class="stat"><span class="stat-label">Meetings</span><strong>{{ stats.board_meetings|fmt_int }}</strong></div>
+      <div class="stat"><span class="stat-label">Documents</span><strong>{{ stats.board_documents|fmt_int }}</strong></div>
+      <div class="stat"><span class="stat-label">Last board sync</span><strong>{{ stats.board_last_sync|fmt_dt }}</strong></div>
+    </section>
+  </section>
+
+  <section class="content-section">
     <h2>Recent Runs</h2>
     {% if recent_runs %}
       <table>

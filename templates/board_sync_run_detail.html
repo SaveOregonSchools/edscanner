@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Board Sync #{{ run.id }} - EdScanner{% endblock %}
+{% block head_extra %}{% if run.status in ['queued', 'running'] %}<meta http-equiv="refresh" content="15">{% endif %}{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Board Sync #{{ run.id }}</h2>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('boards.sync') }}">Sync</a><a class="button-link" href="{{ url_for('boards.sync_run_detail', run_id=run.id) }}">Refresh</a>
+      {% if run.debug_log_path %}<a class="button-link" href="{{ url_for('boards.sync_run_log', run_id=run.id) }}" target="_blank" rel="noopener">Debug log</a>{% endif %}
+      {% if run.status in ['queued', 'running'] and not run.cancel_requested %}<form method="post" action="{{ url_for('boards.cancel_sync_run', run_id=run.id) }}" class="inline-action"><button type="submit" class="danger">Cancel</button></form>{% endif %}
+    </div>
+  </section>
+  {% include "_board_nav.html" %}
+  {% if run.status in ['queued', 'running'] %}<p class="status-note">This page refreshes every 15 seconds. Cancellation keeps meetings, documents, and versions already collected.</p>{% endif %}
+
+  <section class="stat-grid compact">
+    <div class="stat"><span class="stat-label">Status</span><strong>{{ run.status }}</strong></div><div class="stat"><span class="stat-label">Processed</span><strong>{{ run.districts_processed|fmt_int }} / {{ run.districts_planned|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Meetings found</span><strong>{{ run.meetings_discovered|fmt_int }}</strong></div><div class="stat"><span class="stat-label">Meetings added</span><strong>{{ run.meetings_added|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Meetings updated</span><strong>{{ run.meetings_updated|fmt_int }}</strong></div><div class="stat"><span class="stat-label">Documents added</span><strong>{{ run.documents_added|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Documents updated</span><strong>{{ run.documents_updated|fmt_int }}</strong></div><div class="stat"><span class="stat-label">Failures</span><strong>{{ run.failures|fmt_int }}</strong></div><div class="stat"><span class="stat-label">Elapsed</span><strong>{{ elapsed }}</strong></div>
+  </section>
+
+  <section class="content-section"><h2>Run Settings</h2><table class="key-table"><tbody>
+    <tr><th>Mode</th><td>{{ run.sync_mode }}</td></tr><tr><th>States</th><td>{{ states|join(', ') if states else 'All' }}</td></tr><tr><th>Agency types</th><td>{{ agency_types|join(', ') if agency_types else 'All' }}</td></tr>
+    <tr><th>Platforms</th><td>{{ platforms|join(', ') if platforms else 'All' }}</td></tr><tr><th>Date range</th><td>{{ run.date_from or 'Any' }} to {{ run.date_to or 'Any' }}</td></tr><tr><th>Workers</th><td>{{ run.max_workers }}</td></tr><tr><th>Force</th><td>{{ 'Yes' if run.force else 'No' }}</td></tr>
+    <tr><th>Started</th><td>{{ run.started_at|fmt_dt }}</td></tr><tr><th>Finished</th><td>{{ run.finished_at|fmt_dt }}</td></tr>{% if run.error_message %}<tr><th>Message</th><td>{{ run.error_message }}</td></tr>{% endif %}
+  </tbody></table></section>
+
+  <section class="content-section"><h2>Source Work</h2><div class="table-scroll"><table>
+    <thead><tr><th>District</th><th>Platform</th><th>Status</th><th>Meetings</th><th>Added</th><th>Updated</th><th>Documents</th><th>Message</th></tr></thead>
+    <tbody>{% for item in items %}<tr><td><strong>{{ item.agency_name }}</strong><div class="status-note">{{ item.state }}</div></td><td>{{ item.platform }}</td><td><span class="status {{ item.status }}">{{ item.status }}</span></td><td>{{ item.meetings_discovered|fmt_int }}</td><td>{{ item.meetings_added|fmt_int }}</td><td>{{ item.meetings_updated|fmt_int }}</td><td>{{ (item.documents_added + item.documents_updated)|fmt_int }}</td><td>{{ item.error_message or '' }}</td></tr>{% else %}<tr><td colspan="8" class="empty">No work items.</td></tr>{% endfor %}</tbody>
+  </table></div></section>
+{% endblock %}

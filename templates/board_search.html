@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+
+{% block title %}Search Board Records - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading"><div><h2>Search Board Records</h2><p class="status-note">Search meeting titles, structured agenda items, motions, votes, minutes, and extracted documents.</p></div>{% if query %}<div class="metric-inline"><span>Results</span><strong>{{ total|fmt_int }}</strong></div>{% endif %}</section>
+  {% include "_board_nav.html" %}
+  <section class="tool-surface"><form method="get" class="search-form">
+    <div class="wide"><label for="q">Keywords or quoted phrase</label><input id="q" name="q" value="{{ query }}" required placeholder='community schools or "cell phone policy"'></div>
+    <div><label for="state">State</label><select id="state" name="state"><option value="">All</option>{% for value in options.states %}<option value="{{ value }}" {% if filters.state == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div><label for="district_id">District</label><select id="district_id" name="district_id"><option value="">All</option>{% for value in districts %}<option value="{{ value.id }}" {% if filters.district_id == value.id|string %}selected{% endif %}>{{ value.state }} · {{ value.agency_name }}</option>{% endfor %}</select></div>
+    <div><label for="platform">Platform</label><select id="platform" name="platform"><option value="">All</option>{% for value in platforms %}<option value="{{ value }}" {% if filters.platform == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div><label for="document_type">Document type</label><select id="document_type" name="document_type"><option value="">All</option>{% for value in document_types %}<option value="{{ value }}" {% if filters.document_type == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div><label for="date_from">From</label><input id="date_from" name="date_from" type="date" value="{{ filters.date_from }}"></div><div><label for="date_to">To</label><input id="date_to" name="date_to" type="date" value="{{ filters.date_to }}"></div>
+    <div class="form-actions full"><button type="submit">Search records</button></div>
+  </form></section>
+
+  {% if query %}<section class="content-section board-search-results">
+    {% for row in rows %}<article class="search-hit">
+      <div class="search-hit-heading"><div><h3><a href="{{ url_for('boards.meeting_detail', meeting_id=row.meeting_id) }}{% if row.document_id %}#document-{{ row.document_id }}{% elif row.agenda_item_id %}#agenda-item-{{ row.agenda_item_id }}{% endif %}">{{ row.title or row.meeting_title or 'Board record' }}</a></h3><p>{{ row.agency_name }} · {{ row.state }} · {{ row.meeting_date }} · {{ row.platform }}</p></div><span class="status">{{ row.entity_type }}</span></div>
+      <p class="snippet">{{ row.excerpt }}</p>
+      <p class="source-links"><a href="{{ row.source_url }}" target="_blank" rel="noopener">Original public source</a> · Retrieved {{ row.retrieved_at|fmt_dt }}{% if row.changed %} · <span class="status warn">Source changed</span>{% endif %}</p>
+    </article>{% else %}<p class="empty">No collected board records match this search.</p>{% endfor %}
+    {% if pages > 1 %}<nav class="pagination">{% if page > 1 %}<a class="button-link" href="{{ page_url(page - 1) }}">Previous</a>{% endif %}<span>Page {{ page }} of {{ pages }}</span>{% if page < pages %}<a class="button-link" href="{{ page_url(page + 1) }}">Next</a>{% endif %}</nav>{% endif %}
+  </section>{% endif %}
+{% endblock %}

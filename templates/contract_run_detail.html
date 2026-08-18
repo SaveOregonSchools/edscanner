@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+
+{% block title %}Contract Run #{{ run.id }} - EdScanner{% endblock %}
+
+{% block head_extra %}
+  {% if run.status in ["queued", "running"] %}<meta http-equiv="refresh" content="15">{% endif %}
+{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <h2>Contract Discovery Run #{{ run.id }}</h2>
+      <p class="status-note">{{ states|join(", ") or "All states" }} · current as of the discovery date</p>
+    </div>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('contracts_page') }}">Contracts</a>
+      <a class="button-link" href="{{ url_for('export_contract_discovery_run', run_id=run.id) }}">Export CSV</a>
+      {% if run.debug_log_path %}<a class="button-link" href="{{ url_for('contract_discovery_debug_log_file', run_id=run.id) }}">Debug log</a>{% endif %}
+      {% if run.status in ["queued", "running"] and not run.cancel_requested %}
+        <form method="post" action="{{ url_for('cancel_contract_discovery_run', run_id=run.id) }}"><button type="submit" class="danger">Cancel</button></form>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if run.status in ["queued", "running"] %}<p class="status-note">This page refreshes every 15 seconds while discovery is active.</p>{% endif %}
+
+  <section class="stat-grid compact">
+    <div class="stat"><span class="stat-label">Status</span><strong><span class="status {{ run.status }}">{{ run.status }}</span></strong></div>
+    <div class="stat"><span class="stat-label">Processed</span><strong>{{ run.districts_processed|fmt_int }} / {{ run.districts_planned|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">In progress</span><strong>{{ in_progress_count|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Left</span><strong>{{ left_count|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Packages</span><strong>{{ run.packages_found|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Documents</span><strong>{{ run.documents_found|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Failures</span><strong>{{ run.districts_failed|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Skipped recent</span><strong>{{ run.districts_skipped_recent|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Elapsed</span><strong>{{ elapsed or "—" }}</strong></div>
+  </section>
+
+  {% if run.error_message %}<div class="message {% if run.status == 'failed' %}error{% else %}info{% endif %}">{{ run.error_message }}</div>{% endif %}
+
+  <p class="status-note">
+    Archive: {{ "documents + extracted text" if run.archive_documents and run.store_extracted_text else "documents" if run.archive_documents else "extracted text only" if run.store_extracted_text else "off" }}
+    Â· rescan threshold {{ run.rescan_after_days }} days
+    Â· expired override {{ "on" if run.recheck_expired else "off" }}
+    {% if run.force_rescan %}Â· forced rescan{% endif %}
+  </p>
+
+  <section class="content-section">
+    <h2>Agreement Packages</h2>
+    {% if packages %}
+      {% for package in packages %}
+        <article class="result-group" id="package-{{ package.id }}">
+          <div class="result-group-header">
+            <div>
+              <h3>{{ package.district_name }} — {{ package.bargaining_unit_name }}</h3>
+              <p>{{ package.union_name or "Union name not identified" }} · <span class="status {{ 'good' if package.agreement_status == 'current' else 'warn' if package.agreement_status == 'unknown' else 'error' }}">{{ package.agreement_status }}</span> · confidence {{ "%.0f"|format(package.confidence or 0) }}%</p>
+            </div>
+            {% if package.source_page_url %}<a href="{{ package.source_page_url }}" target="_blank" rel="noopener">Authoritative source page</a>{% endif %}
+          </div>
+
+          <details class="review-panel" {% if package.review_status == 'needs_review' %}open{% endif %}>
+            <summary>Review package ({{ package.review_status }})</summary>
+            <form method="post" action="{{ url_for('review_contract_package', package_id=package.id) }}" class="search-form compact-form">
+              <div><label>Unit type</label><select name="bargaining_unit_type">{% for unit_type in unit_types %}<option value="{{ unit_type }}" {% if package.bargaining_unit_type == unit_type %}selected{% endif %}>{{ unit_type }}</option>{% endfor %}</select></div>
+              <div><label>Unit name</label><input name="bargaining_unit_name" value="{{ package.bargaining_unit_name or '' }}"></div>
+              <div><label>Union</label><input name="union_name" value="{{ package.union_name or '' }}"></div>
+              <div><label>Effective date</label><input type="date" name="effective_date" value="{{ package.effective_date or '' }}"></div>
+              <div><label>Expiration date</label><input type="date" name="expiration_date" value="{{ package.expiration_date or '' }}"></div>
+              <div><label>Agreement status</label><select name="agreement_status">{% for value in ["current", "expired", "future", "unknown"] %}<option value="{{ value }}" {% if package.agreement_status == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+              <div><label>Review status</label><select name="review_status">{% for value in ["unreviewed", "needs_review", "verified", "rejected"] %}<option value="{{ value }}" {% if package.review_status == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+              <div class="full"><label>Notes</label><input name="notes" value="{{ package.notes or '' }}"></div>
+              <div class="form-actions full"><button type="submit">Save review</button></div>
+            </form>
+          </details>
+
+          <table>
+            <thead><tr><th>Role</th><th>Document</th><th>Dates</th><th>Status</th><th>Evidence</th></tr></thead>
+            <tbody>
+              {% for document in documents_by_package.get(package.id, []) %}
+                <tr>
+                  <td>{{ document.document_type }}</td>
+                  <td>
+                    <a href="{{ document.url }}" target="_blank" rel="noopener">{{ document.title }}</a>
+                    <div class="status-note">{{ document.content_type or "unknown type" }}{% if document.file_size_bytes %} Â· {{ document.file_size_bytes|fmt_int }} bytes{% endif %}</div>
+                    {% if document.local_file_path or document.extracted_text_path %}
+                      <div class="status-note">
+                        {% if document.local_file_path %}<a href="{{ url_for('archived_contract_document', document_id=document.id) }}" target="_blank">local archive</a>{% endif %}
+                        {% if document.local_file_path and document.extracted_text_path %} Â· {% endif %}
+                        {% if document.extracted_text_path %}<a href="{{ url_for('archived_contract_text', document_id=document.id) }}" target="_blank">extracted text</a>{% endif %}
+                      </div>
+                    {% endif %}
+                  </td>
+                  <td>{{ document.effective_date or "?" }} → {{ document.expiration_date or "?" }}</td>
+                  <td>{{ document.agreement_status }}<div class="status-note">{{ "%.0f"|format(document.confidence or 0) }}%</div></td>
+                  <td class="snippet">{{ document.snippet }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </article>
+      {% endfor %}
+    {% elif run.status in ["queued", "running"] %}
+      <p class="empty">No packages stored yet.</p>
+    {% else %}
+      <p class="empty">No labor agreement candidates were confirmed in this run.</p>
+    {% endif %}
+  </section>
+{% endblock %}

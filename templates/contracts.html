@@ -1,0 +1,146 @@
+{% extends "base.html" %}
+
+{% block title %}Contracts - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <h2>Labor Agreement Discovery</h2>
+      <p class="status-note">Find and keep separate agreement packages for every district bargaining unit.</p>
+    </div>
+  </section>
+
+  <section class="stat-grid compact">
+    <div class="stat"><span class="stat-label">Districts with packages</span><strong>{{ totals.districts|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Successfully scanned</span><strong>{{ totals.successful_scans|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Locally archived</span><strong>{{ totals.archived_districts|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Packages</span><strong>{{ totals.packages|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Marked current</span><strong>{{ totals.current_packages|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Needs review</span><strong>{{ totals.needs_review|fmt_int }}</strong></div>
+  </section>
+
+  <section class="tool-surface">
+    <form method="post" action="{{ url_for('contracts_page') }}" class="search-form">
+      <div>
+        <label for="states">States</label>
+        <select id="states" name="states" multiple size="8">
+          {% for state in options.states %}
+            <option value="{{ state }}" {% if state in selected_states %}selected{% endif %}>{{ state }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="agency_types">Agency types</label>
+        <select id="agency_types" name="agency_types" multiple size="8">
+          {% for agency_type in options.agency_types %}
+            <option value="{{ agency_type }}" {% if agency_type in selected_agency_types %}selected{% endif %}>{{ agency_type }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="min_enrollment">Minimum enrollment</label>
+        <input id="min_enrollment" name="min_enrollment" type="number" value="{{ min_enrollment or '' }}">
+      </div>
+      <div>
+        <label for="max_enrollment">Maximum enrollment</label>
+        <input id="max_enrollment" name="max_enrollment" type="number" value="{{ max_enrollment or '' }}">
+      </div>
+      <div>
+        <label for="max_districts">Largest districts to scan</label>
+        <input id="max_districts" name="max_districts" type="number" min="1" max="100" value="{{ max_districts }}">
+      </div>
+      <div>
+        <label for="max_pages_per_district">Navigation pages per district</label>
+        <input id="max_pages_per_district" name="max_pages_per_district" type="number" min="3" max="60" value="{{ max_pages_per_district }}">
+      </div>
+      <div>
+        <label for="max_workers">District workers</label>
+        <input id="max_workers" name="max_workers" type="number" min="1" max="8" value="{{ max_workers }}">
+      </div>
+      <div>
+        <label for="rescan_after_days">Rescan after this many days</label>
+        <input id="rescan_after_days" name="rescan_after_days" type="number" min="0" max="3650" value="{{ rescan_after_days }}">
+        <p class="field-note">Default: 180. Use 0 to make every matching district due.</p>
+      </div>
+      <div class="checkbox-field">
+        <input id="include_salary_schedules" name="include_salary_schedules" type="checkbox" value="1" {% if include_salary_schedules %}checked{% endif %}>
+        <label for="include_salary_schedules">Include salary schedules in their unit package</label>
+      </div>
+      <div class="checkbox-field">
+        <input id="use_llm" name="use_llm" type="checkbox" value="1" {% if use_llm %}checked{% endif %} {% if not llm_configured %}disabled{% endif %}>
+        <label for="use_llm">Use local AI classification</label>
+        {% if not llm_configured %}<p class="field-note"><a href="{{ url_for('settings_page') }}">Configure a local AI server</a> to enable this option.</p>{% endif %}
+      </div>
+      <div class="checkbox-field">
+        <input id="archive_documents" name="archive_documents" type="checkbox" value="1" {% if archive_documents %}checked{% endif %}>
+        <label for="archive_documents">Archive source documents locally</label>
+        <p class="field-note"><code>{{ contract_archive_dir }}</code></p>
+      </div>
+      <div class="checkbox-field">
+        <input id="store_extracted_text" name="store_extracted_text" type="checkbox" value="1" {% if store_extracted_text %}checked{% endif %}>
+        <label for="store_extracted_text">Store extracted text sidecars</label>
+      </div>
+      <div class="checkbox-field">
+        <input id="recheck_expired" name="recheck_expired" type="checkbox" value="1" {% if recheck_expired %}checked{% endif %}>
+        <label for="recheck_expired">Recheck expired bargaining units even inside the age threshold</label>
+      </div>
+      <div class="checkbox-field">
+        <input id="force_rescan" name="force_rescan" type="checkbox" value="1" {% if force_rescan %}checked{% endif %}>
+        <label for="force_rescan">Force rescan and ignore prior successful scans</label>
+      </div>
+      <div class="form-actions full">
+        <button type="submit">Discover labor agreements</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <h2>Recent Runs</h2>
+    {% if recent_runs %}
+      <table>
+        <thead><tr><th>Run</th><th>Status</th><th>Progress</th><th>Skipped recent</th><th>Packages</th><th>Documents</th><th>Archive</th><th>AI</th><th>Started</th></tr></thead>
+        <tbody>
+          {% for run in recent_runs %}
+            <tr>
+              <td><a href="{{ url_for('contract_discovery_run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
+              <td><span class="status {{ run.status }}">{{ run.status }}</span></td>
+              <td>{{ run.districts_processed|fmt_int }} / {{ run.districts_planned|fmt_int }}</td>
+              <td>{{ run.districts_skipped_recent|fmt_int }}</td>
+              <td>{{ run.packages_found|fmt_int }}</td>
+              <td>{{ run.documents_found|fmt_int }}</td>
+              <td>{{ "yes" if run.archive_documents else "no" }}</td>
+              <td>{{ "yes" if run.use_llm else "no" }}</td>
+              <td>{{ run.started_at|fmt_dt }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No contract discovery runs yet.</p>
+    {% endif %}
+  </section>
+
+  <section class="content-section">
+    <h2>District Scan Status</h2>
+    {% if district_scan_statuses %}
+      <table>
+        <thead><tr><th>District</th><th>Last result</th><th>Last successful scan</th><th>Packages</th><th>Documents</th><th>Contract timing</th><th>Run</th></tr></thead>
+        <tbody>
+          {% for scan in district_scan_statuses %}
+            <tr>
+              <td>{{ scan.agency_name }}<div class="status-note">{{ scan.state }}</div></td>
+              <td><span class="status {{ 'good' if scan.last_status == 'success' else 'error' }}">{{ scan.last_status }}</span>{% if scan.last_error %}<div class="status-note">{{ scan.last_error }}</div>{% endif %}</td>
+              <td>{% if scan.last_successful_scan_at %}{{ scan.last_successful_scan_at|fmt_dt }}{% else %}Never{% endif %}</td>
+              <td>{{ scan.packages_found|fmt_int }}</td>
+              <td>{{ scan.documents_found|fmt_int }}</td>
+              <td>{% if scan.has_expired_contract %}<span class="status error">expired; due</span>{% elif scan.next_expiration_date %}next {{ scan.next_expiration_date }}{% else %}unknown{% endif %}</td>
+              <td>{% if scan.last_run_id %}<a href="{{ url_for('contract_discovery_run_detail', run_id=scan.last_run_id) }}">#{{ scan.last_run_id }}</a>{% else %}—{% endif %}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="empty">No districts have completed a contract scan yet.</p>
+    {% endif %}
+  </section>
+{% endblock %}

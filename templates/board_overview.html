@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block title %}School Boards - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <h2>School Boards</h2>
+      <p class="status-note">Public meeting source discovery, incremental collection, revision history, and search.</p>
+    </div>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('boards.discovery') }}">Discover sources</a>
+      <a class="button-link primary" href="{{ url_for('boards.sync') }}">Sync meetings</a>
+    </div>
+  </section>
+
+  {% include "_board_nav.html" %}
+
+  <section class="stat-grid compact" aria-label="School board coverage">
+    <div class="stat"><span class="stat-label">Districts</span><strong>{{ summary.total_districts|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Sources discovered</span><strong>{{ summary.source_districts|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Not yet checked</span><strong>{{ summary.unchecked_districts|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Working sources</span><strong>{{ summary.working_sources|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Manual review</span><strong>{{ summary.manual_review|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Failed or blocked</span><strong>{{ summary.failed_sources|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Meetings</span><strong>{{ summary.meetings|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Documents</span><strong>{{ summary.documents|fmt_int }}</strong></div>
+  </section>
+
+  <section class="content-section">
+    <h2>Platform Coverage</h2>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr><th>Platform</th><th>Districts</th><th>Working</th><th>Failed</th><th>Sync failures (24h)</th><th>Manual review</th><th>Last successful sync</th></tr>
+        </thead>
+        <tbody>
+          {% for row in platform_rows %}
+            <tr>
+              <td><strong>{{ row.platform }}</strong></td>
+              <td>{{ row.districts|fmt_int }}</td>
+              <td>{{ row.working|fmt_int }}</td>
+              <td>{{ row.failed|fmt_int }}</td>
+              <td>{{ row.recent_failures|fmt_int }}</td>
+              <td>{{ row.manual_review|fmt_int }}</td>
+              <td>{{ row.last_sync|fmt_dt }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="7" class="empty">No board sources have been checked yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="content-section two-column-sections">
+    <div>
+      <h2>Recent Discovery Runs</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Run</th><th>Status</th><th>Processed</th><th>Working</th><th>Started</th></tr></thead>
+          <tbody>
+            {% for run in discovery_runs %}
+              <tr>
+                <td><a href="{{ url_for('boards.discovery_run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
+                <td><span class="status {{ run.status }}">{{ run.status }}</span></td>
+                <td>{{ run.districts_processed|fmt_int }} / {{ run.districts_planned|fmt_int }}</td>
+                <td>{{ run.sources_working|fmt_int }}</td>
+                <td>{{ (run.started_at or run.queued_at)|fmt_dt }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="5" class="empty">No discovery runs yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div>
+      <h2>Recent Sync Runs</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Run</th><th>Status</th><th>Processed</th><th>Meetings</th><th>Started</th></tr></thead>
+          <tbody>
+            {% for run in sync_runs %}
+              <tr>
+                <td><a href="{{ url_for('boards.sync_run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
+                <td><span class="status {{ run.status }}">{{ run.status }}</span></td>
+                <td>{{ run.districts_processed|fmt_int }} / {{ run.districts_planned|fmt_int }}</td>
+                <td>{{ run.meetings_discovered|fmt_int }}</td>
+                <td>{{ (run.started_at or run.queued_at)|fmt_dt }}</td>
+              </tr>
+            {% else %}
+              <tr><td colspan="5" class="empty">No sync runs yet.</td></tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+{% endblock %}

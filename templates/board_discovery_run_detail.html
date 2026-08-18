@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+
+{% block title %}Board Discovery #{{ run.id }} - EdScanner{% endblock %}
+{% block head_extra %}{% if run.status in ['queued', 'running'] %}<meta http-equiv="refresh" content="15">{% endif %}{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Board Source Discovery #{{ run.id }}</h2>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('boards.discovery') }}">Discover Sources</a>
+      <a class="button-link" href="{{ url_for('boards.discovery_run_detail', run_id=run.id) }}">Refresh</a>
+      {% if run.debug_log_path %}<a class="button-link" href="{{ url_for('boards.discovery_run_log', run_id=run.id) }}" target="_blank" rel="noopener">Debug log</a>{% endif %}
+      {% if run.status in ['queued', 'running'] and not run.cancel_requested %}<form method="post" action="{{ url_for('boards.cancel_discovery_run', run_id=run.id) }}" class="inline-action"><button type="submit" class="danger">Cancel</button></form>{% endif %}
+    </div>
+  </section>
+  {% include "_board_nav.html" %}
+  {% if run.status in ['queued', 'running'] %}<p class="status-note">This page refreshes every 15 seconds. Cancellation keeps all sources already collected.</p>{% endif %}
+
+  <section class="stat-grid compact">
+    <div class="stat"><span class="stat-label">Status</span><strong>{{ run.status }}</strong></div>
+    <div class="stat"><span class="stat-label">Matched</span><strong>{{ run.districts_matched|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Planned</span><strong>{{ run.districts_planned|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Processed</span><strong>{{ run.districts_processed|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Working</span><strong>{{ run.sources_working|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Not found</span><strong>{{ run.sources_not_found|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Manual review</span><strong>{{ run.sources_manual_review|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Failed</span><strong>{{ run.sources_failed|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Elapsed</span><strong>{{ elapsed }}</strong></div>
+  </section>
+
+  <section class="content-section"><h2>Run Settings</h2><table class="key-table"><tbody>
+    <tr><th>States</th><td>{{ states|join(', ') if states else 'All' }}</td></tr><tr><th>Agency types</th><td>{{ agency_types|join(', ') if agency_types else 'All' }}</td></tr>
+    <tr><th>Enrollment</th><td>{{ run.min_enrollment|fmt_int or 'Any' }} to {{ run.max_enrollment|fmt_int or 'Any' }}</td></tr><tr><th>Platform/status</th><td>{{ run.platform_filter or 'Any' }} / {{ run.status_filter or 'Any' }}</td></tr>
+    <tr><th>Workers</th><td>{{ run.max_workers }}</td></tr><tr><th>Force</th><td>{{ 'Yes' if run.force else 'No' }}</td></tr><tr><th>Started</th><td>{{ run.started_at|fmt_dt }}</td></tr><tr><th>Finished</th><td>{{ run.finished_at|fmt_dt }}</td></tr>
+    {% if run.error_message %}<tr><th>Message</th><td>{{ run.error_message }}</td></tr>{% endif %}
+  </tbody></table></section>
+
+  <section class="content-section"><h2>District Work</h2><div class="table-scroll"><table>
+    <thead><tr><th>District</th><th>State</th><th>Status</th><th>Platform</th><th>Source</th><th>Message</th><th>Finished</th></tr></thead>
+    <tbody>{% for item in items %}<tr><td><strong>{{ item.agency_name }}</strong></td><td>{{ item.state }}</td><td><span class="status {{ item.status }}">{{ item.status }}</span></td><td>{{ item.platform or '' }}</td><td>{% if item.source_url %}<a href="{{ item.source_url }}" target="_blank" rel="noopener">Original</a>{% endif %}</td><td>{{ item.error_message or item.source_error or '' }}</td><td>{{ item.finished_at|fmt_dt }}</td></tr>{% else %}<tr><td colspan="7" class="empty">No work items.</td></tr>{% endfor %}</tbody>
+  </table></div></section>
+{% endblock %}

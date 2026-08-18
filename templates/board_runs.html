@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+
+{% block title %}Board Runs - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading"><h2>School Board Runs</h2></section>
+  {% include "_board_nav.html" %}
+  <section class="content-section"><h2>Source Discovery</h2><div class="table-scroll"><table><thead><tr><th>Run</th><th>Status</th><th>Filters</th><th>Processed</th><th>Working</th><th>Manual</th><th>Failed</th><th>Queued</th></tr></thead><tbody>{% for run in discovery_runs %}<tr><td><a href="{{ url_for('boards.discovery_run_detail', run_id=run.id) }}">#{{ run.id }}</a></td><td><span class="status {{ run.status }}">{{ run.status }}</span></td><td>{{ run.states_json }}</td><td>{{ run.districts_processed|fmt_int }} / {{ run.districts_planned|fmt_int }}</td><td>{{ run.sources_working|fmt_int }}</td><td>{{ run.sources_manual_review|fmt_int }}</td><td>{{ run.sources_failed|fmt_int }}</td><td>{{ run.queued_at|fmt_dt }}</td></tr>{% else %}<tr><td colspan="8" class="empty">No discovery runs.</td></tr>{% endfor %}</tbody></table></div></section>
+  <section class="content-section"><h2>Meeting Sync</h2><div class="table-scroll"><table><thead><tr><th>Run</th><th>Mode</th><th>Status</th><th>Platforms</th><th>Processed</th><th>Meetings</th><th>Documents</th><th>Failures</th><th>Queued</th></tr></thead><tbody>{% for run in sync_runs %}<tr><td><a href="{{ url_for('boards.sync_run_detail', run_id=run.id) }}">#{{ run.id }}</a></td><td>{{ run.sync_mode }}</td><td><span class="status {{ run.status }}">{{ run.status }}</span></td><td>{{ run.platforms_json }}</td><td>{{ run.districts_processed|fmt_int }} / {{ run.districts_planned|fmt_int }}</td><td>{{ run.meetings_discovered|fmt_int }}</td><td>{{ (run.documents_added + run.documents_updated)|fmt_int }}</td><td>{{ run.failures|fmt_int }}</td><td>{{ run.queued_at|fmt_dt }}</td></tr>{% else %}<tr><td colspan="9" class="empty">No sync runs.</td></tr>{% endfor %}</tbody></table></div></section>
+{% endblock %}

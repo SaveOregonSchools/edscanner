@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% macro render_items(items) %}
+  <ol class="agenda-tree">
+    {% for item in items %}
+      <li>
+        <article id="agenda-item-{{ item.id }}" class="agenda-item">
+          <h3>{% if item.display_number %}<span class="agenda-number">{{ item.display_number }}</span>{% endif %} {{ item.title }}</h3>
+          {% if item.presenter %}<p class="agenda-meta">Presenter: {{ item.presenter }}</p>{% endif %}
+          {% if item.description %}<p>{{ item.description }}</p>{% endif %}
+          {% if item.motion_text %}<p><strong>Motion:</strong> {{ item.motion_text }}</p>{% endif %}
+          {% if item.vote_text or item.result_text %}<p><strong>Vote/result:</strong> {{ item.vote_text }} {{ item.result_text }}</p>{% endif %}
+          {% for document in documents_by_item.get(item.id, []) %}<p class="agenda-document"><a href="#document-{{ document.id }}">{{ document.title or document.document_type }}</a></p>{% endfor %}
+        </article>
+        {% if item.children %}{{ render_items(item.children) }}{% endif %}
+      </li>
+    {% endfor %}
+  </ol>
+{% endmacro %}
+
+{% block title %}{{ meeting.title or 'Board Meeting' }} - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading"><div><h2>{{ meeting.title or 'Board Meeting' }}</h2><p class="status-note">{{ meeting.agency_name }} · {{ meeting.meeting_datetime_text or meeting.meeting_date }}</p></div><div class="action-row"><a class="button-link" href="{{ url_for('boards.meetings') }}">All meetings</a><a class="button-link primary" href="{{ meeting.source_url }}" target="_blank" rel="noopener">Original public source</a></div></section>
+  {% include "_board_nav.html" %}
+
+  <section class="content-section"><h2>Meeting Metadata</h2><table class="key-table"><tbody>
+    <tr><th>District</th><td>{{ meeting.agency_name }} ({{ meeting.state }})</td></tr><tr><th>Date/time</th><td>{{ meeting.meeting_datetime_text or meeting.meeting_date }}</td></tr><tr><th>Type</th><td>{{ meeting.meeting_type or '' }}</td></tr><tr><th>Location</th><td>{{ meeting.location_name or '' }}{% if meeting.location_address %}<br>{{ meeting.location_address }}{% endif %}</td></tr>
+    <tr><th>Platform</th><td>{{ meeting.platform }}</td></tr><tr><th>Last checked</th><td>{{ meeting.last_checked_at|fmt_dt }}</td></tr><tr><th>Revision status</th><td><span class="status {{ 'warn' if meeting.revision_detected else 'good' }}">{{ 'Change detected' if meeting.revision_detected else 'No detected change' }}</span></td></tr>
+    {% if meeting.agenda_url %}<tr><th>Agenda</th><td><a href="{{ meeting.agenda_url }}" target="_blank" rel="noopener">Open original agenda</a></td></tr>{% endif %}{% if meeting.minutes_url %}<tr><th>Minutes</th><td><a href="{{ meeting.minutes_url }}" target="_blank" rel="noopener">Open original minutes</a></td></tr>{% endif %}
+    {% if meeting.video_url or meeting.livestream_url %}<tr><th>Video</th><td>{% if meeting.video_url %}<a href="{{ meeting.video_url }}" target="_blank" rel="noopener">Recording</a>{% endif %}{% if meeting.livestream_url %} <a href="{{ meeting.livestream_url }}" target="_blank" rel="noopener">Livestream</a>{% endif %}</td></tr>{% endif %}
+  </tbody></table></section>
+
+  <section class="content-section"><h2>Agenda</h2>{% if agenda_tree %}{{ render_items(agenda_tree) }}{% else %}<p class="empty">No structured agenda items have been collected.</p>{% endif %}</section>
+
+  <section class="content-section"><h2>Documents</h2><div class="table-scroll"><table>
+    <thead><tr><th>Title</th><th>Type</th><th>Agenda item</th><th>Extraction</th><th>Size</th><th>Evidence</th></tr></thead>
+    <tbody>{% for document in documents %}<tr id="document-{{ document.id }}"><td><strong>{{ document.title or document.filename or 'Document' }}</strong>{% if document.error_message %}<div class="status-note">{{ document.error_message }}</div>{% endif %}</td><td>{{ document.document_type }}</td><td>{% if document.agenda_item_id %}<a href="#agenda-item-{{ document.agenda_item_id }}">{{ document.agenda_item_title or 'Agenda item' }}</a>{% endif %}</td><td><span class="status {{ 'good' if document.text_extraction_status == 'extracted' else 'warn' }}">{{ document.text_extraction_status }}</span></td><td>{{ document.size_bytes|fmt_int }}</td><td><a href="{{ document.source_url }}" target="_blank" rel="noopener">Original</a>{% if document.local_path %} · <a href="{{ url_for('boards.document_file', document_id=document.id) }}">Local copy</a>{% endif %}</td></tr>{% else %}<tr><td colspan="6" class="empty">No documents collected.</td></tr>{% endfor %}</tbody>
+  </table></div></section>
+
+  <section class="content-section"><h2>Version History</h2><div class="table-scroll"><table>
+    <thead><tr><th>Entity</th><th>Version</th><th>Detected</th><th>Hash</th><th>Evidence</th></tr></thead><tbody>
+      {% for version in meeting_versions %}<tr><td>Meeting / agenda</td><td>{{ version.version_number }}</td><td>{{ version.first_seen_at|fmt_dt }}</td><td><code>{{ version.content_hash[:16] }}</code></td><td>{% if version.raw_snapshot_path %}<a href="{{ url_for('boards.meeting_version_snapshot', version_id=version.id) }}">Raw snapshot</a>{% else %}Normalized record{% endif %}</td></tr>{% endfor %}
+      {% for version in document_versions %}<tr><td>{{ version.title or 'Document' }}</td><td>{{ version.version_number }}</td><td>{{ version.first_seen_at|fmt_dt }}</td><td><code>{{ version.sha256[:16] }}</code></td><td>{% if version.local_path %}<a href="{{ url_for('boards.document_version_file', version_id=version.id) }}">Archived file</a>{% endif %}</td></tr>{% endfor %}
+      {% if not meeting_versions and not document_versions %}<tr><td colspan="5" class="empty">No version history.</td></tr>{% endif %}
+    </tbody></table></div></section>
+{% endblock %}
