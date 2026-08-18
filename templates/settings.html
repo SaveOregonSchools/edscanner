@@ -25,9 +25,45 @@
         <input id="brave_api_key" name="brave_api_key" type="password" autocomplete="off" placeholder="Paste key to save or replace">
       </div>
       <div class="form-actions full">
-        <button type="submit" name="action" value="save">Save key</button>
+        <button type="submit" name="action" value="save_brave">Save key</button>
         {% if key_present %}
           <button type="submit" name="action" value="clear_brave_key" class="secondary">Clear key</button>
+        {% endif %}
+      </div>
+    </form>
+  </section>
+
+  <section class="tool-surface">
+    <form method="post" action="{{ url_for('settings_page') }}" class="settings-form">
+      <div class="full">
+        <h2>Local AI Server</h2>
+        <p class="field-note">
+          Native Ollama connection status:
+          {% if llm_configured %}
+            configured for <code>{{ llm_model }}</code>. Servers are tried from top to bottom.
+          {% else %}
+            not configured
+          {% endif %}
+        </p>
+      </div>
+      <div class="full">
+        <label for="ollama_endpoints">Ollama server URLs (one per line, primary first)</label>
+        <textarea id="ollama_endpoints" name="ollama_endpoints" rows="4" placeholder="http://server-name:11434&#10;http://192.168.1.10:11434">{{ ollama_endpoints_text }}</textarea>
+        <p class="field-note">Enter server roots; <code>/api/chat</code> is added automatically. If one fails, EdScanner tries the next.</p>
+      </div>
+      <div>
+        <label for="ollama_model">Ollama model</label>
+        <input id="ollama_model" name="ollama_model" value="{{ llm_model }}" placeholder="gemma4:12b">
+      </div>
+      <div>
+        <label for="llm_api_key">Bearer token (optional)</label>
+        <input id="llm_api_key" name="llm_api_key" type="password" autocomplete="off" placeholder="{% if llm_key_present %}Saved as {{ llm_masked_key }}; leave blank to keep{% else %}Only needed if your server requires it{% endif %}">
+      </div>
+      <div class="form-actions full">
+        <button type="submit" name="action" value="save_ollama">Save Ollama settings</button>
+        <button type="submit" name="action" value="save_test_ollama" class="secondary">Save and test</button>
+        {% if llm_configured or llm_key_present %}
+          <button type="submit" name="action" value="clear_ollama" class="secondary">Clear Ollama settings</button>
         {% endif %}
       </div>
     </form>
@@ -48,6 +84,10 @@
         <tr>
           <th>Storage</th>
           <td>The key is saved only in the local <code>.env</code> file, which is ignored by Git.</td>
+        </tr>
+        <tr>
+          <th>Contract classification</th>
+          <td>Contract discovery works without AI. When enabled for a run, EdScanner sends bounded candidate excerpts to the configured Ollama servers for structured classification.</td>
         </tr>
       </tbody>
     </table>

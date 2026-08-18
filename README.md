@@ -7,7 +7,9 @@ The current version imports NCES/ELSI district exports into SQLite, provides
 dashboard and district-browsing views, queues website searches in a background
 worker, and supports both conservative same-domain crawling and optional Brave
 Search API-assisted discovery. It can also discover and reuse district website
-built-in search profiles to reduce dependence on third-party search APIs.
+built-in search profiles to reduce dependence on third-party search APIs. A
+labor-agreement discovery workflow finds and keeps separate contract packages
+for each district bargaining unit.
 
 ## Local Setup
 
@@ -65,8 +67,10 @@ HTTP.
 - Import: load district source files from `imports\`.
 - Search: configure filters and run website searches.
 - Search Profiles: discover and inspect district built-in search profiles.
+- Contracts: discover licensed, classified, substitute, administrator,
+  transportation, service, and other bargaining-unit agreement packages.
 - Districts: browse imported districts, filter by state/name, and sort columns.
-- Settings: save or clear the local Brave Search API key.
+- Settings: configure Brave Search and optional ordered Ollama server endpoints.
 
 The header includes the Save Oregon Schools logo linking to
 `https://www.saveoregonschools.com/`, and the footer includes the Save Oregon
@@ -233,6 +237,78 @@ Queued or running searches can be cancelled from the run detail page.
 Cancellation is saved in SQLite. Already stored results are kept, and a running
 search stops at the next page or district boundary.
 
+## Labor Agreement Discovery
+
+Use the Contracts page to select states and district filters, then scan the
+largest matching districts. Discovery follows high-signal Human Resources,
+staff, careers, labor-relations, contract, and bargaining links and also checks
+district sitemaps. It downloads linked documents, extracts PDF text, identifies
+agreement dates, and assembles one package per bargaining unit.
+
+A package never represents the district as a whole. It represents one distinct
+unit, such as:
+
+- licensed or certified educators
+- classified staff
+- substitute educators
+- administrators or supervisors
+- transportation staff
+- service staff
+- another or not-yet-identified unit
+
+Each package can contain a base agreement plus extensions, MOUs, amendments,
+tentative agreements, and salary schedules. Salary-only pages do not create a
+package. When the unit or current status cannot be supported, the package is
+marked for review instead of being merged into a known unit. The run detail page
+provides the source documents, extracted evidence, editable review fields, and a
+CSV export.
+
+Agreement status is evaluated as of the discovery date. An expired agreement is
+not assumed to remain operative merely because no successor was found.
+
+### Local Contract Archive and Rescanning
+
+Source documents and extracted-text sidecars are archived by default under:
+
+```text
+downloads\contracts\<STATE>\<bounded-district-name>--<NCES-or-database-id>\
+```
+
+The state segment is always a two-letter code (or `XX` for malformed source
+data). District-name segments are normalized and capped at 50 characters, and a
+stable district identifier is appended to prevent collisions. Document names
+also include a content-hash suffix. The database records the absolute source and
+text paths, byte size, content hash, and archive timestamp, and the run detail
+page links to both local copies.
+
+Each completed district scan updates `district_contract_scan_status`, including
+the last attempt, last successful scan, result, package count, and document
+count. New runs skip districts successfully scanned inside the configured age
+threshold (180 days by default). The expired-contract option overrides that age
+rule when a bargaining unit has an expired agreement and no newer current
+agreement. A force-rescan option bypasses all prior-scan checks.
+
+### Optional Local AI Classification
+
+Contract discovery works without AI. To add a second classification pass,
+configure one or more native Ollama servers on the Settings page. Servers are
+tried in order, so a Tailscale address can be primary with a LAN address as a
+fallback:
+
+```text
+EDSCANNER_OLLAMA_ENDPOINTS='["http://server-name:11434","http://192.168.1.10:11434"]'
+EDSCANNER_OLLAMA_MODEL="gemma4:12b"
+EDSCANNER_LLM_API_KEY="optional"
+```
+
+Enable `Use local AI classification` for an individual run. EdScanner sends a
+bounded candidate excerpt, link context, title, and URL and requests structured
+JSON describing the bargaining unit, union, document role, and effective dates.
+EdScanner calls Ollama's native `/api/chat` API. If a server is unavailable or
+returns invalid output, the next configured server is tried. If all servers fail,
+deterministic results are retained. The bounded excerpt is sent only when local AI
+classification is enabled for a run.
+
 ## Debug Logs
 
 Enable `Capture debug log` on the Search page to create a per-run text log under:
@@ -271,6 +347,7 @@ Runtime files are intentionally local and ignored by Git:
 data\edscanner.db
 imports\*
 exports\*
+downloads\contracts\*
 logs\*.log
 logs\search_runs\*
 .venv\
@@ -295,6 +372,9 @@ $env:EDSCANNER_MAX_PDF_SIZE_MB="10"
 $env:EDSCANNER_MAX_HTML_SIZE_MB="5"
 $env:EDSCANNER_MAX_TOTAL_DISTRICTS_PER_RUN="25"
 $env:EDSCANNER_PROFILE_DISCOVERY_WORKERS="3"
+$env:EDSCANNER_CONTRACT_DISCOVERY_WORKERS="3"
+$env:EDSCANNER_CONTRACT_RESCAN_DAYS="180"
+$env:EDSCANNER_CONTRACT_DISTRICT_DIR_NAME_MAX="50"
 $env:EDSCANNER_USER_AGENT="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"
 $env:EDSCANNER_VERIFY_SSL="true"
 $env:EDSCANNER_RESPECT_ROBOTS="false"
@@ -302,6 +382,9 @@ $env:EDSCANNER_FLASK_DEBUG="false"
 $env:EDSCANNER_HOST="127.0.0.1"
 $env:EDSCANNER_PORT="8765"
 $env:BRAVE_SEARCH_API_KEY="..."
+$env:EDSCANNER_OLLAMA_ENDPOINTS='["http://server-name:11434","http://192.168.1.10:11434"]'
+$env:EDSCANNER_OLLAMA_MODEL="gemma4:12b"
+$env:EDSCANNER_LLM_API_KEY="optional"
 ```
 
 Use `EDSCANNER_DISABLE_WORKER=1` only for tests or diagnostics when the
@@ -318,7 +401,7 @@ logs\edscanner.log
 Run compile checks:
 
 ```powershell
-.\.venv\Scripts\python -m py_compile app.py common.py import_districts.py search_engine.py site_search_discovery.py discover_search_profiles.py ai_matcher.py
+.\.venv\Scripts\python -m py_compile app.py common.py import_districts.py search_engine.py site_search_discovery.py discover_search_profiles.py contract_discovery.py ai_matcher.py
 ```
 
 Run unit tests:
@@ -353,6 +436,8 @@ project's trademark and branding notice.
 - Boolean operators, wildcards, and quote parsing are not implemented.
 - Brave mode consumes one API request per district searched.
 - PDF parsing is basic and limited by file size.
+- Scanned image-only agreements are flagged by their missing extracted text;
+  OCR is not yet built in.
 - Robots.txt is respected where it can be fetched and parsed.
 - The crawler is intentionally conservative and uses per-run district and page
   caps.

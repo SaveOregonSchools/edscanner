@@ -276,6 +276,27 @@ label {
   font-size: 13px;
 }
 
+.review-panel {
+  margin: 12px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+  background: var(--panel);
+}
+
+.review-panel summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.review-panel[open] summary {
+  margin-bottom: 12px;
+}
+
+.compact-form {
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+}
+
 .search-estimate {
   display: flex;
   gap: 14px;
@@ -345,7 +366,8 @@ label {
 }
 
 input,
-select {
+select,
+textarea {
   width: 100%;
   min-height: 36px;
   border: 1px solid var(--border);
@@ -354,6 +376,10 @@ select {
   color: var(--ink);
   background: #fff;
   font: inherit;
+}
+
+textarea {
+  resize: vertical;
 }
 
 select[multiple] {
