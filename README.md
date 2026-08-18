@@ -283,16 +283,23 @@ workflow for public school-board records:
 
 1. **Discover Sources** follows high-signal governance links on district sites
    and permits known external board-platform hosts without weakening the normal
-   district crawler's same-domain boundary.
-2. **Sync** reads public meeting listings, compares stable meeting IDs with
+   district crawler's same-domain boundary. A likely challenge can receive one
+   bounded Chromium render; rate limits, robots denials, and a remaining CAPTCHA
+   stop without browser rotation or challenge bypass.
+2. **Review Sources** lets an operator validate and save a public portal URL for
+   a district when automatic discovery misses or misidentifies it. A source
+   becomes working only after the adapter verifies the public endpoint and the
+   operator confirms that it belongs to the selected district. Unconfirmed links
+   remain manual-review evidence, and prior source URLs remain in history.
+3. **Sync** reads public meeting listings, compares stable meeting IDs with
    SQLite, refreshes new/recent/incomplete meetings, and downloads bounded
    public documents.
-3. **Meetings** shows normalized metadata, hierarchical agenda items,
+4. **Meetings** shows normalized metadata, hierarchical agenda items,
    attachments, approved minutes, video links, and revision history.
-4. **Search** uses SQLite FTS5 when available (with a LIKE fallback) across
+5. **Search** uses SQLite FTS5 when available (with a LIKE fallback) across
    meetings, agenda items, motions/votes, and extracted document text. Every hit
    retains its district, meeting, entity, retrieval date, and original URL.
-5. **Schedules** keeps selected active, working sources current with daily,
+6. **Schedules** keeps selected active, working sources current with daily,
    weekly, or monthly monitoring runs.
 
 Source and sync runs are persisted before they enter the in-process board queue.
@@ -302,6 +309,19 @@ Requests use shared global and per-host concurrency gates, a configurable delay,
 finite timeouts, bounded retries, `Retry-After`, within-run URL caching, and
 conditional `ETag`/`Last-Modified` document requests where servers support them.
 
+BoardBook provider-directory lookup is available only as an explicit opt-in. Its
+public directory exposes names and organization IDs but no state, so EdScanner
+uses it only to generate candidates and requires a unique name match plus state
+and, when identifiers differ, homepage evidence or a unique reciprocal NCES
+name-and-city match before activation. The directory is
+fetched once per discovery run and IDs are never enumerated. Because BoardBook's
+published terms restrict automated copying, this feature is disabled by default;
+enable it only if your organization has confirmed permission under the current
+[provider terms](https://www.boardbook.org/boardbook-terms-and-conditions-of-use).
+Manual source entry remains available without this option. The initial provider-
+directory implementation covers BoardBook only; other platforms continue through
+district-site links or manual entry until an authorized directory is documented.
+
 The adapter status for this release is:
 
 - **BoardBook Premier:** end-to-end public listing, structured agenda hierarchy,
@@ -310,8 +330,9 @@ The adapter status for this release is:
 - **Diligent Community / iCompass and modern CivicClerk:** anonymous public JSON
   listing/detail/document adapters.
 - **Legacy BoardDocs and Simbli/eBOARDsolutions:** rendered-public-page parsers
-  are included. Sites that return a WAF/Incapsula challenge to ordinary HTTP are
-  recorded for JavaScript/manual review; EdScanner does not bypass challenges.
+  are included. Sites that return a WAF/Incapsula challenge to ordinary HTTP get
+  one bounded Chromium recovery; a remaining challenge is recorded for manual
+  review rather than bypassed.
 - **Generic:** conservative fallback for obvious public meeting/agenda links.
 
 Monitoring mode prioritizes future meetings, meetings from the configured recent
@@ -525,6 +546,7 @@ $env:EDSCANNER_BOARD_REQUEST_DELAY="0.75"
 $env:EDSCANNER_BOARD_HTTP_MAX_REDIRECTS="5"
 $env:EDSCANNER_BOARD_HTTP_CACHE_MAX_ENTRIES="128"
 $env:EDSCANNER_BOARD_HTTP_CACHE_MAX_MB="32"
+$env:EDSCANNER_BOARD_PROVIDER_DIRECTORY_ENABLED="false"
 $env:EDSCANNER_BOARD_ALLOW_PRIVATE_NETWORKS="false"
 $env:EDSCANNER_BOARD_ALLOW_INSECURE_SSL_FALLBACK="false"
 $env:EDSCANNER_BOARD_INSECURE_SSL_HOSTS="legacy-board.example.org"
@@ -540,6 +562,7 @@ $env:EDSCANNER_RESPECT_ROBOTS="false"
 $env:EDSCANNER_FLASK_DEBUG="false"
 $env:EDSCANNER_HOST="127.0.0.1"
 $env:EDSCANNER_PORT="8765"
+$env:EDSCANNER_SECRET_KEY="optional-long-random-value-for-stable-sessions"
 $env:BRAVE_SEARCH_API_KEY="..."
 $env:EDSCANNER_OLLAMA_ENDPOINTS='["http://server-name:11434","http://192.168.1.10:11434"]'
 $env:EDSCANNER_OLLAMA_MODEL="gemma4:12b"
@@ -547,10 +570,14 @@ $env:EDSCANNER_LLM_API_KEY="optional"
 ```
 
 Board collection rejects localhost, private, link-local, and reserved network
-targets by default, validates each bounded redirect hop, and does not retry with
-TLS verification disabled. Each ordinary connection is pinned to its validated
-DNS answer while retaining the public hostname for HTTP Host, TLS SNI, and
-certificate verification. Playwright fallback uses a loopback SOCKS proxy that
+targets by default, validates each bounded redirect hop, and never silently
+retries with TLS verification disabled. Ordinary hosts use Requests' normal
+certificate verifier. The exact compatibility host `meetings.boardbook.org`
+uses the operating system's native trust store for Windows certificate-chain
+handling; this is not extended to arbitrary district or manually entered hosts.
+Each ordinary connection is pinned to its validated DNS answer while retaining
+the public hostname for HTTP Host, TLS SNI, and certificate verification.
+Playwright fallback uses a loopback SOCKS proxy that
 applies the same address validation/pinning to every browser tunnel; unnecessary
 WebSockets and non-HTTP network schemes are blocked. `EDSCANNER_BOARD_ALLOW_PRIVATE_NETWORKS=true`
 is intended only for deterministic local-server tests. Insecure TLS fallback

@@ -4,6 +4,7 @@ import html as html_lib
 import logging
 import re
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import PurePosixPath
 from typing import Any, Iterable, Mapping, Sequence
@@ -13,6 +14,7 @@ from bs4 import BeautifulSoup
 
 from board.http import (
     BoardHTTPClient,
+    BoardHTTPError,
     HTTPResult,
     InvalidPublicURL,
     ResponseTooLarge,
@@ -298,18 +300,182 @@ def nested_values(value: Any, keys: Sequence[str]) -> list[Any]:
     return found
 
 
-def looks_like_blocked_page(content: Content) -> bool:
-    text = content_text(content).casefold()
-    markers = (
-        "captcha",
-        "cf-chl-",
-        "cloudflare ray id",
-        "request unsuccessful",
-        "_incapsula_resource",
-        "access denied",
-        "verify you are human",
+@dataclass(frozen=True, slots=True)
+class ChallengeAssessment:
+    """Explain whether a response is an access challenge and how to recover.
+
+    The recovery flag deliberately excludes rate limiting. A terminal HTTP 429
+    should not cause EdScanner to add more traffic by starting a browser.
+    """
+
+    is_challenge: bool
+    category: str = ""
+    marker: str = ""
+    browser_retry_allowed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedPage:
+    """A bounded browser result with the final document provenance intact."""
+
+    content: bytes
+    final_url: str
+    status_code: int
+    browser_rendered: bool = False
+
+
+_TITLE_PATTERN = re.compile(r"<title\b[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_CHALLENGE_TITLE_MARKERS = (
+    "access denied",
+    "attention required",
+    "checking your browser",
+    "just a moment",
+    "request unsuccessful",
+    "verify you are human",
+)
+
+
+def assess_challenge(
+    status_code: int,
+    content: Content | None,
+    url: str = "",
+) -> ChallengeAssessment:
+    """Classify an HTTP/browser response without matching incidental page text.
+
+    A 200 page is considered challenged only when its title or a combination of
+    provider-specific challenge markers is present. This avoids treating a
+    normal news page, navigation item, or embedded script containing a phrase
+    such as ``access denied`` as a block page.
+    """
+
+    try:
+        status = int(status_code)
+    except (TypeError, ValueError):
+        status = 0
+    if status == 429:
+        return ChallengeAssessment(True, "rate_limited", "http_429", False)
+    if status in {401, 403}:
+        return ChallengeAssessment(True, "http_access_denied", f"http_{status}", True)
+
+    text = content_text(content)[:100_000].casefold()
+    title_match = _TITLE_PATTERN.search(text)
+    title = collapse_ws(title_match.group(1)) if title_match else ""
+    for marker in _CHALLENGE_TITLE_MARKERS:
+        if marker in title:
+            return ChallengeAssessment(True, "challenge_title", marker, True)
+
+    provider_checks = (
+        (
+            "cloudflare",
+            "cf-chl-",
+            ("challenge-platform", "checking your browser", "verify you are human"),
+        ),
+        (
+            "cloudflare",
+            "cloudflare ray id",
+            ("attention required", "sorry, you have been blocked", "access denied"),
+        ),
+        (
+            "incapsula",
+            "_incapsula_resource",
+            ("incident id", "request unsuccessful", "access denied"),
+        ),
+        (
+            "human_verification",
+            "verify you are human",
+            ("captcha", "challenge", "turnstile"),
+        ),
     )
-    return any(marker in text for marker in markers)
+    for category, primary, companions in provider_checks:
+        if primary in text and any(companion in text for companion in companions):
+            return ChallengeAssessment(True, category, primary, True)
+
+    soup = BeautifulSoup(text, "lxml")
+    heading = soup.find(["h1", "h2"])
+    heading_text = collapse_ws(heading.get_text(" ", strip=True) if heading else "")
+    if (
+        heading_text in {
+            "access denied",
+            "request unsuccessful",
+            "verify you are human",
+            "checking your browser",
+        }
+        and len(collapse_ws(soup.get_text(" ", strip=True))) <= 2_000
+    ):
+        return ChallengeAssessment(True, "challenge_heading", heading_text, True)
+
+    # A known vendor hostname alone is not enough to label a successful page
+    # blocked. The URL remains part of this public API for future diagnostics.
+    return ChallengeAssessment(False)
+
+
+def looks_like_blocked_page(content: Content) -> bool:
+    """Backward-compatible Boolean wrapper for rendered-page callers."""
+
+    return assess_challenge(200, content).is_challenge
+
+
+def _validate_browser_route(
+    client: BoardHTTPClient,
+    requested_url: str,
+    request_url: str,
+    *,
+    main_frame_navigation: bool,
+) -> str:
+    """Validate a browser request before Playwright sends it.
+
+    All browser traffic must remain on public addresses. Main-frame navigation
+    additionally follows the ordinary HTTP client's organization/vendor redirect
+    boundary; public CDN and API subrequests retain the existing public-address
+    validation without being mistaken for top-level redirects.
+    """
+
+    target_url = client.validate_target_url(request_url)
+    if main_frame_navigation and not client.redirect_allowed(requested_url, target_url):
+        raise InvalidPublicURL(
+            "Browser navigation left the allowed public boundary: "
+            f"{requested_url} -> {target_url}"
+        )
+    if main_frame_navigation and not client.can_fetch(target_url):
+        raise RobotsDenied(f"robots.txt disallows browser rendering for {target_url}")
+    return target_url
+
+
+def _browser_navigation_scope(request: Any, page: Any) -> str:
+    """Classify a browser request without allowing a popup's first request.
+
+    Playwright deliberately raises when ``request.frame`` is read for a popup's
+    initial navigation. Browser-context routing sees that request early enough
+    to abort it, whereas page-level routing does not. Child-frame documents stay
+    subject to public-address validation but are not treated as top-level
+    organization redirects.
+    """
+
+    if not request.is_navigation_request():
+        return "subresource"
+    try:
+        frame = request.frame
+    except Exception:
+        return "popup"
+    if frame == page.main_frame:
+        return "main"
+    try:
+        owning_page = frame.page
+    except Exception:
+        return "popup"
+    return "child" if owning_page is page else "popup"
+
+
+def _main_frame_response_details(page: Any, response: Any) -> tuple[int, str] | None:
+    """Return status/URL only for a response that committed the main document."""
+
+    try:
+        request = response.request
+        if not request.is_navigation_request() or request.frame != page.main_frame:
+            return None
+        return int(response.status), str(response.url or "")
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 class BoardPlatformAdapter(ABC):
@@ -363,19 +529,63 @@ class BoardPlatformAdapter(ABC):
         try:
             if content is None:
                 try:
-                    response = self.fetch_url(candidate_url, raise_for_status=True)
+                    response = self.fetch_url(candidate_url, raise_for_status=False)
                     final_url = response.final_url
                     content = response.content
+                    challenge = assess_challenge(
+                        response.status_code,
+                        content,
+                        final_url,
+                    )
+                    if challenge.is_challenge:
+                        if not (
+                            self.allow_browser_fallback
+                            and challenge.browser_retry_allowed
+                        ):
+                            return BoardSourceResult(
+                                detection=self.detect(final_url, content),
+                                source=None,
+                                status="blocked_by_challenge",
+                                candidate_url=candidate_url,
+                                error=(
+                                    "Public page returned an access challenge "
+                                    f"({challenge.marker or challenge.category})."
+                                ),
+                            )
+                        try:
+                            rendered = self.render_page_with_metadata(final_url)
+                            content = rendered.content
+                            final_url = rendered.final_url
+                        except RobotsDenied:
+                            raise
+                        except Exception as exc:
+                            return BoardSourceResult(
+                                detection=self.detect(final_url, content),
+                                source=None,
+                                status="blocked_by_challenge",
+                                candidate_url=candidate_url,
+                                error=(
+                                    "Public page returned an access challenge and "
+                                    f"browser recovery failed: {exc}"
+                                ),
+                            )
+                    elif response.status_code >= 400:
+                        response.raise_for_status()
+                except RobotsDenied:
+                    raise
                 except Exception:
                     if not (self.allow_browser_fallback and self.requires_javascript):
                         raise
-                    content = self.render_page(candidate_url)
+                    rendered = self.render_page_with_metadata(candidate_url)
+                    content = rendered.content
+                    final_url = rendered.final_url
             if (
                 looks_like_blocked_page(content or b"")
                 and self.allow_browser_fallback
-                and self.requires_javascript
             ):
-                content = self.render_page(final_url)
+                rendered = self.render_page_with_metadata(final_url)
+                content = rendered.content
+                final_url = rendered.final_url
             detection = self.detect(final_url, content)
             if not detection.matched:
                 return BoardSourceResult(
@@ -389,7 +599,7 @@ class BoardPlatformAdapter(ABC):
                 return BoardSourceResult(
                     detection=detection,
                     source=None,
-                    status="manual_review",
+                    status="blocked_by_challenge",
                     candidate_url=candidate_url,
                     error="Public page returned a challenge or access-denied response.",
                 )
@@ -453,25 +663,31 @@ class BoardPlatformAdapter(ABC):
     ) -> list[MeetingRef]:
         normalized_source = source_from_mapping(source)
         listing_url = self.meeting_listing_url(normalized_source, since)
-        response = self.fetch_url(listing_url)
-        meetings = self.parse_meeting_list(response.content, response.final_url, normalized_source, since)
+        page = self.fetch_page_with_browser_recovery(listing_url)
+        meetings = self.parse_meeting_list(page.content, page.final_url, normalized_source, since)
         if (
             not meetings
             and self.allow_browser_fallback
             and (self.requires_javascript or normalized_source.requires_javascript)
+            and not page.browser_rendered
         ):
-            rendered = self.render_page(response.final_url)
-            meetings = self.parse_meeting_list(rendered, response.final_url, normalized_source, since)
+            rendered = self.render_page_with_metadata(page.final_url)
+            meetings = self.parse_meeting_list(
+                rendered.content,
+                rendered.final_url,
+                normalized_source,
+                since,
+            )
         return dedupe_meetings(meetings)
 
     def fetch_meeting(self, source: SourceLike, meeting_ref: MeetingLike) -> NormalizedMeeting:
         normalized_source = source_from_mapping(source)
         normalized_ref = meeting_ref_from_mapping(meeting_ref)
         detail_url = normalized_ref.agenda_url or normalized_ref.url
-        response = self.fetch_url(detail_url)
+        page = self.fetch_page_with_browser_recovery(detail_url)
         meeting = self.parse_meeting_detail(
-            response.content,
-            response.final_url,
+            page.content,
+            page.final_url,
             normalized_source,
             normalized_ref,
         )
@@ -479,13 +695,52 @@ class BoardPlatformAdapter(ABC):
             not meeting.agenda_items
             and self.allow_browser_fallback
             and (self.requires_javascript or normalized_source.requires_javascript)
+            and not page.browser_rendered
         ):
-            rendered = self.render_page(response.final_url)
-            meeting = self.parse_meeting_detail(rendered, response.final_url, normalized_source, normalized_ref)
+            rendered = self.render_page_with_metadata(page.final_url)
+            meeting = self.parse_meeting_detail(
+                rendered.content,
+                rendered.final_url,
+                normalized_source,
+                normalized_ref,
+            )
         return meeting
 
     def fetch_url(self, url: str, **kwargs: Any) -> HTTPResult:
         return self.client.get(url, **kwargs)
+
+    def fetch_page_with_browser_recovery(self, url: str) -> RenderedPage:
+        """Fetch one HTML/JSON page and recover one real access challenge.
+
+        This is shared by discovery, meeting listings, and meeting details so a
+        source that required Chromium during discovery remains usable during
+        manual and scheduled syncs. Rate limits and robots denials never trigger
+        the browser path.
+        """
+
+        response = self.fetch_url(url, raise_for_status=False)
+        challenge = assess_challenge(
+            response.status_code,
+            response.content,
+            response.final_url,
+        )
+        if challenge.is_challenge:
+            if self.allow_browser_fallback and challenge.browser_retry_allowed:
+                return self.render_page_with_metadata(response.final_url)
+            if response.status_code >= 400:
+                response.raise_for_status()
+            raise BoardHTTPError(
+                "Public page returned an access challenge "
+                f"({challenge.marker or challenge.category}): {response.final_url}"
+            )
+        if response.status_code >= 400:
+            response.raise_for_status()
+        return RenderedPage(
+            content=response.content,
+            final_url=response.final_url,
+            status_code=response.status_code,
+            browser_rendered=False,
+        )
 
     def fetch_document(self, document_ref: DocumentRef) -> DownloadedDocument:
         response = self.fetch_url(
@@ -513,11 +768,34 @@ class BoardPlatformAdapter(ABC):
     def _prepare_rendered_page(self, page: Any, url: str, timeout_ms: int) -> None:
         """Vendor hook for a minimal public-page interaction after navigation."""
 
+    def render_page_with_metadata(self, url: str) -> RenderedPage:
+        """Render a page while retaining its final URL and document status.
+
+        Tests and specialized adapters may replace ``render_page`` with a
+        lightweight implementation. Preserve that extension point and attach
+        conservative metadata instead of bypassing the override.
+        """
+
+        render_method = self.render_page
+        if getattr(render_method, "__func__", None) is not BoardPlatformAdapter.render_page:
+            return RenderedPage(
+                content=content_bytes(render_method(url)),
+                final_url=canonical_public_url(url),
+                status_code=200,
+                browser_rendered=True,
+            )
+        return self._render_page_result(url)
+
     def render_page(self, url: str) -> bytes:
+        """Backward-compatible bytes-only wrapper for rendered pages."""
+
+        return self._render_page_result(url).content
+
+    def _render_page_result(self, url: str) -> RenderedPage:
         if not self.allow_browser_fallback:
             raise RuntimeError("Browser fallback is disabled for this adapter.")
         if not self.client.can_fetch(url):
-            raise RuntimeError(f"robots.txt disallows browser rendering for {url}")
+            raise RobotsDenied(f"robots.txt disallows browser rendering for {url}")
         try:
             from board.browser_proxy import pinned_browser_proxy
             from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -530,6 +808,9 @@ class BoardPlatformAdapter(ABC):
 
         timeout_ms = max(1000, int(self.client.settings.timeout_seconds * 1000))
         requested_url = self.client.validate_target_url(url)
+        navigation_status = 200
+        navigation_seen = False
+        navigation_policy_error: BoardHTTPError | None = None
         with (
             self.client.browser_slot(requested_url),
             pinned_browser_proxy(self.client) as proxy_server,
@@ -552,7 +833,30 @@ class BoardPlatformAdapter(ABC):
                     service_workers="block",
                 )
 
+                if not hasattr(context, "route_web_socket"):
+                    raise RuntimeError(
+                        "Secure browser rendering requires Playwright 1.48 or newer."
+                    )
+                # Public board parsing needs navigation/XHR, not a separate
+                # WebSocket path. Fail closed even though the proxy also pins it.
+                context.route_web_socket(
+                    "**/*",
+                    lambda socket_route: socket_route.close(
+                        code=1008,
+                        reason="WebSockets disabled during board rendering",
+                    ),
+                )
+                page = context.new_page()
+
+                def track_main_frame_response(response: Any) -> None:
+                    nonlocal navigation_seen, navigation_status
+                    details = _main_frame_response_details(page, response)
+                    if details is not None:
+                        navigation_status = details[0]
+                        navigation_seen = True
+
                 def guard_public_route(route: Any) -> None:
+                    nonlocal navigation_policy_error
                     request_url = str(route.request.url or "")
                     request_scheme = urlsplit(request_url).scheme.casefold()
                     if request_scheme in {"blob", "data"} or request_url in {
@@ -569,11 +873,32 @@ class BoardPlatformAdapter(ABC):
                         )
                         route.abort("blockedbyclient")
                         return
+                    navigation_scope = _browser_navigation_scope(route.request, page)
+                    if navigation_scope == "popup":
+                        LOGGER.info(
+                            "Blocked popup navigation during board rendering: %s",
+                            request_url,
+                        )
+                        route.abort("blockedbyclient")
+                        return
                     try:
-                        self.client.validate_target_url(request_url)
+                        _validate_browser_route(
+                            self.client,
+                            requested_url,
+                            request_url,
+                            main_frame_navigation=navigation_scope == "main",
+                        )
+                    except RobotsDenied as exc:
+                        if navigation_scope == "main":
+                            navigation_policy_error = exc
+                        LOGGER.info("Blocked browser navigation by robots policy: %s", exc)
+                        route.abort("blockedbyclient")
+                        return
                     except InvalidPublicURL as exc:
+                        if navigation_scope == "main":
+                            navigation_policy_error = exc
                         LOGGER.warning(
-                            "Blocked non-public browser subrequest %s: %s",
+                            "Blocked browser request outside its public boundary %s: %s",
                             request_url,
                             exc,
                         )
@@ -581,22 +906,26 @@ class BoardPlatformAdapter(ABC):
                         return
                     route.continue_()
 
+                page.on("response", track_main_frame_response)
+                # Browser-context routing, unlike page routing, covers the
+                # first request of a popup. It also lets us apply policy to
+                # every matching main-document request in a redirect chain.
                 context.route("**/*", guard_public_route)
-                if not hasattr(context, "route_web_socket"):
-                    raise RuntimeError(
-                        "Secure browser rendering requires Playwright 1.48 or newer."
+                try:
+                    navigation_response = page.goto(
+                        requested_url,
+                        wait_until="domcontentloaded",
+                        timeout=timeout_ms,
                     )
-                # Public board parsing needs navigation/XHR, not a separate
-                # WebSocket path. Fail closed even though the proxy also pins it.
-                context.route_web_socket(
-                    "**/*",
-                    lambda socket_route: socket_route.close(
-                        code=1008,
-                        reason="WebSockets disabled during board rendering",
-                    ),
-                )
-                page = context.new_page()
-                page.goto(requested_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                except Exception as exc:
+                    if navigation_policy_error is not None:
+                        raise navigation_policy_error from exc
+                    raise
+                if navigation_policy_error is not None:
+                    raise navigation_policy_error
+                details = _main_frame_response_details(page, navigation_response)
+                if details is not None and not navigation_seen:
+                    navigation_status = details[0]
                 final_url = self.client.validate_target_url(page.url)
                 if not self.client.redirect_allowed(requested_url, final_url):
                     raise InvalidPublicURL(
@@ -607,7 +936,16 @@ class BoardPlatformAdapter(ABC):
                     page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 5000))
                 except PlaywrightTimeoutError:
                     pass
-                self._prepare_rendered_page(page, url, timeout_ms)
+                if navigation_policy_error is not None:
+                    raise navigation_policy_error
+                try:
+                    self._prepare_rendered_page(page, url, timeout_ms)
+                except Exception as exc:
+                    if navigation_policy_error is not None:
+                        raise navigation_policy_error from exc
+                    raise
+                if navigation_policy_error is not None:
+                    raise navigation_policy_error
                 final_url = self.client.validate_target_url(page.url)
                 if not self.client.redirect_allowed(requested_url, final_url):
                     raise InvalidPublicURL(
@@ -621,16 +959,34 @@ class BoardPlatformAdapter(ABC):
             raise ResponseTooLarge(
                 f"Rendered page exceeded {self.client.settings.max_html_size_bytes} bytes: {url}"
             )
-        if looks_like_blocked_page(content):
-            raise RuntimeError("Browser received an anti-bot challenge or access-denied page.")
-        return content
+        browser_challenge = assess_challenge(navigation_status, content, final_url)
+        if browser_challenge.is_challenge:
+            raise RuntimeError(
+                "Browser received an anti-bot challenge or access-denied page "
+                f"({browser_challenge.marker or browser_challenge.category})."
+            )
+        if navigation_status >= 400:
+            raise RuntimeError(
+                f"Browser received HTTP {navigation_status} for {final_url}."
+            )
+        return RenderedPage(
+            content=content,
+            final_url=final_url,
+            status_code=navigation_status,
+            browser_rendered=True,
+        )
 
 
 __all__ = [
     "BoardPlatformAdapter",
+    "ChallengeAssessment",
     "Content",
     "MeetingLike",
+    "RenderedPage",
     "SourceLike",
+    "_browser_navigation_scope",
+    "_main_frame_response_details",
+    "assess_challenge",
     "collapse_ws",
     "content_bytes",
     "content_text",

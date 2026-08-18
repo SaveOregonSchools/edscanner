@@ -4,16 +4,23 @@ import socket
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import SSLError
+from requests.adapters import HTTPAdapter
 
+from board.adapters.base import (
+    _browser_navigation_scope,
+    _main_frame_response_details,
+    _validate_browser_route,
+)
 from board.browser_proxy import pinned_browser_proxy
 from board.http import (
     BoardHTTPClient,
     BoardHTTPSettings,
     InvalidPublicURL,
+    RobotsDenied,
     _PinnedHTTPAdapter,
     validate_public_url,
 )
@@ -82,6 +89,36 @@ class SequenceSession:
         return None
 
 
+class FakeNavigationRequest:
+    def __init__(self, frame, *, navigation: bool = True):
+        self.frame = frame
+        self._navigation = navigation
+
+    def is_navigation_request(self) -> bool:
+        return self._navigation
+
+
+class FakeNavigationResponse:
+    def __init__(self, status: int, url: str, request):
+        self.status = status
+        self.url = url
+        self.request = request
+
+
+class FakeFrame:
+    def __init__(self, page):
+        self.page = page
+
+
+class PopupFirstNavigationRequest:
+    def is_navigation_request(self) -> bool:
+        return True
+
+    @property
+    def frame(self):
+        raise RuntimeError("frame is unavailable for a popup's first request")
+
+
 class BoardHTTPPolicyTests(unittest.TestCase):
     def settings(self, **overrides) -> BoardHTTPSettings:
         values = {
@@ -108,6 +145,128 @@ class BoardHTTPPolicyTests(unittest.TestCase):
         with patch("board.http.socket.getaddrinfo", return_value=private_answer):
             with self.assertRaises(InvalidPublicURL):
                 validate_public_url("https://district.example/")
+
+    def test_browser_route_checks_main_frame_redirect_before_fetch(self):
+        client = Mock()
+        client.validate_target_url.side_effect = lambda url: url
+        client.can_fetch.return_value = True
+        client.redirect_allowed.side_effect = (
+            lambda _source, target: target.startswith("https://district.example/")
+        )
+
+        self.assertEqual(
+            _validate_browser_route(
+                client,
+                "https://district.example/board",
+                "https://district.example/meetings",
+                main_frame_navigation=True,
+            ),
+            "https://district.example/meetings",
+        )
+        # Public cross-host assets remain subject to public-address validation,
+        # but they are not top-level redirects.
+        self.assertEqual(
+            _validate_browser_route(
+                client,
+                "https://district.example/board",
+                "https://cdn.example.net/app.js",
+                main_frame_navigation=False,
+            ),
+            "https://cdn.example.net/app.js",
+        )
+        with self.assertRaises(InvalidPublicURL):
+            _validate_browser_route(
+                client,
+                "https://district.example/board",
+                "https://unrelated.example.net/login",
+                main_frame_navigation=True,
+            )
+
+    def test_browser_main_frame_redirect_rechecks_robots_policy(self):
+        client = Mock()
+        client.validate_target_url.side_effect = lambda url: url
+        client.redirect_allowed.return_value = True
+        client.can_fetch.side_effect = (
+            lambda url: not url.endswith("/private-board-archive")
+        )
+
+        with self.assertRaises(RobotsDenied):
+            _validate_browser_route(
+                client,
+                "https://district.example/board",
+                "https://district.example/private-board-archive",
+                main_frame_navigation=True,
+            )
+
+        # Subresources remain under the public-network boundary but are not
+        # treated as independent crawler navigation targets.
+        self.assertEqual(
+            _validate_browser_route(
+                client,
+                "https://district.example/board",
+                "https://district.example/private-board-archive",
+                main_frame_navigation=False,
+            ),
+            "https://district.example/private-board-archive",
+        )
+
+    def test_browser_context_navigation_scope_blocks_popup_first_request(self):
+        page = type("FakePage", (), {})()
+        page.main_frame = FakeFrame(page)
+        child_frame = FakeFrame(page)
+        other_page = object()
+        popup_frame = FakeFrame(other_page)
+
+        self.assertEqual(
+            _browser_navigation_scope(FakeNavigationRequest(page.main_frame), page),
+            "main",
+        )
+        self.assertEqual(
+            _browser_navigation_scope(FakeNavigationRequest(child_frame), page),
+            "child",
+        )
+        self.assertEqual(
+            _browser_navigation_scope(FakeNavigationRequest(popup_frame), page),
+            "popup",
+        )
+        self.assertEqual(
+            _browser_navigation_scope(PopupFirstNavigationRequest(), page),
+            "popup",
+        )
+        self.assertEqual(
+            _browser_navigation_scope(
+                FakeNavigationRequest(page.main_frame, navigation=False),
+                page,
+            ),
+            "subresource",
+        )
+
+    def test_browser_uses_latest_main_document_response_after_challenge_reload(self):
+        main_frame = object()
+        page = type("FakePage", (), {"main_frame": main_frame})()
+        initial = FakeNavigationResponse(
+            403,
+            "https://district.example/challenge",
+            FakeNavigationRequest(main_frame),
+        )
+        solved = FakeNavigationResponse(
+            200,
+            "https://district.example/board",
+            FakeNavigationRequest(main_frame),
+        )
+        subresource = FakeNavigationResponse(
+            404,
+            "https://district.example/missing.js",
+            FakeNavigationRequest(main_frame, navigation=False),
+        )
+
+        latest = None
+        for response in (initial, solved, subresource):
+            details = _main_frame_response_details(page, response)
+            if details is not None:
+                latest = details
+
+        self.assertEqual(latest, (200, "https://district.example/board"))
 
     def test_redirect_to_private_target_is_blocked_before_second_request(self):
         session = SequenceSession(
@@ -156,6 +315,121 @@ class BoardHTTPPolicyTests(unittest.TestCase):
         self.assertEqual(pool_call["host"], "93.184.216.34")
         self.assertEqual(pool_call["pool_kwargs"]["server_hostname"], "district.example")
         self.assertEqual(pool_call["pool_kwargs"]["assert_hostname"], "district.example")
+
+    def test_native_trust_context_is_used_only_for_verified_https(self):
+        native_context = object()
+        adapter = _PinnedHTTPAdapter(native_ssl_context=native_context)
+        url = "https://meetings.boardbook.org/Public"
+        adapter.pin(url, "93.184.216.34")
+        request = type("PreparedRequest", (), {"url": url})()
+        connection = object()
+
+        with patch.object(
+            adapter.poolmanager,
+            "connection_from_host",
+            return_value=connection,
+        ) as connection_from_host:
+            self.assertIs(
+                adapter.get_connection_with_tls_context(request, True),
+                connection,
+            )
+            verified_kwargs = connection_from_host.call_args.kwargs["pool_kwargs"]
+            self.assertIs(verified_kwargs["ssl_context"], native_context)
+            self.assertEqual(verified_kwargs["cert_reqs"], "CERT_REQUIRED")
+            self.assertEqual(verified_kwargs["server_hostname"], "meetings.boardbook.org")
+
+            self.assertIs(
+                adapter.get_connection_with_tls_context(request, False),
+                connection,
+            )
+            insecure_kwargs = connection_from_host.call_args.kwargs["pool_kwargs"]
+            self.assertNotIn("ssl_context", insecure_kwargs)
+            self.assertEqual(insecure_kwargs["cert_reqs"], "CERT_NONE")
+
+            unrelated_url = "https://district.example/board"
+            adapter.pin(unrelated_url, "93.184.216.34")
+            unrelated_request = type("PreparedRequest", (), {"url": unrelated_url})()
+            self.assertIs(
+                adapter.get_connection_with_tls_context(unrelated_request, True),
+                connection,
+            )
+            unrelated_kwargs = connection_from_host.call_args.kwargs["pool_kwargs"]
+            self.assertNotIn("ssl_context", unrelated_kwargs)
+            self.assertEqual(unrelated_kwargs["cert_reqs"], "CERT_REQUIRED")
+
+            subdomain_url = "https://public.meetings.boardbook.org/board"
+            adapter.pin(subdomain_url, "93.184.216.34")
+            subdomain_request = type("PreparedRequest", (), {"url": subdomain_url})()
+            self.assertIs(
+                adapter.get_connection_with_tls_context(subdomain_request, True),
+                connection,
+            )
+            subdomain_kwargs = connection_from_host.call_args.kwargs["pool_kwargs"]
+            self.assertNotIn("ssl_context", subdomain_kwargs)
+
+    def test_native_trust_allowlist_is_exact_and_custom_ca_takes_precedence(self):
+        settings = self.settings(
+            native_trust_hosts=(
+                "Meetings.BoardBook.org.",
+                "*.district.example",
+                "https://invalid.example",
+            )
+        )
+        self.assertEqual(settings.native_trust_hosts, ("meetings.boardbook.org",))
+
+        native_context = object()
+        adapter = _PinnedHTTPAdapter(
+            native_ssl_context=native_context,
+            native_trust_hosts=settings.native_trust_hosts,
+        )
+        url = "https://meetings.boardbook.org/Public"
+        adapter.pin(url, "93.184.216.34")
+        request = type("PreparedRequest", (), {"url": url})()
+        connection = object()
+        with patch.object(
+            adapter.poolmanager,
+            "connection_from_host",
+            return_value=connection,
+        ) as connection_from_host:
+            self.assertIs(
+                adapter.get_connection_with_tls_context(
+                    request,
+                    "C:/fixture/custom-ca.pem",
+                ),
+                connection,
+            )
+
+        pool_kwargs = connection_from_host.call_args.kwargs["pool_kwargs"]
+        self.assertNotIn("ssl_context", pool_kwargs)
+        self.assertEqual(pool_kwargs["ca_certs"], "C:/fixture/custom-ca.pem")
+        self.assertEqual(pool_kwargs["cert_reqs"], "CERT_REQUIRED")
+
+    def test_requests_231_path_preserves_unverified_pool_separation(self):
+        native_context = object()
+        adapter = _PinnedHTTPAdapter(native_ssl_context=native_context)
+        url = "https://meetings.boardbook.org/Public"
+        adapter.pin(url, "93.184.216.34")
+        request = type("PreparedRequest", (), {"url": url})()
+        connection = object()
+
+        with (
+            patch.object(
+                adapter.poolmanager,
+                "connection_from_host",
+                return_value=connection,
+            ) as connection_from_host,
+            patch.object(
+                HTTPAdapter,
+                "send",
+                side_effect=lambda *_args, **_kwargs: adapter.get_connection(url),
+            ),
+        ):
+            self.assertIs(adapter.send(request, verify=False), connection)
+
+        pool_kwargs = connection_from_host.call_args.kwargs["pool_kwargs"]
+        self.assertNotIn("ssl_context", pool_kwargs)
+        self.assertEqual(pool_kwargs["cert_reqs"], "CERT_NONE")
+        self.assertFalse(hasattr(adapter._active_verify, "value"))
 
     def test_real_pinned_http_transport_preserves_the_logical_host(self):
         LocalHandler.seen_hosts.clear()

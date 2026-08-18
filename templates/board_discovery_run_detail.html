@@ -37,7 +37,7 @@
   </tbody></table></section>
 
   <section class="content-section"><h2>District Work</h2><div class="table-scroll"><table>
-    <thead><tr><th>District</th><th>State</th><th>Status</th><th>Platform</th><th>Source</th><th>Message</th><th>Finished</th></tr></thead>
-    <tbody>{% for item in items %}<tr><td><strong>{{ item.agency_name }}</strong></td><td>{{ item.state }}</td><td><span class="status {{ item.status }}">{{ item.status }}</span></td><td>{{ item.platform or '' }}</td><td>{% if item.source_url %}<a href="{{ item.source_url }}" target="_blank" rel="noopener">Original</a>{% endif %}</td><td>{{ item.error_message or item.source_error or '' }}</td><td>{{ item.finished_at|fmt_dt }}</td></tr>{% else %}<tr><td colspan="7" class="empty">No work items.</td></tr>{% endfor %}</tbody>
+    <thead><tr><th>District</th><th>State</th><th>Status</th><th>Platform</th><th>Source</th><th>Message</th><th>Finished</th><th>Manual correction</th></tr></thead>
+    <tbody>{% for item in items %}<tr><td><strong>{{ item.agency_name }}</strong></td><td>{{ item.state }}</td><td><span class="status {{ item.status }}">{{ item.status }}</span></td><td>{{ item.platform or '' }}</td><td>{% if item.source_url %}<a href="{{ item.source_url }}" target="_blank" rel="noopener">Original</a>{% endif %}</td><td>{{ item.error_message or item.source_error or '' }}</td><td>{{ item.finished_at|fmt_dt }}</td><td><a class="button-link" href="{{ url_for('boards.manual_source', district_id=item.district_id) }}">Add or correct source</a></td></tr>{% else %}<tr><td colspan="8" class="empty">No work items.</td></tr>{% endfor %}</tbody>
   </table></div></section>
 {% endblock %}

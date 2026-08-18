@@ -20,6 +20,12 @@ from board.http import (
     RobotsDenied,
 )
 from board.models import BoardSource, DocumentRef, DownloadedDocument, MeetingRef
+from board.provider_directories import (
+    BOARD_BOOK_DIRECTORY_URL,
+    BoardBookDirectoryCatalog,
+    load_enabled_boardbook_directory,
+    provider_directory_enabled,
+)
 from board.storage import persist_meeting_bundle, upsert_board_source
 from common import (
     BOARD_DISCOVERY_RUN_LOGS_DIR,
@@ -140,6 +146,7 @@ def _discovery_selection(
         agency_types=agency_types,
         min_enrollment=min_enrollment,
         max_enrollment=max_enrollment,
+        require_website=not provider_directory_enabled(),
     )
     platform_filter = str(platform_filter or "").strip().casefold()
     status_filter = str(status_filter or "").strip().casefold()
@@ -320,6 +327,7 @@ def _execute_discovery_item(
     district: Mapping[str, Any],
     *,
     client: BoardHTTPClient,
+    provider_directory: BoardBookDirectoryCatalog | None,
     debug_logger: RunDebugLogger | None,
     db_path: Path | str | None,
 ) -> None:
@@ -339,6 +347,7 @@ def _execute_discovery_item(
         outcome = discover_board_source(
             district,
             client=client,
+            provider_directory=provider_directory,
             allow_browser_fallback=True,
             cancel_requested=lambda: _run_cancelled("board_discovery_runs", run_id, db_path),
             debug_logger=debug_logger,
@@ -380,6 +389,7 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
     init_db(db_path)
     debug_logger: RunDebugLogger | None = None
     client: BoardHTTPClient | None = None
+    provider_directory: BoardBookDirectoryCatalog | None = None
     try:
         with connect_db(db_path) as conn:
             run = conn.execute("SELECT * FROM board_discovery_runs WHERE id = ?", (run_id,)).fetchone()
@@ -414,6 +424,41 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                 global_concurrency=max(1, int(run["max_workers"])),
             )
         )
+        try:
+            provider_directory = load_enabled_boardbook_directory(client)
+            if provider_directory is not None:
+                with connect_db(db_path) as conn:
+                    district_universe = conn.execute(
+                        """
+                        SELECT id, agency_name, state, website,
+                               website_normalized, raw_json
+                        FROM districts
+                        """
+                    ).fetchall()
+                provider_directory.configure_district_universe(
+                    [dict(row) for row in district_universe]
+                )
+                debug_log(
+                    debug_logger,
+                    "board_provider_directory_loaded",
+                    provider="boardbook",
+                    catalog_url=provider_directory.source_url,
+                    organizations=len(provider_directory.entries),
+                    district_universe=len(district_universe),
+                )
+        except Exception as exc:
+            LOGGER.warning(
+                "BoardBook provider directory was enabled but could not be loaded; "
+                "continuing with district-site discovery: %s",
+                exc,
+            )
+            debug_log(
+                debug_logger,
+                "board_provider_directory_error",
+                provider="boardbook",
+                catalog_url=BOARD_BOOK_DIRECTORY_URL,
+                error=str(exc),
+            )
         with ThreadPoolExecutor(
             max_workers=max(1, int(run["max_workers"])),
             thread_name_prefix="BoardDiscovery",
@@ -425,6 +470,7 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                     int(item["item_id"]),
                     dict(item),
                     client=client,
+                    provider_directory=provider_directory,
                     debug_logger=debug_logger,
                     db_path=db_path,
                 )
@@ -1120,6 +1166,26 @@ def _execute_sync_item(
         conn.commit()
     if not claimed:
         return
+    with connect_db(db_path) as conn:
+        source_state = conn.execute(
+            "SELECT is_active FROM board_sources WHERE id = ?",
+            (int(item["board_source_id"]),),
+        ).fetchone()
+        if source_state is None or not int(source_state["is_active"] or 0):
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE board_sync_run_items
+                SET status = 'cancelled',
+                    error_message = 'Source became inactive before synchronization; item cancelled.',
+                    finished_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (now, item_id),
+            )
+            conn.commit()
+            _refresh_sync_counts(run_id, db_path)
+            return
     counters = {
         "meetings_discovered": 0,
         "meetings_added": 0,
@@ -1372,20 +1438,37 @@ def execute_board_sync_run(
                 "UPDATE board_sync_runs SET status = 'running', started_at = ?, error_message = NULL WHERE id = ? AND status = 'queued'",
                 (utc_now_iso(), run_id),
             ).rowcount
+            if not claimed:
+                conn.commit()
+                return
+            inactive_finished_at = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE board_sync_run_items
+                SET status = 'cancelled',
+                    error_message = 'Source is inactive; item cancelled before synchronization.',
+                    finished_at = ?
+                WHERE run_id = ? AND status IN ('queued', 'running')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM board_sources bs
+                      WHERE bs.id = board_sync_run_items.board_source_id
+                        AND bs.is_active = 1
+                  )
+                """,
+                (inactive_finished_at, run_id),
+            )
             item_rows = conn.execute(
                 """
                 SELECT i.id AS item_id, i.board_source_id, bs.*, d.agency_name, d.state
                 FROM board_sync_run_items i
                 JOIN board_sources bs ON bs.id = i.board_source_id
                 JOIN districts d ON d.id = i.district_id
-                WHERE i.run_id = ? AND i.status = 'queued'
+                WHERE i.run_id = ? AND i.status = 'queued' AND bs.is_active = 1
                 ORDER BY i.id
                 """,
                 (run_id,),
             ).fetchall()
             conn.commit()
-        if not claimed:
-            return
         run = dict(row)
         if run.get("debug_log_path"):
             debug_logger = RunDebugLogger(Path(run["debug_log_path"]))

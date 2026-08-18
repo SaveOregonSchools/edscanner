@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
+
+import requests
 
 from board.adapters import detect_platform
+from board.adapters.base import RenderedPage, assess_challenge
 from board.adapters.boardbook import BoardBookAdapter, resolve_boardbook_document_url
 from board.adapters.boarddocs import BoardDocsAdapter
 from board.adapters.civicclerk import CivicClerkAdapter
@@ -14,9 +18,17 @@ from board.discovery import (
     BoardSourceCandidate,
     _outcome_from_adapter_result,
     board_url_allowed,
+    discover_board_source,
     extract_board_candidates,
 )
-from board.models import BoardSource, BoardSourceResult, DetectionResult
+from board.http import HTTPResult, RobotsDenied
+from board.models import (
+    BoardSource,
+    BoardSourceResult,
+    DetectionResult,
+    MeetingRef,
+    NormalizedMeeting,
+)
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "board"
@@ -26,7 +38,342 @@ def fixture_bytes(name: str) -> bytes:
     return (FIXTURE_DIR / name).read_bytes()
 
 
+class FakeDiscoveryClient:
+    def __init__(self, response: HTTPResult | BaseException):
+        self.response = response
+        self.calls: list[str] = []
+
+    def get(self, url: str, **_kwargs):
+        self.calls.append(url)
+        if isinstance(self.response, BaseException):
+            raise self.response
+        return self.response
+
+
+class FakeBoardBookRecoveryAdapter:
+    platform_name = "boardbook"
+
+    def __init__(self):
+        self.render_calls: list[str] = []
+        self.discover_calls: list[str] = []
+
+    def detect(self, url: str, _html=None) -> DetectionResult:
+        matched = "meetings.boardbook.org/public/organization/2413" in url.casefold()
+        return DetectionResult(
+            matched,
+            self.platform_name,
+            0.99 if matched else 0.0,
+            canonical_url=url if matched else None,
+        )
+
+    def render_page(self, url: str) -> bytes:
+        self.render_calls.append(url)
+        return (
+            b'<html><title>Bend-La Pine Schools</title><body>'
+            b'<a href="https://meetings.boardbook.org/public/Organization/2413">'
+            b'BoardBook agendas and minutes</a></body></html>'
+        )
+
+    def discover_source(self, district, candidate_url: str, html=None) -> BoardSourceResult:
+        del html
+        self.discover_calls.append(candidate_url)
+        detection = self.detect(candidate_url)
+        source = BoardSource(
+            platform="boardbook",
+            public_url="https://meetings.boardbook.org/Public/Organization/2413",
+            external_source_id="2413",
+            district_id=int(district["id"]),
+            organization_name=district["agency_name"],
+            status="working",
+        )
+        return BoardSourceResult(
+            detection=detection,
+            source=source,
+            status="working",
+            candidate_url=candidate_url,
+        )
+
+
 class BoardDiscoveryFixtureTests(unittest.TestCase):
+    def test_challenge_classifier_ignores_incidental_access_denied_text(self):
+        ordinary = assess_challenge(
+            200,
+            b"<html><title>District news</title><body>How to resolve an access denied error.</body></html>",
+            "https://district.example/",
+        )
+        challenged = assess_challenge(
+            200,
+            b"<html><title>Attention Required</title><body>Cloudflare Ray ID: fixture</body></html>",
+            "https://district.example/",
+        )
+        rate_limited = assess_challenge(429, b"Too many requests")
+
+        self.assertFalse(ordinary.is_challenge)
+        self.assertTrue(challenged.is_challenge)
+        self.assertEqual(challenged.marker, "attention required")
+        self.assertTrue(challenged.browser_retry_allowed)
+        self.assertTrue(rate_limited.is_challenge)
+        self.assertEqual(rate_limited.category, "rate_limited")
+        self.assertFalse(rate_limited.browser_retry_allowed)
+
+    def test_challenge_classifier_accepts_only_constrained_short_headings(self):
+        challenged = assess_challenge(
+            200,
+            b"<html><body><h1>Access Denied</h1><p>Request ID 123</p></body></html>",
+        )
+        ordinary = assess_challenge(
+            200,
+            (
+                b"<html><title>Technology help</title><body><h1>Access Denied</h1>"
+                + b"<p>District troubleshooting guidance.</p>" * 200
+                + b"</body></html>"
+            ),
+        )
+
+        self.assertTrue(challenged.is_challenge)
+        self.assertEqual(challenged.category, "challenge_heading")
+        self.assertFalse(ordinary.is_challenge)
+
+    def test_listing_sync_recovers_401_and_403_once_and_preserves_final_url(self):
+        requested_url = "https://district.example/board"
+        challenged_url = "https://district.example/board/challenge"
+        recovered_url = "https://district.example/board/meetings"
+        source = BoardSource(
+            platform="generic",
+            public_url=requested_url,
+            requires_javascript=True,
+        )
+        for status_code in (401, 403):
+            with self.subTest(status_code=status_code):
+                adapter = GenericBoardAdapter(allow_browser_fallback=True)
+                adapter.fetch_url = Mock(
+                    return_value=HTTPResult(
+                        requested_url,
+                        challenged_url,
+                        status_code,
+                        {},
+                        b"Access denied",
+                    )
+                )
+                adapter.render_page_with_metadata = Mock(
+                    return_value=RenderedPage(
+                        b"<html><body>No meetings yet</body></html>",
+                        recovered_url,
+                        200,
+                        browser_rendered=True,
+                    )
+                )
+                adapter.parse_meeting_list = Mock(return_value=[])
+
+                self.assertEqual(adapter.list_meetings(source), [])
+
+                adapter.fetch_url.assert_called_once_with(
+                    requested_url,
+                    raise_for_status=False,
+                )
+                adapter.render_page_with_metadata.assert_called_once_with(challenged_url)
+                parsed_args = adapter.parse_meeting_list.call_args.args
+                self.assertEqual(parsed_args[1], recovered_url)
+                # An empty JS-backed result must not start a second browser
+                # after challenge recovery already rendered the page.
+                self.assertEqual(adapter.render_page_with_metadata.call_count, 1)
+
+    def test_meeting_sync_recovers_structural_200_challenge_once(self):
+        requested_url = "https://district.example/board/agenda/7"
+        challenged_url = "https://district.example/challenge/agenda/7"
+        recovered_url = "https://district.example/board/agenda/7?rendered=1"
+        source = BoardSource(
+            platform="generic",
+            public_url="https://district.example/board",
+            requires_javascript=True,
+        )
+        meeting_ref = MeetingRef("7", requested_url, agenda_url=requested_url)
+        normalized = NormalizedMeeting("7", recovered_url)
+        adapter = GenericBoardAdapter(allow_browser_fallback=True)
+        adapter.fetch_url = Mock(
+            return_value=HTTPResult(
+                requested_url,
+                challenged_url,
+                200,
+                {},
+                b"<html><body><h1>Access Denied</h1></body></html>",
+            )
+        )
+        adapter.render_page_with_metadata = Mock(
+            return_value=RenderedPage(
+                b"<html><body>Rendered agenda</body></html>",
+                recovered_url,
+                200,
+                browser_rendered=True,
+            )
+        )
+        adapter.parse_meeting_detail = Mock(return_value=normalized)
+
+        self.assertIs(adapter.fetch_meeting(source, meeting_ref), normalized)
+
+        adapter.render_page_with_metadata.assert_called_once_with(challenged_url)
+        parsed_args = adapter.parse_meeting_detail.call_args.args
+        self.assertEqual(parsed_args[1], recovered_url)
+        self.assertEqual(adapter.render_page_with_metadata.call_count, 1)
+
+    def test_sync_never_browser_retries_429_or_robots_denial(self):
+        url = "https://district.example/board"
+        source = BoardSource(platform="generic", public_url=url)
+
+        rate_limited = GenericBoardAdapter(allow_browser_fallback=True)
+        rate_limited.fetch_url = Mock(
+            return_value=HTTPResult(url, url, 429, {}, b"Too many requests")
+        )
+        rate_limited.render_page_with_metadata = Mock()
+        with self.assertRaises(requests.HTTPError):
+            rate_limited.list_meetings(source)
+        rate_limited.render_page_with_metadata.assert_not_called()
+
+        denied = GenericBoardAdapter(allow_browser_fallback=True)
+        denied.fetch_url = Mock(side_effect=RobotsDenied("robots.txt disallows fixture"))
+        denied.render_page_with_metadata = Mock()
+        with self.assertRaises(RobotsDenied):
+            denied.list_meetings(source)
+        denied.render_page_with_metadata.assert_not_called()
+
+    def test_non_javascript_adapter_recovers_challenge_with_browser_once(self):
+        url = "https://district.example/board/meetings"
+        adapter = GenericBoardAdapter(allow_browser_fallback=True)
+        adapter.fetch_url = Mock(
+            return_value=HTTPResult(url, url, 403, {}, b"Access denied")
+        )
+        adapter.render_page = Mock(return_value=fixture_bytes("generic_board_page.html"))
+
+        result = adapter.discover_source({"id": 7, "agency_name": "Example Schools"}, url)
+
+        self.assertEqual(result.status, "working")
+        self.assertIsNotNone(result.source)
+        adapter.render_page.assert_called_once_with(url)
+
+    def test_adapter_does_not_render_for_rate_limit_or_robots_denial(self):
+        url = "https://district.example/board/meetings"
+        rate_limited = GenericBoardAdapter(allow_browser_fallback=True)
+        rate_limited.fetch_url = Mock(
+            return_value=HTTPResult(url, url, 429, {}, b"Too many requests")
+        )
+        rate_limited.render_page = Mock(return_value=fixture_bytes("generic_board_page.html"))
+
+        result = rate_limited.discover_source(
+            {"id": 7, "agency_name": "Example Schools"},
+            url,
+        )
+        self.assertEqual(result.status, "blocked_by_challenge")
+        rate_limited.render_page.assert_not_called()
+
+        denied = GenericBoardAdapter(allow_browser_fallback=True)
+        denied.fetch_url = Mock(side_effect=RobotsDenied("robots.txt disallows fixture"))
+        denied.render_page = Mock(return_value=fixture_bytes("generic_board_page.html"))
+        result = denied.discover_source(
+            {"id": 7, "agency_name": "Example Schools"},
+            url,
+        )
+        self.assertEqual(result.status, "blocked_by_robots")
+        denied.render_page.assert_not_called()
+
+    def test_district_discovery_recovers_403_with_one_browser_render(self):
+        district_url = "https://www.bend.k12.or.us/"
+        client = FakeDiscoveryClient(
+            HTTPResult(district_url, district_url, 403, {}, b"Access denied")
+        )
+        adapter = FakeBoardBookRecoveryAdapter()
+        district = {
+            "id": 1445,
+            "agency_name": "BEND-LAPINE ADMINISTRATIVE SD 1",
+            "website": district_url,
+            "website_normalized": district_url,
+        }
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(district, client=client)
+
+        self.assertEqual(outcome.status, "working")
+        self.assertEqual(outcome.platform, "boardbook")
+        self.assertEqual(outcome.organization_external_id, "2413")
+        self.assertEqual(adapter.render_calls, [district_url])
+        self.assertEqual(len(outcome.raw["challenge_recoveries"]), 1)
+        self.assertTrue(
+            outcome.raw["challenge_recoveries"][0]["browser_fallback_attempted"]
+        )
+
+    def test_direct_challenged_platform_source_is_rendered_only_once(self):
+        source_url = "https://meetings.boardbook.org/Public/Organization/2413"
+        client = FakeDiscoveryClient(
+            HTTPResult(source_url, source_url, 403, {}, b"Access denied")
+        )
+        adapter = FakeBoardBookRecoveryAdapter()
+        district = {
+            "id": 1445,
+            "agency_name": "BEND-LAPINE ADMINISTRATIVE SD 1",
+            "website": source_url,
+            "website_normalized": source_url,
+        }
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(district, client=client)
+
+        self.assertEqual(outcome.status, "working")
+        self.assertEqual(adapter.render_calls, [source_url])
+        self.assertEqual(adapter.discover_calls, [source_url])
+
+    def test_challenged_redirect_keeps_the_final_platform_and_source_url(self):
+        district_url = "https://district.example/board"
+        source_url = "https://meetings.boardbook.org/Public/Organization/2413"
+        client = FakeDiscoveryClient(
+            HTTPResult(district_url, source_url, 403, {}, b"Access denied")
+        )
+        adapter = BoardBookAdapter(client, allow_browser_fallback=False)
+        district = {
+            "id": 1445,
+            "agency_name": "BEND-LAPINE ADMINISTRATIVE SD 1",
+            "website": district_url,
+            "website_normalized": district_url,
+        }
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(
+                district,
+                client=client,
+                allow_browser_fallback=False,
+                max_pages=1,
+            )
+
+        self.assertEqual(outcome.status, "blocked_by_challenge")
+        self.assertEqual(outcome.platform, "boardbook")
+        self.assertEqual(outcome.source_url, source_url)
+
+    def test_district_discovery_does_not_render_429_or_robots_denial(self):
+        district_url = "https://district.example/"
+        district = {
+            "id": 9,
+            "agency_name": "Example Schools",
+            "website": district_url,
+            "website_normalized": district_url,
+        }
+
+        adapter = FakeBoardBookRecoveryAdapter()
+        rate_limited = FakeDiscoveryClient(
+            HTTPResult(district_url, district_url, 429, {}, b"Too many requests")
+        )
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(district, client=rate_limited)
+        self.assertEqual(outcome.status, "blocked_by_challenge")
+        self.assertEqual(adapter.render_calls, [])
+        self.assertEqual(outcome.raw["challenges"][0]["category"], "rate_limited")
+
+        denied_adapter = FakeBoardBookRecoveryAdapter()
+        robots_denied = FakeDiscoveryClient(
+            RobotsDenied("robots.txt disallows https://district.example/")
+        )
+        with patch("board.discovery.build_adapters", return_value=[denied_adapter]):
+            outcome = discover_board_source(district, client=robots_denied)
+        self.assertEqual(outcome.status, "blocked_by_robots")
+        self.assertEqual(denied_adapter.render_calls, [])
+
     def test_adapter_confidence_is_normalized_without_rescaling_candidate_scores(self):
         candidate = BoardSourceCandidate(
             url="https://meetings.boardbook.org/Public/Organization/2221",

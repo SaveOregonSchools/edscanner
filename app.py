@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import re
+import secrets
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
@@ -79,7 +80,7 @@ configure_logging()
 init_db()
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "edscanner-local-dev"
+app.config["SECRET_KEY"] = os.getenv("EDSCANNER_SECRET_KEY") or secrets.token_hex(32)
 app.register_blueprint(board_blueprint)
 LOGGER = logging.getLogger(__name__)
 SEARCH_QUEUE: queue.Queue[int] = queue.Queue()

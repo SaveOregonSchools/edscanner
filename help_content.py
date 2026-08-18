@@ -255,7 +255,7 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                 ),
                 "steps": [
                     ("Discover Sources", "Identify the public board portal and platform for selected districts."),
-                    ("Review Sources", "Confirm working sources and investigate manual-review, challenge, robots, or parser failures."),
+                    ("Review Sources", "Confirm working sources and use Add or correct source when discovery misses or misidentifies a district."),
                     ("Sync Meetings", "Collect meeting metadata, agenda hierarchy, minutes, packets, attachments, and revisions."),
                     ("Explore or Search", "Browse meetings by district/date or search indexed agenda and document text."),
                     ("Schedule monitoring", "Enable a daily, weekly, or monthly sync for boards you want to keep current."),
@@ -264,8 +264,17 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                     {
                         "title": "Do I have to run discovery first?",
                         "paragraphs": [
-                            "Yes. A district needs an active board source before sync or scheduling knows which public platform to contact.",
+                            "Usually. Discovery is the fastest way to identify sources in bulk, but you can instead open Board Sources and use Add or correct source for an individual district.",
+                            "A manually submitted URL is safely fetched and checked by a platform adapter. It becomes working only after the adapter verifies the endpoint and you confirm that the page belongs to the selected district; otherwise it remains manual-review evidence.",
                             "Discovery does not collect the full meeting archive. Sync performs that collection and creates versions only when normalized content or document bytes actually change.",
+                        ],
+                    },
+                    {
+                        "title": "Challenges and provider directories",
+                        "paragraphs": [
+                            "When a district page returns a likely access challenge, EdScanner can try that page once with a real Chromium browser. Rate limits and robots denials do not trigger the retry, and a remaining CAPTCHA or challenge is recorded for manual review rather than bypassed.",
+                            "BoardBook publishes an organization directory, but the directory has names and opaque organization IDs without state. Provider-directory lookup is therefore disabled by default and must only be enabled after the operator confirms permission under the provider's current terms.",
+                            "When authorized, EdScanner fetches the directory once per discovery run, generates local name candidates, and requires state evidence plus a unique reciprocal NCES name-and-city match (or district-homepage evidence) before a source can become working. Ambiguous or state-less matches are never activated automatically.",
                         ],
                     },
                     {
@@ -285,7 +294,7 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                         "title": "Board source status",
                         "terms": [
                             ("working", "The active public source was identified and its adapter can process it."),
-                            ("manual_review", "A plausible board source was found, but a person should verify the platform or URL."),
+                            ("manual_review", "A plausible or manually entered source is retained, but adapter validation has not confirmed it as working."),
                             ("requires_javascript", "The public portal requires bounded browser rendering for reliable collection."),
                             ("blocked_by_challenge", "A public WAF or bot challenge prevented reliable anonymous collection."),
                             ("blocked_by_robots", "The configured robots policy disallowed the attempted public request."),

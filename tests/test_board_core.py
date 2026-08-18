@@ -762,6 +762,52 @@ class BoardRunTests(BoardDatabaseTestCase):
             [(self.district_id, source["id"], "queued")],
         )
 
+    def test_queued_sync_item_is_cancelled_if_its_source_was_superseded(self):
+        original = self.add_source()
+        run_id = create_board_sync_run(
+            states=["OR"],
+            platforms=["boardbook"],
+            max_workers=1,
+            debug_logging=False,
+            db_path=self.db_path,
+        )
+        replacement = self.add_source(
+            external_id="replacement",
+            url="https://meetings.boardbook.org/Public/Organization/replacement",
+        )
+        self.assertNotEqual(replacement["id"], original["id"])
+
+        class NoNetworkClient:
+            def __init__(self, settings) -> None:
+                self.settings = settings
+
+            def close(self) -> None:
+                return None
+
+        with (
+            patch("board.runs.BoardHTTPClient", NoNetworkClient),
+            patch("board.adapters.get_adapter") as get_adapter,
+        ):
+            execute_board_sync_run(
+                run_id,
+                db_path=self.db_path,
+                document_storage_root=self.storage_root / "documents",
+                snapshot_storage_root=self.storage_root / "snapshots",
+            )
+
+        get_adapter.assert_not_called()
+        with connect_db(self.db_path) as conn:
+            item = conn.execute(
+                "SELECT * FROM board_sync_run_items WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            run = conn.execute(
+                "SELECT * FROM board_sync_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+        self.assertEqual(item["status"], "cancelled")
+        self.assertIn("inactive", item["error_message"])
+        self.assertEqual(run["districts_processed"], 1)
+        self.assertEqual(run["status"], "completed")
+
     def test_boardbook_sync_is_idempotent_across_persistent_runs(self):
         self.add_source()
         adapter = FixtureBoardBookSyncAdapter()

@@ -38,8 +38,9 @@ from .base import (
 from board.models import DetectionResult
 
 
+_ORGANIZATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 _SOURCE_PATH = re.compile(
-    r"/Public/(?:Organization|Agenda|Minutes|PublicNotice)/(\d+)",
+    r"/Public/(?:Organization|Agenda|Minutes|PublicNotice)/([A-Za-z0-9][A-Za-z0-9_-]{0,127})(?:/|$)",
     re.IGNORECASE,
 )
 _MEETING_LABEL = re.compile(
@@ -83,7 +84,7 @@ def resolve_boardbook_document_url(viewer_url: str, organization_id: str | None 
     organization_id = organization_id or _organization_id(viewer_url)
     if organization_id is None:
         path_parts = [part for part in parsed.path.split("/") if part]
-        if path_parts and path_parts[-1].isdigit():
+        if path_parts and _ORGANIZATION_ID.fullmatch(path_parts[-1]):
             organization_id = path_parts[-1]
     if not document_id or not organization_id:
         return viewer_url

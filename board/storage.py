@@ -185,6 +185,27 @@ def _json_text(value: Any) -> str | None:
     return stable_json(value)
 
 
+def _json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    if not isinstance(value, str) or not value.strip():
+        return {}
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return dict(parsed) if isinstance(parsed, Mapping) else {}
+
+
+def _is_confirmed_manual_source(raw: Any) -> bool:
+    metadata = _json_mapping(raw)
+    return bool(
+        str(metadata.get("discovery_method") or "").casefold() == "manual_entry"
+        and metadata.get("operator_confirmed_district_identity") is True
+        and metadata.get("verified") is True
+    )
+
+
 def upsert_board_source(
     district_id: int,
     source: Any,
@@ -206,12 +227,16 @@ def upsert_board_source(
     last_discovered_at = _optional_text(value_of(source, "last_discovered_at")) or now
     last_checked_at = _optional_text(value_of(source, "last_checked_at")) or now
     raw = value_of(source, "raw_discovery_json", "raw", "metadata")
+    raw_json = _json_text(raw)
+    incoming_confirmed_manual = _is_confirmed_manual_source(raw_json)
+    schedule_action: str | None = None
+    superseded_source_id: int | None = None
 
     with connect_db(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         existing_active = conn.execute(
             """
-            SELECT id, platform, source_url, source_status
+            SELECT id, platform, source_url, source_status, raw_discovery_json
             FROM board_sources
             WHERE district_id = ? AND is_active = 1
             LIMIT 1
@@ -224,15 +249,35 @@ def upsert_board_source(
             and canonicalize_url(existing_active["source_url"]).casefold()
             == source_url.casefold()
         )
+        existing_is_confirmed_manual = bool(
+            existing_active is not None
+            and str(existing_active["source_status"] or "").casefold() == "working"
+            and _is_confirmed_manual_source(existing_active["raw_discovery_json"])
+        )
+        preserve_manual_authority = bool(
+            existing_is_confirmed_manual
+            and not is_exact_current
+            and not incoming_confirmed_manual
+        )
         # A known-good current source must not be displaced by a weaker lead.
         # The current source itself remains current when its latest health check
         # changes status, so operators retain one stable source history record.
         promote_to_current = (
-            status == "working"
+            (status == "working" and not preserve_manual_authority)
             or is_exact_current
             or (existing_active is None and status not in {"not_found", "error"})
         )
+        if (
+            is_exact_current
+            and existing_is_confirmed_manual
+            and not incoming_confirmed_manual
+        ):
+            # Automated health refreshes may update the exact source without
+            # erasing the operator-confirmed authority marker that protects it.
+            raw_json = str(existing_active["raw_discovery_json"] or "") or raw_json
         if promote_to_current:
+            if existing_active is not None and not is_exact_current:
+                superseded_source_id = int(existing_active["id"])
             conn.execute(
                 """
                 UPDATE board_sources
@@ -308,7 +353,7 @@ def upsert_board_source(
                 _optional_text(value_of(source, "last_successful_sync_at")),
                 last_checked_at,
                 _optional_text(value_of(source, "error_message", "error")),
-                _json_text(raw),
+                raw_json,
                 now,
                 now,
             ),
@@ -320,10 +365,53 @@ def upsert_board_source(
             """,
             (int(district_id), platform, source_url),
         ).fetchone()
+        if row is not None and superseded_source_id is not None:
+            old_schedule = conn.execute(
+                """
+                SELECT id FROM board_sync_schedules
+                WHERE board_source_id = ? AND enabled = 1
+                """,
+                (superseded_source_id,),
+            ).fetchone()
+            if old_schedule is not None:
+                replacement_schedule = conn.execute(
+                    "SELECT id FROM board_sync_schedules WHERE board_source_id = ?",
+                    (int(row["id"]),),
+                ).fetchone()
+                if replacement_schedule is None:
+                    conn.execute(
+                        """
+                        UPDATE board_sync_schedules
+                        SET board_source_id = ?, claim_token = NULL,
+                            claim_expires_at = NULL, last_error = NULL, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (int(row["id"]), now, int(old_schedule["id"])),
+                    )
+                    schedule_action = "transferred"
+                else:
+                    message = (
+                        "Disabled when this source was superseded because the replacement "
+                        "source already had a schedule."
+                    )
+                    conn.execute(
+                        """
+                        UPDATE board_sync_schedules
+                        SET enabled = 0, claim_token = NULL, claim_expires_at = NULL,
+                            last_error = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (message, now, int(old_schedule["id"])),
+                    )
+                    schedule_action = "disabled_conflict"
         conn.commit()
     if row is None:
         raise RuntimeError("Board source upsert did not produce a row.")
-    return dict(row)
+    result = dict(row)
+    if schedule_action is not None:
+        result["_schedule_action"] = schedule_action
+        result["_superseded_source_id"] = superseded_source_id
+    return result
 
 
 def get_board_source(

@@ -1,17 +1,30 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import math
 import queue
 import re
+import secrets
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlencode
 
-from flask import Blueprint, Response, abort, flash, redirect, render_template, request, send_file, url_for
+from flask import (
+    Blueprint,
+    Response,
+    abort,
+    flash,
+    redirect,
+    render_template,
+    request,
+    send_file,
+    session,
+    url_for,
+)
 
 from board.exports import (
     BoardExport,
@@ -20,6 +33,15 @@ from board.exports import (
     export_board_search_csv,
     export_board_sources_csv,
     export_board_sync_run_csv,
+)
+from board.manual_sources import (
+    AUTO_PLATFORM,
+    ManualSourceValidationError,
+    validate_manual_board_source,
+)
+from board.provider_directories import (
+    BOARD_PROVIDER_DIRECTORY_WARNING,
+    provider_directory_enabled,
 )
 from board.runs import (
     board_discovery_preview,
@@ -40,6 +62,7 @@ from board.scheduler import (
     update_schedule,
 )
 from board.search import count_board_content, search_board_content
+from board.storage import upsert_board_source
 from common import (
     BOARD_DISCOVERY_RUN_LOGS_DIR,
     BOARD_DOCUMENTS_DIR,
@@ -72,6 +95,28 @@ SOURCE_STATUSES = [
     "error",
 ]
 PAGE_SIZE = 50
+SQLITE_INT64_MAX = (1 << 63) - 1
+_MANUAL_SOURCE_CSRF_SESSION_KEY = "board_manual_source_csrf"
+
+
+def _manual_source_csrf_token() -> str:
+    token = session.get(_MANUAL_SOURCE_CSRF_SESSION_KEY)
+    if not isinstance(token, str) or len(token) < 32:
+        token = secrets.token_urlsafe(32)
+        session[_MANUAL_SOURCE_CSRF_SESSION_KEY] = token
+    return token
+
+
+def _consume_manual_source_csrf_token() -> None:
+    submitted = request.form.get("csrf_token", "")
+    expected = session.get(_MANUAL_SOURCE_CSRF_SESSION_KEY)
+    if (
+        not isinstance(expected, str)
+        or not submitted
+        or not hmac.compare_digest(expected, submitted)
+    ):
+        abort(400, description="The form expired. Reload it and try again.")
+    session.pop(_MANUAL_SOURCE_CSRF_SESSION_KEY, None)
 
 
 def _optional_int(value: Any) -> int | None:
@@ -423,6 +468,110 @@ def export_sources() -> Response:
     )
 
 
+@bp.route("/sources/manual", methods=["GET", "POST"])
+def manual_source() -> str | Response | tuple[str, int]:
+    district_id = _optional_int(request.values.get("district_id"))
+    if district_id is None or district_id <= 0 or district_id > SQLITE_INT64_MAX:
+        abort(400, description="Select a district before adding a board source.")
+
+    with connect_db() as conn:
+        district = conn.execute(
+            "SELECT * FROM districts WHERE id = ?", (district_id,)
+        ).fetchone()
+    if district is None:
+        abort(404, description="District not found.")
+
+    validation_error: str | None = None
+    if request.method == "POST":
+        _consume_manual_source_csrf_token()
+        if request.form.get("confirm_district_identity", "").casefold() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            abort(
+                400,
+                description=(
+                    "Open the public page and confirm that it belongs to the selected "
+                    "district before saving it."
+                ),
+            )
+        submitted_url = request.form.get("source_url", "").strip()
+        submitted_platform = request.form.get("platform", AUTO_PLATFORM).strip().casefold()
+        try:
+            outcome = validate_manual_board_source(
+                dict(district),
+                submitted_url,
+                submitted_platform,
+                operator_confirmed=True,
+            )
+        except ManualSourceValidationError as exc:
+            validation_error = str(exc)
+        else:
+            payload = outcome.as_storage_payload()
+            payload["discovered_from_url"] = submitted_url
+            saved = upsert_board_source(district_id, payload)
+            if outcome.verified:
+                schedule_action = saved.get("_schedule_action")
+                flash(
+                    f"The {outcome.platform} source was adapter-validated and saved as working.",
+                    "success",
+                )
+                if schedule_action == "transferred":
+                    flash(
+                        "The enabled monitoring schedule was moved to the corrected source.",
+                        "success",
+                    )
+                elif schedule_action == "disabled_conflict":
+                    flash(
+                        "The earlier source's schedule was disabled because the corrected "
+                        "source already has a schedule. Review Schedules before monitoring.",
+                        "info",
+                    )
+            else:
+                flash(
+                    "The safely retrieved link was saved for manual review, but it was not "
+                    "marked working because adapter validation did not succeed.",
+                    "info",
+                )
+            return redirect(
+                url_for(
+                    "boards.manual_source",
+                    district_id=district_id,
+                    saved_source_id=saved["id"],
+                )
+            )
+    else:
+        submitted_url = ""
+        submitted_platform = AUTO_PLATFORM
+
+    with connect_db() as conn:
+        history = conn.execute(
+            """
+            SELECT * FROM board_sources
+            WHERE district_id = ?
+            ORDER BY is_active DESC, updated_at DESC, id DESC
+            """,
+            (district_id,),
+        ).fetchall()
+    if request.method == "GET" and history:
+        submitted_url = str(history[0]["source_url"] or "")
+        submitted_platform = AUTO_PLATFORM
+
+    response = render_template(
+        "board_manual_source.html",
+        district=district,
+        history=history,
+        platforms=PLATFORMS,
+        submitted_url=submitted_url,
+        submitted_platform=submitted_platform,
+        validation_error=validation_error,
+        csrf_token=_manual_source_csrf_token(),
+    )
+    return (response, 400) if validation_error else response
+
+
 @bp.route("/discover", methods=["GET", "POST"])
 def discovery() -> str | Response:
     selected_states = _selected("states")
@@ -483,6 +632,8 @@ def discovery() -> str | Response:
         max_workers=max_workers,
         force=force,
         debug_logging=debug_logging,
+        provider_directory_enabled=provider_directory_enabled(),
+        provider_directory_warning=BOARD_PROVIDER_DIRECTORY_WARNING,
     )
 
 

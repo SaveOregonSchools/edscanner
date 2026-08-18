@@ -11,6 +11,7 @@
     </div>
   </section>
   {% include "_board_nav.html" %}
+  <p class="status-note">If discovery misses a district or finds the wrong link, use <strong>Add or correct source</strong> in that district's row to validate and save the public board site manually.</p>
 
   <section class="tool-surface">
     <form method="get" class="search-form">
@@ -39,7 +40,7 @@
   <section class="content-section">
     <div class="table-scroll">
       <table>
-        <thead><tr><th>District</th><th>State</th><th>Platform</th><th>Status</th><th>Confidence</th><th>Public source</th><th>Last checked</th><th>Last sync</th><th>Monitoring</th></tr></thead>
+        <thead><tr><th>District</th><th>State</th><th>Platform</th><th>Status</th><th>Confidence</th><th>Public source</th><th>Last checked</th><th>Last sync</th><th>Monitoring</th><th>Manual correction</th></tr></thead>
         <tbody>
           {% for row in rows %}
             <tr>
@@ -55,9 +56,10 @@
               <td>{{ row.last_checked_at|fmt_dt }}</td>
               <td>{{ row.last_successful_sync_at|fmt_dt }}</td>
               <td>{% if row.schedule_id %}<a class="button-link" href="{{ url_for('boards.schedule_edit', schedule_id=row.schedule_id) }}">Edit schedule</a>{% elif row.board_source_id and row.is_active and row.source_status == 'working' %}<a class="button-link" href="{{ url_for('boards.schedule_new', board_source_id=row.board_source_id) }}">Add schedule</a>{% else %}<span class="status-note">Working source required</span>{% endif %}</td>
+              <td><a class="button-link" href="{{ url_for('boards.manual_source', district_id=row.id) }}">{{ 'Correct source' if row.board_source_id else 'Add source' }}</a></td>
             </tr>
           {% else %}
-            <tr><td colspan="9" class="empty">No districts match these filters.</td></tr>
+            <tr><td colspan="10" class="empty">No districts match these filters.</td></tr>
           {% endfor %}
         </tbody>
       </table>

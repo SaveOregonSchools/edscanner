@@ -4,7 +4,9 @@ import email.utils
 import ipaddress
 import json
 import logging
+import os
 import socket
+import ssl
 import threading
 import time
 from collections import OrderedDict
@@ -16,6 +18,7 @@ from urllib import robotparser
 from urllib.parse import urldefrag, urljoin, urlsplit, urlunsplit
 
 import requests
+import truststore
 from requests.adapters import HTTPAdapter
 from requests.exceptions import SSLError
 
@@ -105,6 +108,11 @@ class BoardHTTPSettings:
     allow_private_networks: bool = BOARD_ALLOW_PRIVATE_NETWORKS
     allow_insecure_ssl_fallback: bool = BOARD_ALLOW_INSECURE_SSL_FALLBACK
     insecure_ssl_fallback_hosts: tuple[str, ...] | str = BOARD_INSECURE_SSL_FALLBACK_HOSTS
+    # Windows' native certificate verifier may retrieve missing intermediate
+    # certificates while building a chain. Keep that network-capable behavior
+    # confined to exact, reviewed vendor hosts; arbitrary district and manually
+    # entered hosts continue to use Requests' ordinary certifi/OpenSSL path.
+    native_trust_hosts: tuple[str, ...] | str = ("meetings.boardbook.org",)
 
     def __post_init__(self) -> None:
         self.timeout_seconds = max(1.0, float(self.timeout_seconds))
@@ -130,6 +138,22 @@ class BoardHTTPSettings:
                     str(host).strip().casefold().lstrip("*.").rstrip(".")
                     for host in hosts
                     if str(host).strip().lstrip("*.").rstrip(".")
+                }
+            )
+        )
+        native_hosts = self.native_trust_hosts
+        if native_hosts is None:
+            native_hosts = ()
+        if isinstance(native_hosts, str):
+            native_hosts = tuple(native_hosts.split(","))
+        self.native_trust_hosts = tuple(
+            sorted(
+                {
+                    str(host).strip().casefold().rstrip(".")
+                    for host in native_hosts
+                    if str(host).strip()
+                    and "*" not in str(host)
+                    and "://" not in str(host)
                 }
             )
         )
@@ -407,8 +431,24 @@ class _PinnedHTTPAdapter(HTTPAdapter):
     """Requests transport that connects to a previously validated IP address."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._native_ssl_context = kwargs.pop("native_ssl_context", None)
+        native_trust_hosts = kwargs.pop(
+            "native_trust_hosts",
+            ("meetings.boardbook.org",),
+        )
+        if isinstance(native_trust_hosts, str):
+            native_trust_hosts = tuple(native_trust_hosts.split(","))
+        self._native_trust_hosts = frozenset(
+            str(host).strip().casefold().rstrip(".")
+            for host in (native_trust_hosts or ())
+            if str(host).strip()
+            and "*" not in str(host)
+            and "://" not in str(host)
+        )
         super().__init__(*args, **kwargs)
         self._active_pin = threading.local()
+        self._active_verify = threading.local()
+        self._active_cert = threading.local()
 
     def pin(self, url: str, address: str) -> None:
         parsed = urlsplit(url)
@@ -419,7 +459,14 @@ class _PinnedHTTPAdapter(HTTPAdapter):
             str(address).split("%", 1)[0],
         )
 
-    def _pool_for_url(self, url: str, proxies: Mapping[str, str] | None = None) -> Any:
+    def _pool_for_url(
+        self,
+        url: str,
+        proxies: Mapping[str, str] | None = None,
+        *,
+        verify: Any = True,
+        cert: Any = None,
+    ) -> Any:
         if proxies:
             raise BoardHTTPError("Proxy routing is disabled for pinned board requests.")
         parsed = urlsplit(url)
@@ -438,6 +485,31 @@ class _PinnedHTTPAdapter(HTTPAdapter):
                     "server_hostname": host,
                 }
             )
+            if verify is False or verify is None:
+                pool_kwargs["cert_reqs"] = "CERT_NONE"
+            else:
+                pool_kwargs["cert_reqs"] = "CERT_REQUIRED"
+                if (
+                    verify is True
+                    and self._native_ssl_context is not None
+                    and host in self._native_trust_hosts
+                ):
+                    # Keep the logical hostname for SNI/hostname checks while
+                    # delegating chain construction to the operating system.
+                    # On Windows this uses CryptoAPI and can retrieve missing
+                    # intermediate certificates securely.
+                    pool_kwargs["ssl_context"] = self._native_ssl_context
+                elif isinstance(verify, str):
+                    if os.path.isdir(verify):
+                        pool_kwargs["ca_cert_dir"] = verify
+                    else:
+                        pool_kwargs["ca_certs"] = verify
+            if cert:
+                if isinstance(cert, tuple) and len(cert) == 2:
+                    pool_kwargs["cert_file"] = cert[0]
+                    pool_kwargs["key_file"] = cert[1]
+                else:
+                    pool_kwargs["cert_file"] = cert
         else:
             # Keep plain-HTTP virtual hosts in distinct pools even when their
             # approved address and port are identical.
@@ -458,15 +530,57 @@ class _PinnedHTTPAdapter(HTTPAdapter):
         proxies: Mapping[str, str] | None = None,
         cert: Any = None,
     ) -> Any:
-        del verify, cert
-        return self._pool_for_url(request.url, proxies)
+        return self._pool_for_url(
+            request.url,
+            proxies,
+            verify=verify,
+            cert=cert,
+        )
 
     def get_connection(
         self,
         url: str,
         proxies: Mapping[str, str] | None = None,
     ) -> Any:
-        return self._pool_for_url(url, proxies)
+        # Requests 2.31 does not pass TLS settings to get_connection(). send()
+        # records them in thread-local state so verified and explicitly
+        # unverified requests still use separate connection pools.
+        return self._pool_for_url(
+            url,
+            proxies,
+            verify=getattr(self._active_verify, "value", True),
+            cert=getattr(self._active_cert, "value", None),
+        )
+
+    def send(
+        self,
+        request: Any,
+        stream: bool = False,
+        timeout: Any = None,
+        verify: Any = True,
+        cert: Any = None,
+        proxies: Mapping[str, str] | None = None,
+    ) -> Any:
+        self._active_verify.value = verify
+        self._active_cert.value = cert
+        try:
+            return super().send(
+                request,
+                stream=stream,
+                timeout=timeout,
+                verify=verify,
+                cert=cert,
+                proxies=proxies,
+            )
+        finally:
+            try:
+                del self._active_verify.value
+            except AttributeError:
+                pass
+            try:
+                del self._active_cert.value
+            except AttributeError:
+                pass
 
 
 class BoardHTTPClient:
@@ -489,6 +603,7 @@ class BoardHTTPClient:
         session: requests.Session | None = None,
     ) -> None:
         self.settings = settings or BoardHTTPSettings()
+        self._native_ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self._injected_session = session
         self._thread_local = threading.local()
         self._sessions: set[requests.Session] = set()
@@ -555,6 +670,8 @@ class BoardHTTPClient:
             pool_maxsize=max(4, self.settings.global_concurrency),
             max_retries=0,
             pool_block=True,
+            native_ssl_context=self._native_ssl_context,
+            native_trust_hosts=self.settings.native_trust_hosts,
         )
         session.mount("http://", adapter)
         session.mount("https://", adapter)

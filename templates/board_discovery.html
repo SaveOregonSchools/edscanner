@@ -9,6 +9,12 @@
   </section>
   {% include "_board_nav.html" %}
 
+  <section class="guidance-card">
+    <h3>How discovery handles blocked pages</h3>
+    <p>If an ordinary public request returns a likely access challenge, EdScanner can make one bounded retry with a real Chromium browser and feed the rendered page back into normal link detection. It does not retry rate limits, solve CAPTCHAs, rotate browser identities, or bypass robots policy. If recovery still fails, use <a href="{{ url_for('boards.sources') }}">Board Sources</a> to add or correct the public source manually.</p>
+    <p><strong>Provider-directory matching is {{ 'enabled' if provider_directory_enabled else 'disabled' }}.</strong> {{ provider_directory_warning }} {% if not provider_directory_enabled %}After confirming permission, set <code>EDSCANNER_BOARD_PROVIDER_DIRECTORY_ENABLED=true</code> and restart EdScanner to enable it.{% endif %} When authorized and enabled, BoardBook names are only candidate leads; EdScanner requires state evidence plus a unique reciprocal NCES name-and-city match (or district-homepage evidence) and rejects ambiguous matches. See the <a href="https://www.boardbook.org/boardbook-terms-and-conditions-of-use" target="_blank" rel="noopener">current BoardBook terms</a> before enabling it.</p>
+  </section>
+
   <section class="tool-surface">
     <form method="post" class="search-form">
       <div><label for="states">States</label><select id="states" name="states" multiple size="8">{% for value in options.states %}<option value="{{ value }}" {% if value in selected_states %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
