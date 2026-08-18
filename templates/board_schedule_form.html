@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+
+{% block title %}{{ 'Edit' if schedule else 'Add' }} Board Schedule - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <h2>{{ 'Edit' if schedule else 'Add' }} Board Monitoring Schedule</h2>
+      <p class="status-note">Choose when EdScanner should check this board source for new and changed content.</p>
+    </div>
+    <a class="button-link" href="{{ url_for('boards.schedules') }}">Back to schedules</a>
+  </section>
+  {% include "_board_nav.html" %}
+
+  <section class="tool-surface">
+    <form method="post" class="search-form" id="schedule-form">
+      {% if schedule %}
+        <div class="full">
+          <label>Board source</label>
+          <strong>{{ schedule.agency_name }}</strong>
+          <div class="status-note">{{ schedule.state }} · {{ schedule.platform }} · {{ schedule.source_url }}</div>
+        </div>
+      {% else %}
+        <div class="full">
+          <label for="board_source_id">Board source</label>
+          <select id="board_source_id" name="board_source_id" required>
+            <option value="">Select a working source</option>
+            {% for source in source_options %}<option value="{{ source.id }}" {% if selected_source_id == source.id %}selected{% endif %}>{{ source.state }} — {{ source.agency_name }} ({{ source.platform }})</option>{% endfor %}
+          </select>
+          {% if not source_options %}<p class="status-note">Every working source already has a schedule, or no working source has been discovered yet.</p>{% endif %}
+        </div>
+      {% endif %}
+
+      <div>
+        <label for="frequency">Frequency</label>
+        <select id="frequency" name="frequency" required>
+          {% for value in frequencies %}<option value="{{ value }}" {% if form.frequency == value %}selected{% endif %}>{{ value|title }}</option>{% endfor %}
+        </select>
+      </div>
+      <div id="weekly-options">
+        <label for="weekday">Day of week</label>
+        <select id="weekday" name="weekday">
+          {% for name in weekdays %}<option value="{{ loop.index0 }}" {% if form.weekday == loop.index0 %}selected{% endif %}>{{ name }}</option>{% endfor %}
+        </select>
+      </div>
+      <div id="monthly-options">
+        <label for="day_of_month">Day of month</label>
+        <input id="day_of_month" name="day_of_month" type="number" min="1" max="31" value="{{ form.day_of_month }}">
+        <div class="status-note">Short months automatically use their final day.</div>
+      </div>
+      <div>
+        <label for="run_hour">Run hour</label>
+        <select id="run_hour" name="run_hour" required>
+          {% for value in range(1, 13) %}<option value="{{ value }}" {% if form.run_hour == value %}selected{% endif %}>{{ value }}</option>{% endfor %}
+        </select>
+      </div>
+      <div>
+        <label for="run_minute">Minute</label>
+        <input id="run_minute" name="run_minute" type="number" min="0" max="59" step="1" value="{{ form.run_minute }}" required>
+      </div>
+      <div>
+        <label for="meridiem">AM or PM</label>
+        <select id="meridiem" name="meridiem" required><option value="AM" {% if form.meridiem == 'AM' %}selected{% endif %}>AM</option><option value="PM" {% if form.meridiem == 'PM' %}selected{% endif %}>PM</option></select>
+      </div>
+      <div class="checkbox-field"><input id="enabled" name="enabled" type="checkbox" value="1" {% if form.enabled %}checked{% endif %}><label for="enabled">Schedule enabled</label></div>
+      <div class="form-actions full"><button type="submit">{{ 'Save schedule' if schedule else 'Create schedule' }}</button><a class="button-link" href="{{ url_for('boards.schedules') }}">Cancel</a></div>
+    </form>
+  </section>
+
+  <script>
+    (() => {
+      const frequency = document.getElementById("frequency");
+      const weekly = document.getElementById("weekly-options");
+      const monthly = document.getElementById("monthly-options");
+      const update = () => {
+        weekly.hidden = frequency.value !== "weekly";
+        monthly.hidden = frequency.value !== "monthly";
+      };
+      frequency.addEventListener("change", update);
+      update();
+    })();
+  </script>
+{% endblock %}

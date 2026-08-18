@@ -15,16 +15,18 @@
     <form method="get" action="{{ url_for('search_page') }}" class="search-form">
       <div class="full">
         <div class="label-row">
-          <label for="query_text">Keyword or phrase</label>
+          <label for="query_text">Search query</label>
           <details class="help-popover">
             <summary>Help</summary>
             <div class="help-panel">
-              <p>Current search is simple case-insensitive text matching. Enter one word or an exact phrase, such as <code>calendar</code> or <code>community schools</code>.</p>
-              <p>Boolean logic, wildcards, and quote parsing are not supported yet. Do not add quotes unless you want quote characters included in the search.</p>
+              <p>Use uppercase <code>AND</code>, <code>OR</code>, and <code>NOT</code>, quoted phrases, parentheses, and word wildcards. Example: <code>budget AND (audit OR counsel*) AND NOT draft</code>.</p>
+              <p><code>*</code> matches any number of characters and <code>?</code> matches one character within a word. A plain multiword query such as <code>community schools</code> keeps the original exact-phrase behavior.</p>
+              <p>EdScanner adapts candidate retrieval to each district's saved provider, then verifies the complete expression locally so result meaning stays consistent.</p>
+              <p><a href="{{ url_for('help_topic_page', slug='search') }}">Advanced search guide and field definitions</a></p>
             </div>
           </details>
         </div>
-        <input id="query_text" name="query_text" value="{{ query_text }}" placeholder="community schools">
+        <input id="query_text" name="query_text" value="{{ query_text }}" placeholder="budget AND (audit OR counsel*) AND NOT draft">
       </div>
 
       <div>

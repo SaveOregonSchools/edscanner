@@ -302,6 +302,92 @@ class BoardStorageAndSearchTests(BoardDatabaseTestCase):
         self.assertEqual([row["is_active"] for row in final_rows], [1, 0])
         self.assertEqual(len(final_rows), 2)
 
+    def test_unverified_alternate_sources_remain_inactive_evidence(self):
+        current = self.add_source(
+            url="https://meetings.boardbook.org/Public/Organization/1111",
+            external_id="1111",
+        )
+        candidates = (
+            ("manual_review", "https://district.example/board", "generic"),
+            (
+                "requires_javascript",
+                "https://go.boarddocs.com/or/example/Board.nsf/Public",
+                "boarddocs",
+            ),
+            (
+                "blocked_by_challenge",
+                "https://simbli.eboardsolutions.com/Index.aspx?S=1234",
+                "simbli",
+            ),
+            (
+                "blocked_by_robots",
+                "https://district.example/board/meetings",
+                "generic",
+            ),
+        )
+        candidate_rows = [
+            self.add_source(url=url, platform=platform, status=status)
+            for status, url, platform in candidates
+        ]
+
+        with connect_db(self.db_path) as conn:
+            active = conn.execute(
+                "SELECT * FROM board_sources WHERE district_id = ? AND is_active = 1",
+                (self.district_id,),
+            ).fetchall()
+            all_rows = conn.execute(
+                "SELECT * FROM board_sources WHERE district_id = ? ORDER BY id",
+                (self.district_id,),
+            ).fetchall()
+
+        self.assertEqual([row["id"] for row in active], [current["id"]])
+        self.assertEqual(active[0]["source_status"], "working")
+        self.assertTrue(all(row["is_active"] == 0 for row in candidate_rows))
+        self.assertEqual(len(all_rows), 1 + len(candidates))
+
+    def test_exact_current_source_can_update_health_without_losing_current_status(self):
+        current = self.add_source(
+            url="https://meetings.boardbook.org/Public/Organization/1111",
+            external_id="1111",
+        )
+
+        unhealthy = self.add_source(
+            url=current["source_url"],
+            external_id="1111",
+            status="blocked_by_challenge",
+        )
+
+        self.assertEqual(unhealthy["id"], current["id"])
+        self.assertEqual(unhealthy["source_status"], "blocked_by_challenge")
+        self.assertEqual(unhealthy["is_active"], 1)
+        self.assertIsNone(unhealthy["superseded_at"])
+
+        replacement = self.add_source(
+            url="https://meetings.boardbook.org/Public/Organization/2222",
+            external_id="2222",
+            status="working",
+        )
+        with connect_db(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT * FROM board_sources WHERE district_id = ? ORDER BY id",
+                (self.district_id,),
+            ).fetchall()
+
+        self.assertEqual([row["is_active"] for row in rows], [0, 1])
+        self.assertIsNotNone(rows[0]["superseded_at"])
+        self.assertEqual(replacement["is_active"], 1)
+
+    def test_first_reviewable_source_is_current_until_a_working_source_is_found(self):
+        candidate = self.add_source(
+            url="https://district.example/board",
+            platform="generic",
+            status="manual_review",
+        )
+
+        self.assertEqual(candidate["source_status"], "manual_review")
+        self.assertEqual(candidate["is_active"], 1)
+        self.assertIsNone(candidate["superseded_at"])
+
     def test_source_meeting_agenda_and_document_dedup_create_only_real_versions(self):
         source = self.add_source()
         duplicate_source = self.add_source(url=f"{source['source_url']}/")

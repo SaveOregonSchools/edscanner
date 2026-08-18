@@ -9,6 +9,7 @@
     <div class="action-row">
       <a class="button-link" href="{{ url_for('boards.discovery') }}">Discover Sources</a>
       <a class="button-link" href="{{ url_for('boards.discovery_run_detail', run_id=run.id) }}">Refresh</a>
+      <a class="button-link" href="{{ url_for('boards.export_discovery_run', run_id=run.id) }}">Export item ledger CSV</a>
       {% if run.debug_log_path %}<a class="button-link" href="{{ url_for('boards.discovery_run_log', run_id=run.id) }}" target="_blank" rel="noopener">Debug log</a>{% endif %}
       {% if run.status in ['queued', 'running'] and not run.cancel_requested %}<form method="post" action="{{ url_for('boards.cancel_discovery_run', run_id=run.id) }}" class="inline-action"><button type="submit" class="danger">Cancel</button></form>{% endif %}
     </div>

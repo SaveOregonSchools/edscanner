@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
@@ -70,6 +71,38 @@ def _collapse_ws(value: Any) -> str:
 
 def _platform_name(value: Any) -> str:
     return str(value or "").strip().casefold().replace(" ", "_").replace("-", "_")
+
+
+def _adapter_confidence_percent(value: Any) -> float | None:
+    """Return an adapter confidence on the persistence layer's 0..100 scale.
+
+    Adapter ``DetectionResult`` instances conventionally report a probability in
+    the 0..1 range, while link-candidate scores are already percentage-like.  Keep
+    the conversion at this boundary so a candidate score of ``1`` is not
+    accidentally interpreted as 100 percent.
+    """
+
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(confidence) or confidence < 0:
+        return None
+    if confidence <= 1:
+        confidence *= 100
+    return min(confidence, 100)
+
+
+def _outcome_confidence(result: Any, source: Any, candidate: BoardSourceCandidate) -> float:
+    for value in (
+        getattr(result, "confidence", None),
+        getattr(source, "confidence", None),
+    ):
+        normalized = _adapter_confidence_percent(value)
+        if normalized is not None and normalized > 0:
+            return normalized
+    # Candidate scores are already expressed on the storage layer's 0..100 scale.
+    return float(candidate.score)
 
 
 def is_known_board_host(url: str) -> bool:
@@ -186,7 +219,7 @@ def _outcome_from_adapter_result(result: Any, candidate: BoardSourceCandidate) -
         status=status,
         platform=platform,
         source_url=source_url,
-        confidence=float(getattr(result, "confidence", 0) or getattr(source, "confidence", 0) or candidate.score),
+        confidence=_outcome_confidence(result, source, candidate),
         organization_external_id=str(
             getattr(result, "organization_external_id", "")
             or getattr(source, "external_source_id", "")
@@ -293,7 +326,10 @@ def discover_board_source(
                     url=final_url,
                     text="",
                     discovered_from_url=url,
-                    score=max(score, int(float(getattr(detection, "confidence", 0) or 0))),
+                    score=max(
+                        score,
+                        int(round(_adapter_confidence_percent(getattr(detection, "confidence", 0)) or 0)),
+                    ),
                     known_platform=_platform_name(getattr(detection, "platform", "")),
                     evidence=[*evidence, *list(getattr(detection, "evidence", []) or [])],
                 )

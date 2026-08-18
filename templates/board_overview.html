@@ -10,6 +10,7 @@
     </div>
     <div class="action-row">
       <a class="button-link" href="{{ url_for('boards.discovery') }}">Discover sources</a>
+      <a class="button-link" href="{{ url_for('boards.schedules') }}">Schedules</a>
       <a class="button-link primary" href="{{ url_for('boards.sync') }}">Sync meetings</a>
     </div>
   </section>
@@ -25,6 +26,7 @@
     <div class="stat"><span class="stat-label">Failed or blocked</span><strong>{{ summary.failed_sources|fmt_int }}</strong></div>
     <div class="stat"><span class="stat-label">Meetings</span><strong>{{ summary.meetings|fmt_int }}</strong></div>
     <div class="stat"><span class="stat-label">Documents</span><strong>{{ summary.documents|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Enabled schedules</span><strong>{{ summary.enabled_schedules|fmt_int }}</strong></div>
   </section>
 
   <section class="content-section">

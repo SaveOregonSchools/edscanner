@@ -3,7 +3,7 @@
 {% block title %}Board Meetings - EdScanner{% endblock %}
 
 {% block content %}
-  <section class="page-heading"><h2>Board Meetings</h2><div class="metric-inline"><span>Results</span><strong>{{ total|fmt_int }}</strong></div></section>
+  <section class="page-heading"><h2>Board Meetings</h2><div class="action-row"><div class="metric-inline"><span>Results</span><strong>{{ total|fmt_int }}</strong></div><a class="button-link" href="{{ export_url }}">Export filtered CSV</a></div></section>
   {% include "_board_nav.html" %}
   <section class="tool-surface"><form method="get" class="search-form">
     <div><label for="q">Text</label><input id="q" name="q" value="{{ filters.q }}" placeholder="Meeting title or agenda text"></div>

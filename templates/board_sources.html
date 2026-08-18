@@ -5,7 +5,10 @@
 {% block content %}
   <section class="page-heading">
     <h2>Board Sources</h2>
-    <div class="metric-inline"><span>Matching districts</span><strong>{{ total|fmt_int }}</strong></div>
+    <div class="action-row">
+      <div class="metric-inline"><span>Matching districts</span><strong>{{ total|fmt_int }}</strong></div>
+      <a class="button-link" href="{{ export_url }}">Export filtered CSV</a>
+    </div>
   </section>
   {% include "_board_nav.html" %}
 
@@ -36,7 +39,7 @@
   <section class="content-section">
     <div class="table-scroll">
       <table>
-        <thead><tr><th>District</th><th>State</th><th>Platform</th><th>Status</th><th>Confidence</th><th>Public source</th><th>Last checked</th><th>Last sync</th></tr></thead>
+        <thead><tr><th>District</th><th>State</th><th>Platform</th><th>Status</th><th>Confidence</th><th>Public source</th><th>Last checked</th><th>Last sync</th><th>Monitoring</th></tr></thead>
         <tbody>
           {% for row in rows %}
             <tr>
@@ -51,9 +54,10 @@
               <td>{% if row.source_url %}<a href="{{ row.source_url }}" target="_blank" rel="noopener">Open original</a><div class="source-url">{{ row.source_url }}</div>{% endif %}</td>
               <td>{{ row.last_checked_at|fmt_dt }}</td>
               <td>{{ row.last_successful_sync_at|fmt_dt }}</td>
+              <td>{% if row.schedule_id %}<a class="button-link" href="{{ url_for('boards.schedule_edit', schedule_id=row.schedule_id) }}">Edit schedule</a>{% elif row.board_source_id and row.is_active and row.source_status == 'working' %}<a class="button-link" href="{{ url_for('boards.schedule_new', board_source_id=row.board_source_id) }}">Add schedule</a>{% else %}<span class="status-note">Working source required</span>{% endif %}</td>
             </tr>
           {% else %}
-            <tr><td colspan="8" class="empty">No districts match these filters.</td></tr>
+            <tr><td colspan="9" class="empty">No districts match these filters.</td></tr>
           {% endfor %}
         </tbody>
       </table>

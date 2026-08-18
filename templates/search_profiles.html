@@ -4,10 +4,16 @@
 
 {% block content %}
   <section class="page-heading">
-    <h2>Search Profiles</h2>
-    <div class="metric-inline">
-      <span>Filtered districts</span>
-      <strong>{{ total|fmt_int }}</strong>
+    <div>
+      <h2>Search Profiles</h2>
+      <p class="status-note">Discover how each district website's native search works before running profile-based searches.</p>
+    </div>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('help_topic_page', slug='search-profiles') }}">How profiles work</a>
+      <div class="metric-inline">
+        <span>Filtered districts</span>
+        <strong>{{ total|fmt_int }}</strong>
+      </div>
     </div>
   </section>
 

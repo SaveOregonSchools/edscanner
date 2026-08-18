@@ -59,6 +59,7 @@ from ai_matcher import (
     test_ollama_endpoints,
 )
 from import_districts import ImportErrorWithContext, import_districts
+from help_content import NCES_TABLE_URL, help_topic as get_help_topic, help_topic_list
 from search_engine import (
     RunDebugLogger,
     SearchSettings,
@@ -69,6 +70,7 @@ from search_engine import (
     export_search_run_csv,
     normalize_search_method,
     parse_optional_int,
+    parse_search_query,
 )
 from board.web import bp as board_blueprint, start_board_worker
 
@@ -208,13 +210,56 @@ def highlight(text: str | None, query_text: str | None) -> Markup:
     query_text = str(query_text or "").strip()
     if not text or not query_text:
         return escape(text)
-    pattern = re.compile(re.escape(query_text), re.IGNORECASE)
+    try:
+        parsed_query = parse_search_query(query_text)
+    except ValueError:
+        return escape(text)
+
+    spans: list[tuple[int, int]] = []
+    seen_terms: set[tuple[str, bool]] = set()
+    for term in parsed_query.positive_terms:
+        key = (term.text.casefold(), term.wildcard)
+        if key in seen_terms:
+            continue
+        seen_terms.add(key)
+        pattern_parts: list[str] = []
+        previous_was_space = False
+        for character in term.text:
+            if character.isspace():
+                if not previous_was_space:
+                    pattern_parts.append(r"\s+")
+                previous_was_space = True
+                continue
+            previous_was_space = False
+            if term.wildcard and character == "*":
+                pattern_parts.append(r"[\w'’\.\-]*")
+            elif term.wildcard and character == "?":
+                pattern_parts.append(r"[\w'’\.\-]")
+            else:
+                pattern_parts.append(re.escape(character))
+        expression = "".join(pattern_parts)
+        if term.wildcard:
+            expression = rf"(?<![\w'’]){expression}(?![\w'’])"
+        for match in re.finditer(expression, text, re.IGNORECASE):
+            if match.end() > match.start():
+                spans.append((match.start(), match.end()))
+
+    if not spans:
+        return escape(text)
+    spans.sort(key=lambda span: (span[0], -span[1]))
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
     parts: list[Markup] = []
     last = 0
-    for match in pattern.finditer(text):
-        parts.append(escape(text[last : match.start()]))
-        parts.append(Markup("<mark>") + escape(text[match.start() : match.end()]) + Markup("</mark>"))
-        last = match.end()
+    for start, end in merged:
+        parts.append(escape(text[last:start]))
+        parts.append(Markup("<mark>") + escape(text[start:end]) + Markup("</mark>"))
+        last = end
     parts.append(escape(text[last:]))
     return Markup("").join(parts)
 
@@ -774,6 +819,27 @@ def index():
     return render_template("index.html", stats=stats, recent_runs=recent_runs)
 
 
+@app.route("/help")
+def help_index():
+    return render_template("help_index.html", topics=help_topic_list())
+
+
+@app.route("/help/<slug>")
+def help_topic_page(slug: str):
+    topic = get_help_topic(slug)
+    if topic is None:
+        abort(404)
+    related_links = [
+        {"href": url_for(endpoint), "label": label}
+        for endpoint, label in topic.get("related", [])
+    ]
+    return render_template(
+        "help_topic.html",
+        topic=topic,
+        related_links=related_links,
+    )
+
+
 @app.route("/import", methods=["GET", "POST"])
 def import_page():
     summary = None
@@ -800,8 +866,30 @@ def import_page():
         }
         for path in discover_import_files()
     ]
+    zip_files = sorted(
+        (
+            {
+                "name": path.name,
+                "modified": datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            for path in IMPORTS_DIR.glob("*.zip")
+            if path.is_file()
+        ),
+        key=lambda item: (item["modified"], item["name"].casefold()),
+        reverse=True,
+    )
     stats = collect_db_stats()
-    return render_template("import.html", files=files, stats=stats, summary=summary)
+    return render_template(
+        "import.html",
+        files=files,
+        zip_files=zip_files,
+        stats=stats,
+        summary=summary,
+        imports_dir=str(IMPORTS_DIR.resolve()),
+        scan_requested=request.args.get("scan", "").casefold() in {"1", "true", "yes"},
+        scan_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        nces_table_url=NCES_TABLE_URL,
+    )
 
 
 @app.route("/settings", methods=["GET", "POST"])

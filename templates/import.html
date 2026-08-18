@@ -4,50 +4,103 @@
 
 {% block content %}
   <section class="page-heading">
-    <h2>Import Districts</h2>
-    <div class="metric-inline">
-      <span>Loaded districts</span>
-      <strong>{{ stats.district_count|fmt_int }}</strong>
+    <div>
+      <p class="eyebrow">District data</p>
+      <h2>Import Districts</h2>
+      <p class="status-note">Update the district directory that powers every district-based EdScanner module.</p>
     </div>
+    <div class="metric-inline"><span>Loaded districts</span><strong>{{ stats.district_count|fmt_int }}</strong></div>
   </section>
 
-  <section class="tool-surface">
-    <form method="post">
-      <label for="source_file">Source file</label>
-      <select id="source_file" name="source_file">
-        <option value="__auto__">Auto-select newest import file</option>
-        {% for file in files %}
-          <option value="{{ file.name }}">{{ file.name }}</option>
-        {% endfor %}
-      </select>
-      <button type="submit">Run import</button>
-    </form>
+  <section class="guidance-card nces-guide" aria-labelledby="nces-guide-title">
+    <div class="guidance-heading">
+      <div>
+        <p class="module-kicker">Step 1</p>
+        <h3 id="nces-guide-title">Download the current NCES district table</h3>
+      </div>
+      <a class="button-link" href="{{ nces_table_url }}" target="_blank" rel="noopener">Open NCES ELSI</a>
+    </div>
+    <ol class="instruction-steps">
+      <li>Open the NCES ELSI Table Generator. In the <strong>Table ID</strong> box on the top bar, enter <code>658416</code>, then click <strong>Go</strong>.</li>
+      <li>Select <strong>OK</strong> on the message that appears and wait for the saved table to load.</li>
+      <li>Click the <strong>CSV</strong> button above the data table and save the ZIP file in EdScanner's imports folder.</li>
+      <li>Unpack the ZIP file. Make sure the extracted CSV is directly inside the imports folder shown below.</li>
+    </ol>
+    <div class="folder-callout">
+      <span>Imports folder</span>
+      <code>{{ imports_dir }}</code>
+    </div>
+    <p class="guidance-note">EdScanner scans this folder whenever this page loads. Use the button below after copying or extracting a new file so the updated list is obvious.</p>
   </section>
 
-  <section class="content-section">
-    <h2>Available Files</h2>
-    {% if files %}
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Size</th>
-            <th>Modified</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for file in files %}
-            <tr>
-              <td>{{ file.name }}</td>
-              <td>{{ file.size|fmt_int }} bytes</td>
-              <td>{{ file.modified }}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% else %}
-      <p class="empty">No CSV or XLSX files found in imports.</p>
+  <section class="content-section" id="available-files">
+    <div class="section-heading-row">
+      <div>
+        <p class="module-kicker">Step 2</p>
+        <h2>Scan and Choose a File</h2>
+      </div>
+      <form method="get" action="{{ url_for('import_page') }}" class="inline-action">
+        <input type="hidden" name="scan" value="1">
+        <button type="submit" class="secondary">Scan imports folder</button>
+      </form>
+    </div>
+    {% if scan_requested %}
+      <div class="message success">Scan completed at {{ scan_time }}. Found {{ files|length }} supported data file{% if files|length != 1 %}s{% endif %}{% if zip_files %} and {{ zip_files|length }} ZIP archive{% if zip_files|length != 1 %}s{% endif %}{% endif %}.</div>
     {% endif %}
+
+    {% if zip_files %}
+      <div class="message info">
+        <strong>ZIP archive{% if zip_files|length != 1 %}s{% endif %} still need extraction:</strong>
+        {% for archive in zip_files %}<code>{{ archive.name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.
+        Extract the CSV into this same folder, then scan again.
+      </div>
+    {% endif %}
+
+    {% if files %}
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Action</th></tr></thead>
+          <tbody>
+            {% for file in files %}
+              <tr>
+                <td><strong>{{ file.name }}</strong>{% if loop.first %}<div class="status-note">Newest file</div>{% endif %}</td>
+                <td>{{ file.size|fmt_int }} bytes</td>
+                <td>{{ file.modified }}</td>
+                <td>
+                  <form method="post" action="{{ url_for('import_page') }}" class="inline-action">
+                    <input type="hidden" name="source_file" value="{{ file.name }}">
+                    <button type="submit">Import this file</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="empty-state">
+        <strong>No CSV or Excel files found.</strong>
+        <p>Download and extract the NCES file into <code>{{ imports_dir }}</code>, then scan again.</p>
+      </div>
+    {% endif %}
+  </section>
+
+  <section class="tool-surface import-tool-surface">
+    <div>
+      <p class="module-kicker">Step 3</p>
+      <h3>Run the Import</h3>
+      <p class="status-note">Choose a specific file, or let EdScanner use the newest supported file found above.</p>
+    </div>
+    <form method="post" class="import-form">
+      <div>
+        <label for="source_file">Import source</label>
+        <select id="source_file" name="source_file" {% if not files %}disabled{% endif %}>
+          <option value="__auto__">Auto-select newest import file</option>
+          {% for file in files %}<option value="{{ file.name }}">{{ file.name }}</option>{% endfor %}
+        </select>
+      </div>
+      <button type="submit" {% if not files %}disabled{% endif %}>Run import</button>
+    </form>
   </section>
 
   {% if summary %}
@@ -64,24 +117,14 @@
       </div>
       <table class="key-table">
         <tbody>
-          <tr>
-            <th>Source</th>
-            <td><code>{{ summary.source_file }}</code></td>
-          </tr>
-          <tr>
-            <th>Header row</th>
-            <td>{{ summary.header_row_number }}</td>
-          </tr>
-          <tr>
-            <th>Website field</th>
-            <td>{{ summary.field_mapping.website }}</td>
-          </tr>
-          <tr>
-            <th>Enrollment field</th>
-            <td>{{ summary.field_mapping.total_enrollment_excludes_ae }}</td>
-          </tr>
+          <tr><th>Source</th><td><code>{{ summary.source_file }}</code></td></tr>
+          <tr><th>Header row</th><td>{{ summary.header_row_number }}</td></tr>
+          <tr><th>Website field</th><td>{{ summary.field_mapping.website }}</td></tr>
+          <tr><th>Enrollment field</th><td>{{ summary.field_mapping.total_enrollment_excludes_ae }}</td></tr>
         </tbody>
       </table>
     </section>
   {% endif %}
+
+  <p class="page-help-link">Need more detail? <a href="{{ url_for('help_topic_page', slug='import-districts') }}">Read the Importing Districts guide</a>.</p>
 {% endblock %}

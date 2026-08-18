@@ -3,7 +3,7 @@
 {% block title %}Search Board Records - EdScanner{% endblock %}
 
 {% block content %}
-  <section class="page-heading"><div><h2>Search Board Records</h2><p class="status-note">Search meeting titles, structured agenda items, motions, votes, minutes, and extracted documents.</p></div>{% if query %}<div class="metric-inline"><span>Results</span><strong>{{ total|fmt_int }}</strong></div>{% endif %}</section>
+  <section class="page-heading"><div><h2>Search Board Records</h2><p class="status-note">Search meeting titles, structured agenda items, motions, votes, minutes, and extracted documents.</p></div>{% if query %}<div class="action-row"><div class="metric-inline"><span>Results</span><strong>{{ total|fmt_int }}</strong></div><a class="button-link" href="{{ export_url }}">Export results CSV</a></div>{% endif %}</section>
   {% include "_board_nav.html" %}
   <section class="tool-surface"><form method="get" class="search-form">
     <div class="wide"><label for="q">Keywords or quoted phrase</label><input id="q" name="q" value="{{ query }}" required placeholder='community schools or "cell phone policy"'></div>

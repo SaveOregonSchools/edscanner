@@ -1,7 +1,8 @@
 # EdScanner
 
 EdScanner is a local Flask web application for importing public school district
-data and searching district websites for keywords or exact text strings.
+data, searching district websites with simple or structured queries, and
+monitoring public district records over time.
 
 The current version imports NCES/ELSI district exports into SQLite, provides
 dashboard and district-browsing views, queues website searches in a background
@@ -11,7 +12,10 @@ built-in search profiles to reduce dependence on third-party search APIs. A
 labor-agreement discovery workflow finds and keeps separate contract packages
 for each district bargaining unit. A School Boards module discovers public
 meeting portals, incrementally collects structured agendas and documents,
-preserves revisions, and exposes cross-district full-text search.
+preserves revisions, exposes cross-district full-text search, and can schedule
+selected working board sources for recurring checks. The two-column home screen
+is the application launcher, while the compact header provides Home, Help, and
+Settings.
 
 ## Local Setup
 
@@ -43,8 +47,20 @@ not depend on the browser staying open.
 
 ## Import Districts
 
-Place a `.csv` or `.xlsx` district source file in `imports\`, then import it
-from the Import page or run:
+To retrieve the current saved NCES/ELSI table:
+
+1. Open the [NCES ELSI Table Generator](https://nces.ed.gov/ccd/elsi/tablegenerator.aspx).
+2. Enter Table ID `658416` in the top bar and click **Go**.
+3. Select **OK** on the message, then wait for the table to load.
+4. Click **CSV** above the table and save the ZIP file in `imports\`.
+5. Extract the ZIP so its CSV file is directly inside `imports\`.
+
+The Import page scans `imports\` every time it loads. **Scan imports folder**
+performs an explicit refresh, identifies ZIP files that still need extraction,
+and lists each supported CSV/XLSX/XLS file with its own import button. The
+general form can also auto-select the newest supported file.
+
+You can instead import from the command line:
 
 ```powershell
 py import_districts.py --auto
@@ -65,18 +81,23 @@ HTTP.
 
 ## Pages
 
-- Home: database summary, state coverage, import status, and recent runs.
-- Import: load district source files from `imports\`.
-- Search: configure filters and run website searches.
+- Home: a two-column, color-coded launcher for every application module, plus
+  database status and recent district searches.
+- Help: task-oriented workflow guides, query instructions, status definitions,
+  and a district/agency-type glossary.
+- Import Districts: retrieve and load district source files from `imports\`.
 - Search Profiles: discover and inspect district built-in search profiles.
-- Contracts: discover licensed, classified, substitute, administrator,
+- Search Websites: configure filters and run simple or advanced website queries.
+- Labor Agreements: discover licensed, classified, substitute, administrator,
   transportation, service, and other bargaining-unit agreement packages.
 - School Boards: discover public meeting sources, run incremental or historical
-  syncs, inspect meetings and evidence, review run history, and search collected
-  agenda items and documents.
+  syncs, inspect meetings and evidence, schedule recurring monitoring, review
+  run history, and search collected agenda items and documents.
 - Districts: browse imported districts, filter by state/name, and sort columns.
 - Settings: configure Brave Search and optional ordered Ollama server endpoints.
 
+Operational modules are launched from Home instead of crowding the main header.
+School Board pages retain a contextual subnavigation for their related workflow.
 The header includes the Save Oregon Schools logo linking to
 `https://www.saveoregonschools.com/`, and the footer includes the Save Oregon
 Schools copyright, source code, license, and trademark notice links.
@@ -97,7 +118,8 @@ Brave-backed search modes require a saved key. Crawler-only mode does not.
 
 ## Search
 
-Use the Search page to enter a keyword or phrase and optional filters:
+Use the Search page to enter a simple phrase or advanced expression and optional
+filters:
 
 - one or more states
 - one or more agency types
@@ -110,9 +132,21 @@ Use the Search page to enter a keyword or phrase and optional filters:
 - follow depth for API-returned pages
 - debug logging
 
-Current search syntax is simple case-insensitive text matching. Enter one word
-or an exact phrase, such as `calendar` or `community schools`. Boolean logic,
-wildcards, and quote parsing are not currently supported.
+Plain multiword input retains the original exact-phrase behavior, so
+`community schools` searches for that phrase. Advanced syntax supports:
+
+- uppercase `AND`, `OR`, and `NOT`, with `NOT` evaluated before `AND`, then `OR`
+- parentheses for grouping, such as `budget AND (audit OR counsel*) NOT draft`
+- quoted phrases, such as `"school board"`
+- `*` for zero or more word characters and `?` for exactly one word character,
+  such as `counsel*` or `bud?et`
+
+EdScanner parses and validates the expression before creating a run. For a
+district-native search, it translates the retrieval query according to the
+saved profile's provider capabilities. Providers without Boolean support receive
+a bounded set of conservative query variants. Regardless of provider behavior,
+EdScanner fetches candidate content and verifies the complete expression locally
+before storing a result.
 
 The Search page previews the matching district count. For Brave or Hybrid runs,
 it also estimates API calls and approximate listed API cost based on the current
@@ -244,7 +278,7 @@ search stops at the next page or district boundary.
 
 ## School Board Monitoring
 
-Open **School Boards** from the main navigation. The module provides a complete
+Open a School Board action from the Home screen. The module provides a complete
 workflow for public school-board records:
 
 1. **Discover Sources** follows high-signal governance links on district sites
@@ -258,6 +292,8 @@ workflow for public school-board records:
 4. **Search** uses SQLite FTS5 when available (with a LIKE fallback) across
    meetings, agenda items, motions/votes, and extracted document text. Every hit
    retains its district, meeting, entity, retrieval date, and original URL.
+5. **Schedules** keeps selected active, working sources current with daily,
+   weekly, or monthly monitoring runs.
 
 Source and sync runs are persisted before they enter the in-process board queue.
 Their per-district/source work items make restart recovery and historical
@@ -288,6 +324,30 @@ Board documents are content-addressed on disk rather than stored as SQLite
 BLOBs. PDF, HTML, plain text, and DOCX extraction are supported. Image-only PDFs
 are retained with a `no_text` status so OCR can be added later; unsupported and
 oversized documents are recorded with explicit extraction statuses.
+
+### Scheduled Board Monitoring
+
+Create a schedule for an active, working source from **School Boards →
+Schedules** or from that source's row. Each source can have one schedule:
+
+- daily at the selected local time
+- weekly on a selected Monday–Sunday
+- monthly on day 1–31 at the selected time
+
+Time entry uses an explicit hour, minute, and AM/PM. A monthly day that does not
+exist is clamped to that month's final day, so day 31 becomes April 30 and
+February 28 or 29 as appropriate. Times use the local wall clock of the computer
+running EdScanner.
+
+The scheduler stores its next occurrence and history in SQLite. Atomic expiring
+claims and a unique occurrence ledger prevent duplicate dispatch when multiple
+workers poll. A due schedule creates an ordinary exact-source monitor run, which
+appears in Board Runs and preserves the normal progress, failure, and evidence
+behavior. An already queued or running sync for the same source is not overlapped.
+After downtime, at most one catch-up occurrence is created before the next future
+time is calculated. Schedules can be edited, paused, and re-enabled without
+deleting earlier runs or collected records. The scheduler runs with the existing
+board worker and is disabled by `EDSCANNER_DISABLE_WORKER=1` during tests.
 
 An optional read-only developer probe verifies a public source without writing
 meeting or document rows:
@@ -388,7 +448,8 @@ events. When a debug log exists, the run detail page shows a `Debug log` link.
 
 ## Exports
 
-Each run can be exported to CSV from the run detail page. Exports include:
+District website search runs can be exported to CSV from their run-detail page.
+Those exports include:
 
 - run ID and query
 - district details
@@ -400,6 +461,20 @@ Each run can be exported to CSV from the run detail page. Exports include:
 - search source
 - score
 - snippet
+
+The School Board module also provides CSV exports for:
+
+- the complete filtered Sources view
+- the complete filtered Meetings explorer
+- filtered Board Search results with meeting, agenda-item/document, retrieval,
+  and original-public-source provenance
+- discovery-run and sync-run item ledgers with per-district/source status,
+  counters, timing, and errors
+
+Export links preserve active filters but intentionally omit pagination so the
+CSV contains the full filtered result set. Columns and row ordering are stable,
+dates and required queries are validated, missing runs return 404, and text
+cells are guarded against spreadsheet-formula interpretation.
 
 Generated exports are written under `exports\` and are ignored by Git.
 
@@ -513,8 +588,11 @@ CSV export, debug-log creation, and cancellation before run start. School-board
 tests use checked-in HTML/JSON fixtures and local/fake HTTP only; they cover all
 platform detectors/parsers plus source discovery boundaries, BoardBook
 normalization, persistence, revision history, document extraction, FTS, sync
-idempotency, cancellation, and Flask routes. Live websites are never required by
-the ordinary test suite.
+idempotency, cancellation, scheduler calculation/claims/concurrency, and Flask
+routes. Advanced-query tests cover parsing, provider translation, local matching,
+and safe syntax errors. Home, Help, and Import route tests cover the module
+launcher and NCES workflow. Live websites are never required by the ordinary
+test suite.
 
 ## License
 
@@ -534,8 +612,11 @@ project's trademark and branding notice.
 - Searches depend on the local Flask worker process staying open.
 - Search profile discovery batches launched from the web UI are capped and run
   through the local Flask worker process.
-- Search matching is simple case-insensitive word or phrase matching.
-- Boolean operators, wildcards, and quote parsing are not implemented.
+- Search operators are intentionally uppercase; lowercase words such as `and`
+  remain ordinary search text for backward compatibility.
+- Search-profile providers vary in native query support, so retrieval can use
+  multiple conservative variants before EdScanner verifies the expression
+  locally.
 - Brave mode consumes one API request per district searched.
 - PDF parsing is basic and limited by file size.
 - Scanned image-only agreements are flagged by their missing extracted text;
@@ -556,5 +637,5 @@ project's trademark and branding notice.
 - AI-assisted match classification
 - semantic search
 - richer PDF-first search workflows
-- scheduled school-board monitoring and saved board-record watchlists
+- saved board-record watchlists and change notifications
 - saved search projects and watchlists

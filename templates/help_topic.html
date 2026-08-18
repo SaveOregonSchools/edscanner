@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block title %}{{ topic.title }} Help - EdScanner{% endblock %}
+
+{% block content %}
+  <nav class="breadcrumbs" aria-label="Breadcrumb">
+    <a href="{{ url_for('help_index') }}">Help</a>
+    <span aria-hidden="true">/</span>
+    <span>{{ topic.title }}</span>
+  </nav>
+
+  <section class="page-heading help-heading">
+    <div>
+      <p class="eyebrow">EdScanner guide</p>
+      <h2>{{ topic.title }}</h2>
+      <p class="help-summary">{{ topic.summary }}</p>
+    </div>
+  </section>
+
+  {% if topic.steps %}
+    <section class="help-section">
+      <h3>Recommended workflow</h3>
+      <ol class="workflow-steps">
+        {% for title, description in topic.steps %}
+          <li>
+            <div>
+              <strong>{{ title }}</strong>
+              <p>{{ description }}</p>
+            </div>
+          </li>
+        {% endfor %}
+      </ol>
+    </section>
+  {% endif %}
+
+  {% for section in topic.sections or [] %}
+    <section class="help-section">
+      <h3>{{ section.title }}</h3>
+      {% for paragraph in section.paragraphs or [] %}<p>{{ paragraph }}</p>{% endfor %}
+      {% if section.bullets %}
+        <ul class="help-list">
+          {% for bullet in section.bullets %}<li>{{ bullet }}</li>{% endfor %}
+        </ul>
+      {% endif %}
+      {% if section.terms %}
+        <dl class="term-list">
+          {% for term, definition in section.terms %}
+            <div>
+              <dt>{{ term }}</dt>
+              <dd>{{ definition }}</dd>
+            </div>
+          {% endfor %}
+        </dl>
+      {% endif %}
+    </section>
+  {% endfor %}
+
+  {% if topic.external_links %}
+    <section class="help-section compact-help-section">
+      <h3>Official resources</h3>
+      <div class="action-row">
+        {% for href, label in topic.external_links %}
+          <a class="button-link" href="{{ href }}" target="_blank" rel="noopener">{{ label }}</a>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  {% if related_links %}
+    <section class="help-section compact-help-section">
+      <h3>Continue in EdScanner</h3>
+      <div class="action-row">
+        {% for link in related_links %}<a class="button-link" href="{{ link.href }}">{{ link.label }}</a>{% endfor %}
+      </div>
+    </section>
+  {% endif %}
+{% endblock %}

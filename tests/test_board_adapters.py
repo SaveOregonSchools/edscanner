@@ -10,8 +10,13 @@ from board.adapters.civicclerk import CivicClerkAdapter
 from board.adapters.diligent_community import DiligentCommunityAdapter
 from board.adapters.generic import GenericBoardAdapter
 from board.adapters.simbli import SimbliAdapter
-from board.discovery import board_url_allowed, extract_board_candidates
-from board.models import BoardSource
+from board.discovery import (
+    BoardSourceCandidate,
+    _outcome_from_adapter_result,
+    board_url_allowed,
+    extract_board_candidates,
+)
+from board.models import BoardSource, BoardSourceResult, DetectionResult
 
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "board"
@@ -22,6 +27,39 @@ def fixture_bytes(name: str) -> bytes:
 
 
 class BoardDiscoveryFixtureTests(unittest.TestCase):
+    def test_adapter_confidence_is_normalized_without_rescaling_candidate_scores(self):
+        candidate = BoardSourceCandidate(
+            url="https://meetings.boardbook.org/Public/Organization/2221",
+            text="Board meetings",
+            discovered_from_url="https://district.example/board",
+            score=73,
+            known_platform="boardbook",
+        )
+        source = BoardSource(
+            platform="boardbook",
+            public_url=candidate.url,
+            external_source_id="2221",
+        )
+
+        detected = _outcome_from_adapter_result(
+            BoardSourceResult(
+                detection=DetectionResult(True, "boardbook", 0.99),
+                source=source,
+            ),
+            candidate,
+        )
+        candidate_only = _outcome_from_adapter_result(
+            BoardSourceResult(
+                detection=DetectionResult(False, "boardbook", 0.0),
+                source=None,
+                status="manual_review",
+            ),
+            candidate,
+        )
+
+        self.assertEqual(detected.confidence, 99)
+        self.assertEqual(candidate_only.confidence, 73)
+
     def test_known_vendor_links_are_allowed_and_unrelated_external_link_is_rejected(self):
         district_url = "https://district.example/"
         known_urls = (

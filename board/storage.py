@@ -202,7 +202,6 @@ def upsert_board_source(
     if not source_url:
         raise ValueError("A board source URL is required.")
     status = (_text(value_of(source, "source_status", "status")) or "manual_review").casefold()
-    promote_to_current = status not in {"not_found", "error"}
     now = utc_now_iso()
     last_discovered_at = _optional_text(value_of(source, "last_discovered_at")) or now
     last_checked_at = _optional_text(value_of(source, "last_checked_at")) or now
@@ -211,11 +210,28 @@ def upsert_board_source(
     with connect_db(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         existing_active = conn.execute(
-            "SELECT id FROM board_sources WHERE district_id = ? AND is_active = 1 LIMIT 1",
+            """
+            SELECT id, platform, source_url, source_status
+            FROM board_sources
+            WHERE district_id = ? AND is_active = 1
+            LIMIT 1
+            """,
             (int(district_id),),
         ).fetchone()
-        if existing_active is None:
-            promote_to_current = True
+        is_exact_current = bool(
+            existing_active is not None
+            and str(existing_active["platform"]).casefold() == platform
+            and canonicalize_url(existing_active["source_url"]).casefold()
+            == source_url.casefold()
+        )
+        # A known-good current source must not be displaced by a weaker lead.
+        # The current source itself remains current when its latest health check
+        # changes status, so operators retain one stable source history record.
+        promote_to_current = (
+            status == "working"
+            or is_exact_current
+            or (existing_active is None and status not in {"not_found", "error"})
+        )
         if promote_to_current:
             conn.execute(
                 """
@@ -248,10 +264,7 @@ def upsert_board_source(
                 ),
                 confidence = excluded.confidence,
                 requires_javascript = excluded.requires_javascript,
-                is_active = CASE
-                    WHEN excluded.is_active = 1 THEN 1
-                    ELSE board_sources.is_active
-                END,
+                is_active = excluded.is_active,
                 superseded_at = CASE
                     WHEN excluded.is_active = 1 THEN NULL
                     ELSE board_sources.superseded_at

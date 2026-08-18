@@ -765,6 +765,52 @@ def init_db(db_path: Path | str | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_board_sync_items_run_status
                 ON board_sync_run_items(run_id, status);
 
+            CREATE TABLE IF NOT EXISTS board_sync_schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                board_source_id INTEGER NOT NULL UNIQUE
+                    REFERENCES board_sources(id) ON DELETE CASCADE,
+                frequency TEXT NOT NULL,
+                weekday INTEGER,
+                day_of_month INTEGER,
+                hour_24 INTEGER NOT NULL,
+                minute INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                next_run_at TEXT NOT NULL,
+                last_scheduled_for TEXT,
+                last_run_at TEXT,
+                last_sync_run_id INTEGER
+                    REFERENCES board_sync_runs(id) ON DELETE SET NULL,
+                last_error TEXT,
+                claim_token TEXT,
+                claim_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (frequency IN ('daily', 'weekly', 'monthly')),
+                CHECK (weekday IS NULL OR weekday BETWEEN 0 AND 6),
+                CHECK (day_of_month IS NULL OR day_of_month BETWEEN 1 AND 31),
+                CHECK (hour_24 BETWEEN 0 AND 23),
+                CHECK (minute BETWEEN 0 AND 59)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_sync_schedules_due
+                ON board_sync_schedules(enabled, next_run_at, claim_expires_at);
+
+            CREATE TABLE IF NOT EXISTS board_sync_schedule_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_id INTEGER NOT NULL
+                    REFERENCES board_sync_schedules(id) ON DELETE CASCADE,
+                scheduled_for TEXT NOT NULL,
+                board_sync_run_id INTEGER
+                    REFERENCES board_sync_runs(id) ON DELETE SET NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(schedule_id, scheduled_for)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_sync_schedule_events_run
+                ON board_sync_schedule_events(board_sync_run_id);
+
             CREATE TABLE IF NOT EXISTS board_meetings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,

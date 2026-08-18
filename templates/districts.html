@@ -4,10 +4,16 @@
 
 {% block content %}
   <section class="page-heading">
-    <h2>Districts</h2>
-    <div class="metric-inline">
-      <span>Rows</span>
-      <strong>{{ total|fmt_int }}</strong>
+    <div>
+      <h2>Districts</h2>
+      <p class="status-note">Review the imported NCES directory and website coverage.</p>
+    </div>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('help_topic_page', slug='glossary') }}">Field glossary</a>
+      <div class="metric-inline">
+        <span>Rows</span>
+        <strong>{{ total|fmt_int }}</strong>
+      </div>
     </div>
   </section>
 

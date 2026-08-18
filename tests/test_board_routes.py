@@ -147,6 +147,12 @@ class BoardRouteSmokeTests(unittest.TestCase):
                 endpoint=endpoint,
                 view_func=lambda endpoint=endpoint: endpoint,
             )
+        app.add_url_rule("/help", endpoint="help_index", view_func=lambda: "help")
+        app.add_url_rule(
+            "/help/<slug>",
+            endpoint="help_topic_page",
+            view_func=lambda slug: slug,
+        )
         app.register_blueprint(board_blueprint)
         app.jinja_env.filters["fmt_int"] = lambda value: f"{int(value or 0):,}"
         app.jinja_env.filters["fmt_dt"] = lambda value: str(value or "")
