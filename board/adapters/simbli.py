@@ -33,10 +33,12 @@ _VIEW_MEETING = re.compile(
     r"ViewMeeting\(\s*['\"](?P<site>[^'\"]+)['\"]\s*,\s*['\"](?P<meeting>[^'\"]+)['\"]",
     re.IGNORECASE,
 )
+_SITE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
 def _site_id(url: str) -> str | None:
-    return query_value(url, "S", "site", "siteid")
+    value = query_value(url, "S", "site", "siteid")
+    return value if value and _SITE_ID.fullmatch(value) else None
 
 
 class SimbliAdapter(BoardPlatformAdapter):
@@ -46,7 +48,7 @@ class SimbliAdapter(BoardPlatformAdapter):
     def detect(self, url: str, html: Content | None = None) -> DetectionResult:
         parsed = urlsplit(url)
         host = (parsed.hostname or "").casefold()
-        host_match = host == "simbli.eboardsolutions.com" or host.endswith(".eboardsolutions.com")
+        host_match = host == "simbli.eboardsolutions.com"
         path_match = any(
             marker in parsed.path.casefold()
             for marker in ("/sb_meetings/", "/index.aspx", "/viewmeeting.aspx")
@@ -63,18 +65,26 @@ class SimbliAdapter(BoardPlatformAdapter):
                 "simbli",
             )
         )
-        matched = bool((host_match and path_match) or (host_match and html_match) or html_match)
         site_id = _site_id(url)
+        matched = bool(host_match and path_match and site_id)
         canonical = (
-            f"{origin_for(url)}/SB_Meetings/SB_MeetingListing.aspx?{urlencode({'S': site_id})}"
-            if matched and site_id
-            else url if matched else None
+            f"https://simbli.eboardsolutions.com/SB_Meetings/SB_MeetingListing.aspx?{urlencode({'S': site_id})}"
+            if matched
+            else None
         )
         return DetectionResult(
             matched=matched,
             platform=self.platform_name,
-            confidence=0.98 if host_match and path_match else 0.91 if html_match else 0.0,
-            reason=("Public Simbli/eBOARDsolutions portal detected." if matched else "No Simbli markers found."),
+            confidence=0.98 if matched else 0.0,
+            reason=(
+                "Public Simbli meeting portal and site ID detected."
+                if matched
+                else (
+                    "Simbli branding was found without a canonical meeting URL and site ID."
+                    if html_match
+                    else "No canonical Simbli meeting URL and site ID found."
+                )
+            ),
             canonical_url=canonical,
             requires_javascript=True,
             metadata={"external_source_id": site_id, "site_id": site_id},
@@ -89,7 +99,7 @@ class SimbliAdapter(BoardPlatformAdapter):
         source = super().parse_source(content, url, district)
         site_id = source.external_source_id or _site_id(url)
         if site_id:
-            source.public_url = f"{origin_for(url)}/SB_Meetings/SB_MeetingListing.aspx?{urlencode({'S': site_id})}"
+            source.public_url = f"https://simbli.eboardsolutions.com/SB_Meetings/SB_MeetingListing.aspx?{urlencode({'S': site_id})}"
             source.metadata["site_id"] = site_id
         source.requires_javascript = True
         return source

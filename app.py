@@ -74,6 +74,7 @@ from search_engine import (
     parse_search_query,
 )
 from board.web import bp as board_blueprint, start_board_worker
+from board.storage import audit_legacy_working_board_sources
 
 
 configure_logging()
@@ -83,6 +84,18 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("EDSCANNER_SECRET_KEY") or secrets.token_hex(32)
 app.register_blueprint(board_blueprint)
 LOGGER = logging.getLogger(__name__)
+try:
+    _board_source_audit = audit_legacy_working_board_sources()
+except Exception:
+    LOGGER.exception("Board source startup audit could not be completed.")
+else:
+    if _board_source_audit["repaired_ids"] or _board_source_audit["review_required"]:
+        LOGGER.warning(
+            "Board source startup audit repaired %s canonical identities and marked %s "
+            "legacy sources for manual review.",
+            len(_board_source_audit["repaired_ids"]),
+            len(_board_source_audit["review_required"]),
+        )
 SEARCH_QUEUE: queue.Queue[int] = queue.Queue()
 PROFILE_DISCOVERY_QUEUE: queue.Queue[int] = queue.Queue()
 CONTRACT_DISCOVERY_QUEUE: queue.Queue[int] = queue.Queue()

@@ -88,6 +88,28 @@ class BoardRouteSmokeTests(unittest.TestCase):
             debug_logging=False,
             db_path=self.db_path,
         )
+        with connect_db(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE board_discovery_runs
+                SET website_moves_accepted = 1
+                WHERE id = ?
+                """,
+                (self.discovery_run_id,),
+            )
+            conn.execute(
+                """
+                UPDATE board_discovery_run_items
+                SET website_original_url = ?, website_final_url = ?
+                WHERE run_id = ?
+                """,
+                (
+                    "https://old-district.example/",
+                    "https://district.example/",
+                    self.discovery_run_id,
+                ),
+            )
+            conn.commit()
         self.sync_run_id = create_board_sync_run(
             states=["OR"],
             platforms=["boardbook"],
@@ -198,6 +220,9 @@ class BoardRouteSmokeTests(unittest.TestCase):
                 f"Board Source Discovery #{self.discovery_run_id}",
                 "Route Test District",
                 "Rediscover district sites, including districts with saved sources",
+                "Website moves accepted",
+                "old-district.example",
+                "district.example",
             ),
             (
                 f"/school-boards/sync-runs/{self.sync_run_id}",

@@ -274,19 +274,24 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                         "title": "Challenges and provider directories",
                         "paragraphs": [
                             "When a district page returns a likely access challenge, EdScanner can try that page once with a real Chromium browser. A separately bounded browser recovery handles connection-stack or certificate-chain failures without disabling TLS verification. Rate limits and robots denials do not trigger the retry, and a remaining CAPTCHA or challenge is recorded for manual review rather than bypassed.",
+                            "Board discovery upgrades imported HTTP addresses to HTTPS and does not fall back to unencrypted HTTP. If the configured district homepage has moved to a different public HTTPS hostname, its initial top-level redirect is accepted as the current crawl base and recorded on the run detail page and in the export. This exception does not loosen redirect checks for later page, vendor, or document navigation; browser subresources remain subject to public-target and DNS-pinning checks and cannot authorize another move.",
                             "BoardBook publishes an organization directory, but the directory has names and opaque organization IDs without state. Provider-directory lookup is therefore disabled by default and must only be enabled after the operator confirms permission under the provider's current terms.",
-                            "When authorized, EdScanner fetches the directory once per discovery run, generates local name candidates, and requires state evidence plus a unique reciprocal NCES name-and-city match (or district-homepage evidence) before a source can become working. Ambiguous or state-less matches are never activated automatically.",
+                            "When authorized, EdScanner fetches the directory once per discovery run, generates local name candidates, and requires state evidence plus a unique reciprocal NCES name-and-city match (or district-homepage evidence) before a source can become working. Ambiguous or state-less matches are never activated automatically. Each run records whether directory lookup was requested, whether it loaded, and how many organizations it supplied.",
                         ],
                     },
                     {
                         "title": "Platform and source terms",
+                        "paragraphs": [
+                            "When EdScanner starts, it rechecks legacy working-source identities. A missing ID is repaired only from a canonical provider URL; an old provider wrapper or one-off generic page is retained as manual-review evidence. An operator-confirmed manual source is never automatically downgraded by this audit.",
+                        ],
                         "terms": [
                             ("BoardBook", "Sparq's public BoardBook Premier meeting and agenda portal."),
                             ("Diligent Community", "Current or legacy iCompass/Diligent public meeting portals and APIs."),
                             ("CivicClerk", "Modern CivicClerk public event and meeting portal."),
                             ("BoardDocs", "Legacy Diligent BoardDocs portal; some sites require browser rendering or manual review."),
-                            ("Simbli", "eBOARDsolutions/Simbli portal; some deployments return a browser challenge to ordinary HTTP."),
-                            ("Working source", "A current public portal EdScanner can identify and process."),
+                            ("Simbli", "eBOARDsolutions/Simbli portal; some deployments return a browser challenge to an ordinary HTTPS request."),
+                            ("Working source", "A current public portal EdScanner can identify and process. Known platforms must resolve to their canonical vendor host with a usable organization, tenant, or site ID; a district wrapper or policy-only link is not enough."),
+                            ("Generic source", "A durable district meeting hub or archive with repeated meeting/document evidence. A single news story or one-off event remains manual review."),
                             ("Platform changed/parser broken", "A previously working source now returns content the adapter cannot reliably interpret."),
                             ("Version", "An immutable historical snapshot created only when meaningful meeting or document content changes."),
                         ],
@@ -302,6 +307,7 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                             ("platform_changed_or_parser_broken", "A previously usable platform now returns an unexpected structure and needs adapter review."),
                             ("not_found", "In new discovery runs, at least one district page was inspected but no credible public board portal was found. Older results may predate this distinction; rediscover them if uncertain."),
                             ("error", "Discovery or sync could not complete because of a request, transport, parsing, or persistence error."),
+                            ("completed_with_errors", "The run saved usable results for some districts but one or more district items failed; inspect the item ledger or debug log."),
                         ],
                     },
                     {

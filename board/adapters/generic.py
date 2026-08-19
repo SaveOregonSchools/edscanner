@@ -55,6 +55,7 @@ _VIDEO_HOST_SUFFIXES = (
     "streamable.com",
     "boxcast.tv",
 )
+_ONE_OFF_CONTENT_SEGMENTS = {"article", "articles", "event", "events", "news"}
 
 
 def _stable_id(url: str) -> str:
@@ -88,6 +89,15 @@ def _video_url(url: str, text: str = "") -> bool:
     )
 
 
+def _is_one_off_content_url(url: str) -> bool:
+    segments = {
+        segment.casefold()
+        for segment in urlsplit(url).path.split("/")
+        if segment
+    }
+    return bool(segments & _ONE_OFF_CONTENT_SEGMENTS)
+
+
 class GenericBoardAdapter(BoardPlatformAdapter):
     platform_name = "generic"
 
@@ -95,6 +105,8 @@ class GenericBoardAdapter(BoardPlatformAdapter):
         url_score = _board_score("", url)
         score = url_score
         strong_links = 0
+        dated_meeting_links = 0
+        durable_hub = False
         organization_name = None
         if html:
             soup = html_soup(html)
@@ -107,15 +119,33 @@ class GenericBoardAdapter(BoardPlatformAdapter):
                 if _board_score(collapse_ws(anchor.get_text(" ", strip=True)), str(anchor.get("href"))) >= 3:
                     strong_links += 1
             score += min(strong_links, 4)
+            dated_meeting_links = len(
+                {meeting.url for meeting in self.parse_meeting_list(html, url)}
+            )
+            hub_context = f"{title_text} {url}".casefold()
+            hub_marked = any(
+                phrase in hub_context
+                for phrase in (*_BOARD_PHRASES, *_DOCUMENT_PHRASES)
+            )
+            durable_hub = (
+                dated_meeting_links >= 2
+                and hub_marked
+                and not _is_one_off_content_url(url)
+            )
         matched = score >= 4
-        confidence = min(0.78, 0.38 + score * 0.05) if matched else 0.0
+        confidence = (
+            0.78
+            if matched and durable_hub
+            else min(0.68, 0.38 + score * 0.05) if matched else 0.0
+        )
         host = (urlsplit(url).hostname or "").casefold()
         return DetectionResult(
             matched=matched,
             platform=self.platform_name,
             confidence=confidence,
             reason=(
-                f"Generic board page matched {score} points and {strong_links} strong links."
+                f"Generic board page matched {score} points, {strong_links} strong links, "
+                f"and {dated_meeting_links} dated meeting/document links."
                 if matched
                 else "Generic page lacks enough explicit school-board evidence."
             ),
@@ -125,6 +155,9 @@ class GenericBoardAdapter(BoardPlatformAdapter):
                 "organization_name": organization_name,
                 "evidence_score": score,
                 "strong_link_count": strong_links,
+                "dated_meeting_link_count": dated_meeting_links,
+                "durable_meeting_hub": durable_hub,
+                "one_off_content_url": _is_one_off_content_url(url),
             },
         )
 
@@ -135,7 +168,12 @@ class GenericBoardAdapter(BoardPlatformAdapter):
         district: Mapping[str, object] | None = None,
     ) -> BoardSource:
         source = super().parse_source(content, url, district)
-        source.status = "working" if self.detect(url, content).confidence >= 0.72 else "manual_review"
+        detection = self.detect(url, content)
+        source.status = (
+            "working"
+            if detection.metadata.get("durable_meeting_hub") is True
+            else "manual_review"
+        )
         return source
 
     def parse_meeting_list(

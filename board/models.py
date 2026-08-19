@@ -135,7 +135,12 @@ class BoardSourceResult:
 
     @property
     def organization_external_id(self) -> str | None:
-        return self.source.external_source_id if self.source is not None else None
+        if self.source is not None and self.source.external_source_id not in (None, ""):
+            return self.source.external_source_id
+        value = self.detection.metadata.get("external_source_id")
+        if value in (None, ""):
+            value = self.detection.metadata.get("organization_external_id")
+        return str(value) if value not in (None, "") else None
 
     @property
     def platform_tenant(self) -> str | None:

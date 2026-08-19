@@ -220,7 +220,7 @@ class ManualSourceValidationTests(unittest.TestCase):
         self.assertFalse(result.verified)
         self.assertEqual(result.source_status, "manual_review")
         self.assertIsNone(result.organization_external_id)
-        self.assertIn("enough public source evidence", result.error_message or "")
+        self.assertIn("supported board platform", result.error_message or "")
 
     def test_empty_success_response_cannot_be_activated(self):
         result = validate_manual_board_source(

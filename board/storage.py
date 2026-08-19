@@ -9,7 +9,7 @@ from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any
-from urllib.parse import urldefrag, urlparse, urlunparse
+from urllib.parse import parse_qs, urldefrag, urlparse, urlunparse
 
 from common import connect_db, init_db, utc_now_iso
 
@@ -204,6 +204,350 @@ def _is_confirmed_manual_source(raw: Any) -> bool:
         and metadata.get("operator_confirmed_district_identity") is True
         and metadata.get("verified") is True
     )
+
+
+_PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+_BOARDBOOK_SOURCE_PATH = re.compile(
+    r"^/Public/Organization/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/?$",
+    re.IGNORECASE,
+)
+_BOARDDOCS_SOURCE_PATH = re.compile(
+    r"^/([A-Za-z0-9][A-Za-z0-9_-]{0,127})/"
+    r"([A-Za-z0-9][A-Za-z0-9_-]{0,127})/Board\.nsf(?:/|$)",
+    re.IGNORECASE,
+)
+_ONE_OFF_GENERIC_SEGMENTS = {
+    "article",
+    "articles",
+    "event",
+    "events",
+    "news",
+}
+
+
+def _tenant_for_suffix(host: str, suffixes: Sequence[str]) -> str:
+    for suffix in suffixes:
+        if host.endswith(suffix):
+            tenant = host[: -len(suffix)]
+            return tenant if _PROVIDER_ID.fullmatch(tenant) else ""
+    return ""
+
+
+def _legacy_https_transport(parsed: Any) -> bool:
+    """Return whether a provider URL can be safely normalized to HTTPS."""
+
+    scheme = str(parsed.scheme or "").casefold()
+    if scheme not in {"http", "https"} or parsed.username or parsed.password:
+        return False
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return port in {None, 80} if scheme == "http" else port in {None, 443}
+
+
+def _legacy_repair(
+    row: Mapping[str, Any],
+    *,
+    canonical_url: str,
+    external_id: str | None = None,
+    tenant: str | None = None,
+) -> dict[str, Any] | None:
+    changes: dict[str, Any] = {"action": "repair"}
+    current_url = canonicalize_url(row.get("source_url"))
+    canonical_url = canonicalize_url(canonical_url)
+    if current_url.casefold() != canonical_url.casefold():
+        changes["source_url"] = canonical_url
+    if external_id and not str(row.get("organization_external_id") or "").strip():
+        changes["organization_external_id"] = external_id
+    if tenant and not str(row.get("platform_tenant") or "").strip():
+        changes["platform_tenant"] = tenant
+    return changes if len(changes) > 1 else None
+
+
+def _legacy_review(reason: str) -> dict[str, Any]:
+    return {"action": "review", "reason": reason}
+
+
+def _legacy_source_identity_update(row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return an identity repair or review reason for a legacy working source.
+
+    Only identities derivable from canonical public provider URLs are repaired.
+    Provider URLs are normalized to HTTPS at the same time. A district wrapper,
+    policy page, or one-off generic article is retained but can no longer remain
+    an automatically trusted working source.
+    """
+
+    if _is_confirmed_manual_source(row.get("raw_discovery_json")):
+        return None
+    platform = str(row.get("platform") or "").strip().casefold()
+    parsed = urlparse(str(row.get("source_url") or ""))
+    host = (parsed.hostname or "").casefold()
+    external_id = str(row.get("organization_external_id") or "").strip()
+    tenant_value = str(row.get("platform_tenant") or "").strip()
+
+    if platform == "boardbook":
+        match = _BOARDBOOK_SOURCE_PATH.match(parsed.path)
+        if host != "meetings.boardbook.org" or match is None:
+            return _legacy_review(
+                "BoardBook source is not a canonical organization URL."
+            )
+        if not _legacy_https_transport(parsed):
+            return _legacy_review(
+                "BoardBook source cannot be safely normalized to HTTPS."
+            )
+        derived = match.group(1)
+        if external_id and external_id.casefold() != derived.casefold():
+            return _legacy_review(
+                "BoardBook organization ID conflicts with the source URL."
+            )
+        return _legacy_repair(
+            row,
+            canonical_url=(
+                "https://meetings.boardbook.org/Public/Organization/" + derived
+            ),
+            external_id=derived,
+        )
+
+    if platform == "diligent_community":
+        derived = _tenant_for_suffix(
+            host,
+            (
+                ".community.diligentoneplatform.com",
+                ".diligent.community",
+                ".community.highbond.com",
+                ".civicweb.net",
+            ),
+        )
+        if not derived:
+            return _legacy_review(
+                "Diligent source is not on a canonical tenant host."
+            )
+        if not _legacy_https_transport(parsed):
+            return _legacy_review(
+                "Diligent source cannot be safely normalized to HTTPS."
+            )
+        for saved in (external_id, tenant_value):
+            if saved and saved.casefold() != derived.casefold():
+                return _legacy_review(
+                    "Diligent tenant ID conflicts with the source URL."
+                )
+        return _legacy_repair(
+            row,
+            canonical_url=f"https://{host}/Portal/",
+            external_id=derived,
+            tenant=derived,
+        )
+
+    if platform == "simbli":
+        query = parse_qs(parsed.query)
+        site_id = next(
+            (
+                str(value).strip()
+                for key, values in query.items()
+                if key.casefold() in {"s", "site", "siteid"}
+                for value in values[:1]
+                if _PROVIDER_ID.fullmatch(str(value).strip())
+            ),
+            "",
+        )
+        meeting_path = any(
+            marker in parsed.path.casefold()
+            for marker in ("/sb_meetings/", "/index.aspx", "/viewmeeting.aspx")
+        )
+        if host != "simbli.eboardsolutions.com" or not meeting_path or not site_id:
+            return _legacy_review(
+                "Simbli source lacks a canonical meeting URL and site ID."
+            )
+        if not _legacy_https_transport(parsed):
+            return _legacy_review(
+                "Simbli source cannot be safely normalized to HTTPS."
+            )
+        if external_id and external_id.casefold() != site_id.casefold():
+            return _legacy_review("Simbli site ID conflicts with the source URL.")
+        return _legacy_repair(
+            row,
+            canonical_url=(
+                "https://simbli.eboardsolutions.com/"
+                f"SB_Meetings/SB_MeetingListing.aspx?S={site_id}"
+            ),
+            external_id=site_id,
+        )
+
+    if platform == "boarddocs":
+        match = _BOARDDOCS_SOURCE_PATH.match(parsed.path)
+        if host != "go.boarddocs.com" or match is None:
+            return _legacy_review(
+                "BoardDocs source is not a canonical public tenant URL."
+            )
+        if not _legacy_https_transport(parsed):
+            return _legacy_review(
+                "BoardDocs source cannot be safely normalized to HTTPS."
+            )
+        state_slug, district_slug = match.groups()
+        derived = f"{state_slug}/{district_slug}"
+        if external_id and external_id.casefold() != derived.casefold():
+            return _legacy_review(
+                "BoardDocs source ID conflicts with the source URL."
+            )
+        return _legacy_repair(
+            row,
+            canonical_url=(
+                f"https://go.boarddocs.com/{state_slug}/{district_slug}/"
+                "Board.nsf/Public"
+            ),
+            external_id=derived,
+        )
+
+    if platform == "civicclerk":
+        derived = _tenant_for_suffix(
+            host,
+            (".portal.civicclerk.com", ".api.civicclerk.com"),
+        )
+        if not derived:
+            return _legacy_review(
+                "CivicClerk source is not on a canonical tenant host."
+            )
+        if not _legacy_https_transport(parsed):
+            return _legacy_review(
+                "CivicClerk source cannot be safely normalized to HTTPS."
+            )
+        for saved in (external_id, tenant_value):
+            if saved and saved.casefold() != derived.casefold():
+                return _legacy_review(
+                    "CivicClerk tenant ID conflicts with the source URL."
+                )
+        return _legacy_repair(
+            row,
+            canonical_url=f"https://{derived}.portal.civicclerk.com/",
+            external_id=derived,
+            tenant=derived,
+        )
+
+    if platform == "generic":
+        segments = {
+            segment.casefold()
+            for segment in parsed.path.split("/")
+            if segment
+        }
+        if segments & _ONE_OFF_GENERIC_SEGMENTS:
+            return _legacy_review(
+                "Generic source is a one-off news, article, or event URL."
+            )
+    return None
+
+
+def audit_legacy_working_board_sources(
+    *,
+    db_path: Path | str | None = None,
+    apply_changes: bool = True,
+) -> dict[str, Any]:
+    """Repair canonical IDs and flag legacy false-positive working sources.
+
+    Source rows and their evidence remain intact. Confirmed manual sources are
+    never changed. Returning IDs and reasons makes the migration auditable and
+    allows a dry-run before applying it to an existing database.
+    """
+
+    init_db(db_path)
+    repaired: list[int] = []
+    review_required: list[dict[str, Any]] = []
+    with connect_db(db_path) as conn:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, district_id, platform, source_url, source_status,
+                       organization_external_id, platform_tenant,
+                       raw_discovery_json
+                FROM board_sources
+                WHERE source_status = 'working'
+                ORDER BY id
+                """
+            )
+        ]
+        for row in rows:
+            update = _legacy_source_identity_update(row)
+            if update is None:
+                continue
+            action = str(update["action"])
+            source_id = int(row["id"])
+            if action == "repair":
+                repaired_url = str(update.get("source_url") or "").strip()
+                if repaired_url:
+                    conflict = conn.execute(
+                        """
+                        SELECT id FROM board_sources
+                        WHERE district_id = ? AND platform = ?
+                          AND source_url = ? COLLATE NOCASE AND id != ?
+                        LIMIT 1
+                        """,
+                        (
+                            int(row["district_id"]),
+                            row["platform"],
+                            repaired_url,
+                            source_id,
+                        ),
+                    ).fetchone()
+                    if conflict is not None:
+                        update = _legacy_review(
+                            "The canonical HTTPS URL already belongs to another "
+                            "source history row."
+                        )
+                        action = "review"
+            if action == "repair":
+                repaired.append(source_id)
+                if apply_changes:
+                    conn.execute(
+                        """
+                        UPDATE board_sources
+                        SET source_url = COALESCE(?, source_url),
+                            organization_external_id = COALESCE(
+                                ?, organization_external_id
+                            ),
+                            platform_tenant = COALESCE(?, platform_tenant),
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            update.get("source_url"),
+                            update.get("organization_external_id"),
+                            update.get("platform_tenant"),
+                            utc_now_iso(),
+                            source_id,
+                        ),
+                    )
+                continue
+            value = str(update["reason"])
+            review_required.append(
+                {
+                    "id": source_id,
+                    "platform": row["platform"],
+                    "source_url": row["source_url"],
+                    "reason": value,
+                }
+            )
+            if apply_changes:
+                conn.execute(
+                    """
+                    UPDATE board_sources
+                    SET source_status = 'manual_review',
+                        error_message = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        "Legacy working source requires revalidation: " + value,
+                        utc_now_iso(),
+                        source_id,
+                    ),
+                )
+        if apply_changes:
+            conn.commit()
+    return {
+        "checked": len(rows),
+        "repaired_ids": repaired,
+        "review_required": review_required,
+    }
 
 
 def upsert_board_source(
@@ -1040,6 +1384,7 @@ upsert_meeting = upsert_board_meeting
 
 
 __all__ = [
+    "audit_legacy_working_board_sources",
     "canonicalize_url",
     "content_hash",
     "deterministic_meeting_identity",

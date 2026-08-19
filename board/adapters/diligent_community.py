@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping
 from urllib.parse import urlencode, urlsplit
@@ -36,7 +37,20 @@ _HOST_SUFFIXES = (
     ".community.diligentoneplatform.com",
     ".diligent.community",
     ".community.highbond.com",
+    ".civicweb.net",
 )
+_TENANT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,126}[a-z0-9]$|^[a-z0-9]$", re.IGNORECASE)
+
+
+def _tenant(url: str) -> str | None:
+    host = (urlsplit(url).hostname or "").casefold()
+    for suffix in _HOST_SUFFIXES:
+        if not host.endswith(suffix):
+            continue
+        tenant = host[: -len(suffix)]
+        if _TENANT_ID.fullmatch(tenant):
+            return tenant
+    return None
 
 
 def _json_payload(content: Content) -> Any | None:
@@ -83,7 +97,8 @@ class DiligentCommunityAdapter(BoardPlatformAdapter):
     def detect(self, url: str, html: Content | None = None) -> DetectionResult:
         parsed = urlsplit(url)
         host = (parsed.hostname or "").casefold()
-        host_match = any(host.endswith(suffix) for suffix in _HOST_SUFFIXES)
+        tenant = _tenant(url)
+        host_match = tenant is not None
         path_match = parsed.path.casefold().startswith("/portal") or "/services/meetingsservice.svc/" in parsed.path.casefold()
         folded = content_text(html).casefold()
         html_match = any(
@@ -95,15 +110,22 @@ class DiligentCommunityAdapter(BoardPlatformAdapter):
                 "diligentoneplatform",
             )
         )
-        matched = bool((host_match and path_match) or (host_match and html_match) or html_match)
-        confidence = 0.98 if host_match and path_match else 0.93 if host_match else 0.86 if html_match else 0.0
-        canonical_url = f"{origin_for(url)}/Portal/" if matched else None
-        tenant = host.split(".", 1)[0] if host else None
+        matched = host_match
+        confidence = 0.98 if host_match and path_match else 0.95 if host_match else 0.0
+        canonical_url = f"https://{host}/Portal/" if matched else None
         return DetectionResult(
             matched=matched,
             platform=self.platform_name,
             confidence=confidence,
-            reason=("Diligent Community public portal detected." if matched else "No Diligent Community markers found."),
+            reason=(
+                "Diligent Community tenant portal detected."
+                if matched
+                else (
+                    "Diligent branding was found without a canonical tenant host."
+                    if html_match
+                    else "No canonical Diligent Community tenant host found."
+                )
+            ),
             canonical_url=canonical_url,
             requires_javascript=False,
             metadata={"external_source_id": tenant, "tenant": tenant},
@@ -116,8 +138,8 @@ class DiligentCommunityAdapter(BoardPlatformAdapter):
         district: Mapping[str, Any] | None = None,
     ) -> BoardSource:
         source = super().parse_source(content, url, district)
-        source.public_url = f"{origin_for(url)}/Portal/"
-        source.metadata["api_base"] = f"{origin_for(url)}/Services/MeetingsService.svc"
+        source.public_url = f"{origin_for(source.public_url)}/Portal/"
+        source.metadata["api_base"] = f"{origin_for(source.public_url)}/Services/MeetingsService.svc"
         return source
 
     def meeting_listing_url(

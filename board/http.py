@@ -21,6 +21,7 @@ import requests
 import truststore
 from requests.adapters import HTTPAdapter
 from requests.exceptions import SSLError
+from urllib3.util import create_urllib3_context
 
 from common import (
     BOARD_ALLOW_INSECURE_SSL_FALLBACK,
@@ -60,9 +61,73 @@ KNOWN_BOARD_VENDOR_FAMILIES = (
         "diligent.community",
         "community.diligent.com",
         "community.highbond.com",
+        "civicweb.net",
     ),
     ("civicclerk.com",),
 )
+NATIVE_TRUST_HOSTS = frozenset({"meetings.boardbook.org"})
+
+
+def _windows_server_auth_root_snapshot() -> tuple[bytes, ...]:
+    """Copy the Windows ROOT store entries trusted for TLS server auth.
+
+    ``truststore`` delegates chain construction to the operating system and may
+    perform platform-specific intermediate retrieval while a connection is in
+    progress. Ordinary board requests instead load this bounded snapshot into
+    OpenSSL before any network I/O, so their trust anchors cannot change during
+    a run and certificate verification remains local and deterministic.
+    """
+
+    enum_certificates = getattr(ssl, "enum_certificates", None)
+    if enum_certificates is None:
+        return ()
+    try:
+        entries = enum_certificates("ROOT")
+    except OSError:
+        LOGGER.warning("Unable to enumerate the Windows ROOT certificate store")
+        return ()
+
+    server_auth_oid = ssl.Purpose.SERVER_AUTH.oid
+    certificates: list[bytes] = []
+    seen: set[bytes] = set()
+    for certificate, encoding, trust in entries:
+        if encoding != "x509_asn":
+            continue
+        if trust is not True and server_auth_oid not in trust:
+            continue
+        certificate_bytes = bytes(certificate)
+        if certificate_bytes in seen:
+            continue
+        seen.add(certificate_bytes)
+        certificates.append(certificate_bytes)
+    return tuple(certificates)
+
+
+def _create_pinned_openssl_context() -> ssl.SSLContext:
+    """Build the verified OpenSSL context used by ordinary pinned requests."""
+
+    context = create_urllib3_context()
+    # urllib3 enables OpenSSL's strict RFC 5280 mode.  Windows' public trust
+    # store still contains valid legacy chains whose CA Basic Constraints were
+    # not encoded as critical, so strict mode rejects sites that Windows and
+    # ordinary Requests verification accept.  Match the platform verifier for
+    # that compatibility detail while retaining CERT_REQUIRED, hostname
+    # verification, and all of the client's DNS-pinning/public-IP controls.
+    strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
+    if strict_flag:
+        context.verify_flags &= ~strict_flag
+    # Requests normally supplies certifi after selecting a connection pool.
+    # Load it up front, then augment it with the static Windows ROOT snapshot so
+    # the shared context is complete before concurrent requests begin.
+    context.load_verify_locations(cafile=requests.certs.where())
+    for certificate in _windows_server_auth_root_snapshot():
+        try:
+            context.load_verify_locations(cadata=certificate)
+        except ssl.SSLError as exc:
+            # A malformed store entry must not disable verification or prevent
+            # all other trusted roots from loading.
+            LOGGER.warning("Skipped an invalid Windows ROOT certificate: %s", exc)
+    return context
 
 
 class BoardHTTPError(RuntimeError):
@@ -113,8 +178,8 @@ class BoardHTTPSettings:
     # Windows' native certificate verifier may retrieve missing intermediate
     # certificates while building a chain. Keep that network-capable behavior
     # confined to exact, reviewed vendor hosts; arbitrary district and manually
-    # entered hosts continue to use Requests' ordinary certifi/OpenSSL path.
-    native_trust_hosts: tuple[str, ...] | str = ("meetings.boardbook.org",)
+    # entered hosts use certifi plus a static Windows ROOT snapshot in OpenSSL.
+    native_trust_hosts: tuple[str, ...] | str = tuple(NATIVE_TRUST_HOSTS)
 
     def __post_init__(self) -> None:
         self.timeout_seconds = max(1.0, float(self.timeout_seconds))
@@ -153,9 +218,7 @@ class BoardHTTPSettings:
                 {
                     str(host).strip().casefold().rstrip(".")
                     for host in native_hosts
-                    if str(host).strip()
-                    and "*" not in str(host)
-                    and "://" not in str(host)
+                    if str(host).strip().casefold().rstrip(".") in NATIVE_TRUST_HOSTS
                 }
             )
         )
@@ -171,6 +234,7 @@ class HTTPResult:
     from_cache: bool = False
     elapsed_seconds: float = 0.0
     redirect_chain: tuple[str, ...] = ()
+    website_migration_accepted: bool = False
     insecure_tls: bool = False
     tls_mode: str = "verified"
     insecure_tls_hosts: tuple[str, ...] = ()
@@ -295,7 +359,8 @@ def canonical_public_url(
         port = parsed.port
     except ValueError as exc:
         raise InvalidPublicURL(f"Invalid public URL: {url!r}") from exc
-    if parsed.scheme.casefold() not in {"http", "https"} or not hostname:
+    source_scheme = parsed.scheme.casefold()
+    if source_scheme not in {"http", "https"} or not hostname:
         raise InvalidPublicURL(f"Only public HTTP(S) URLs are supported: {url!r}")
     if parsed.username or parsed.password:
         raise InvalidPublicURL("Credential-bearing URLs are not supported.")
@@ -313,13 +378,14 @@ def canonical_public_url(
             raise InvalidPublicURL(f"Local network hostname is not allowed: {host}")
         if literal is not None and not _public_ip_address(literal):
             raise InvalidPublicURL(f"Non-public network address is not allowed: {host}")
-    default_port = (parsed.scheme.casefold() == "http" and port == 80) or (
-        parsed.scheme.casefold() == "https" and port == 443
-    )
+    # HTTP is accepted only as legacy input and is upgraded before validation or
+    # network I/O. An explicit legacy/default port must not pin the upgraded
+    # request to port 80.
+    default_port = port == 443 or (source_scheme == "http" and port == 80)
     host_for_netloc = f"[{host}]" if ":" in host else host
     netloc = host_for_netloc if port is None or default_port else f"{host_for_netloc}:{port}"
     path = parsed.path or "/"
-    return urlunsplit((parsed.scheme.casefold(), netloc, path, parsed.query, ""))
+    return urlunsplit(("https", netloc, path, parsed.query, ""))
 
 
 def _validated_public_target(
@@ -423,6 +489,10 @@ def _vendor_family(host: str) -> int | None:
 def redirect_target_allowed(source_url: str, target_url: str) -> bool:
     """Return whether a redirect stays within an organization/vendor boundary."""
 
+    # Check the response's actual target before canonicalization can upgrade a
+    # legacy HTTP URL. Board requests never follow TLS-downgrade redirects.
+    if urlsplit(str(target_url or "").strip()).scheme.casefold() != "https":
+        return False
     source = urlsplit(
         canonical_public_url(source_url, allow_private_networks=True)
     )
@@ -443,19 +513,18 @@ class _PinnedHTTPAdapter(HTTPAdapter):
     """Requests transport that connects to a previously validated IP address."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._verified_ssl_context = kwargs.pop("verified_ssl_context", None)
         self._native_ssl_context = kwargs.pop("native_ssl_context", None)
         native_trust_hosts = kwargs.pop(
             "native_trust_hosts",
-            ("meetings.boardbook.org",),
+            tuple(NATIVE_TRUST_HOSTS),
         )
         if isinstance(native_trust_hosts, str):
             native_trust_hosts = tuple(native_trust_hosts.split(","))
         self._native_trust_hosts = frozenset(
             str(host).strip().casefold().rstrip(".")
             for host in (native_trust_hosts or ())
-            if str(host).strip()
-            and "*" not in str(host)
-            and "://" not in str(host)
+            if str(host).strip().casefold().rstrip(".") in NATIVE_TRUST_HOSTS
         )
         super().__init__(*args, **kwargs)
         self._active_pin = threading.local()
@@ -483,6 +552,8 @@ class _PinnedHTTPAdapter(HTTPAdapter):
             raise BoardHTTPError("Proxy routing is disabled for pinned board requests.")
         parsed = urlsplit(url)
         scheme = parsed.scheme.casefold()
+        if scheme != "https":
+            raise InvalidPublicURL("Pinned board transport requires HTTPS.")
         host = (parsed.hostname or "").casefold().rstrip(".")
         port = parsed.port or (443 if scheme == "https" else 80)
         active = getattr(self._active_pin, "value", None)
@@ -511,6 +582,8 @@ class _PinnedHTTPAdapter(HTTPAdapter):
                     # On Windows this uses CryptoAPI and can retrieve missing
                     # intermediate certificates securely.
                     pool_kwargs["ssl_context"] = self._native_ssl_context
+                elif verify is True and self._verified_ssl_context is not None:
+                    pool_kwargs["ssl_context"] = self._verified_ssl_context
                 elif isinstance(verify, str):
                     if os.path.isdir(verify):
                         pool_kwargs["ca_cert_dir"] = verify
@@ -522,10 +595,6 @@ class _PinnedHTTPAdapter(HTTPAdapter):
                     pool_kwargs["key_file"] = cert[1]
                 else:
                     pool_kwargs["cert_file"] = cert
-        else:
-            # Keep plain-HTTP virtual hosts in distinct pools even when their
-            # approved address and port are identical.
-            pool_kwargs["headers"] = {"Host": urlsplit(url).netloc}
         return self.poolmanager.connection_from_host(
             scheme=scheme,
             host=address,
@@ -594,6 +663,27 @@ class _PinnedHTTPAdapter(HTTPAdapter):
             except AttributeError:
                 pass
 
+    def cert_verify(
+        self,
+        conn: Any,
+        url: str,
+        verify: Any,
+        cert: Any,
+    ) -> None:
+        """Keep verified pools on their already-complete static contexts.
+
+        Requests otherwise attaches certifi to the pool after selection, which
+        makes urllib3 call ``load_verify_locations`` on the shared context at
+        connection time. Both verified contexts are complete before use: the
+        ordinary OpenSSL context contains certifi plus Windows ROOTs, while the
+        exact-host native context intentionally owns its platform trust policy.
+        """
+
+        super().cert_verify(conn, url, verify, cert)
+        if urlsplit(url).scheme.casefold() == "https" and verify is True:
+            conn.ca_certs = None
+            conn.ca_cert_dir = None
+
 
 class BoardHTTPClient:
     """Bounded, host-aware HTTP client scoped to one collection run.
@@ -615,6 +705,7 @@ class BoardHTTPClient:
         session: requests.Session | None = None,
     ) -> None:
         self.settings = settings or BoardHTTPSettings()
+        self._verified_ssl_context = _create_pinned_openssl_context()
         self._native_ssl_context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         self._injected_session = session
         self._thread_local = threading.local()
@@ -682,6 +773,7 @@ class BoardHTTPClient:
             pool_maxsize=max(4, self.settings.global_concurrency),
             max_retries=0,
             pool_block=True,
+            verified_ssl_context=self._verified_ssl_context,
             native_ssl_context=self._native_ssl_context,
             native_trust_hosts=self.settings.native_trust_hosts,
         )
@@ -761,6 +853,8 @@ class BoardHTTPClient:
         resolved_address: str,
         **kwargs: Any,
     ) -> tuple[requests.Response, str]:
+        if urlsplit(url).scheme.casefold() != "https":
+            raise InvalidPublicURL("Board HTTP requests require HTTPS.")
         request_headers = dict(kwargs.pop("headers", {}) or {})
         request_headers.setdefault("Host", urlsplit(url).netloc)
         kwargs["headers"] = request_headers
@@ -925,6 +1019,7 @@ class BoardHTTPClient:
                 max_bytes=min(self.settings.max_html_size_bytes, 1024 * 1024),
                 check_robots=False,
                 raise_for_status=False,
+                allow_district_website_move=False,
             )
             if result.status_code < 400:
                 parser = robotparser.RobotFileParser()
@@ -979,12 +1074,14 @@ class BoardHTTPClient:
         max_bytes: int | None,
         check_robots: bool,
         raise_for_status: bool,
+        allow_district_website_move: bool = False,
     ) -> HTTPResult:
         requested_url, _requested_addresses = self._validated_target(url)
         current_url = requested_url
         request_headers = dict(headers or {})
         redirect_chain: list[str] = []
         visited = {requested_url}
+        website_migration_accepted = False
         insecure_tls = False
         tls_modes: set[str] = set()
         insecure_tls_hosts: list[str] = []
@@ -1054,12 +1151,30 @@ class BoardHTTPClient:
                                 f"Response exceeded {self.settings.max_redirects} redirects: "
                                 f"{requested_url}"
                             )
-                        redirect_target = self._validate_target(urljoin(current_url, location))
-                        if not self.redirect_allowed(current_url, redirect_target):
+                        raw_redirect_target = urljoin(current_url, location)
+                        if urlsplit(raw_redirect_target).scheme.casefold() != "https":
                             raise RedirectDenied(
-                                f"Redirect left the allowed organization/vendor boundary: "
-                                f"{current_url} -> {redirect_target}"
+                                "Board HTTP does not follow redirects to insecure HTTP: "
+                                f"{current_url} -> {raw_redirect_target}"
                             )
+                        redirect_target = self._validate_target(raw_redirect_target)
+                        if not self.redirect_allowed(current_url, redirect_target):
+                            # This exception is intentionally narrower than the
+                            # ordinary redirect policy. Discovery enables it only
+                            # for the configured district homepage. The source
+                            # must still be inside that original boundary, and a
+                            # second boundary change is never accepted.
+                            may_accept_district_website_move = (
+                                allow_district_website_move
+                                and not website_migration_accepted
+                                and self.redirect_allowed(requested_url, current_url)
+                            )
+                            if not may_accept_district_website_move:
+                                raise RedirectDenied(
+                                    f"Redirect left the allowed organization/vendor boundary: "
+                                    f"{current_url} -> {redirect_target}"
+                                )
+                            website_migration_accepted = True
                         if redirect_target in visited:
                             raise TooManyRedirects(
                                 f"Redirect loop detected: {current_url} -> {redirect_target}"
@@ -1082,6 +1197,7 @@ class BoardHTTPClient:
                         content=content,
                         elapsed_seconds=max(0.0, time.monotonic() - started),
                         redirect_chain=tuple(redirect_chain),
+                        website_migration_accepted=website_migration_accepted,
                         insecure_tls=insecure_tls,
                         tls_mode=(
                             "explicit_fallback"
@@ -1134,6 +1250,7 @@ class BoardHTTPClient:
         force: bool = False,
         check_robots: bool = True,
         raise_for_status: bool = True,
+        allow_district_website_move: bool = False,
     ) -> HTTPResult:
         request_headers = dict(headers or {})
         if etag:
@@ -1149,6 +1266,7 @@ class BoardHTTPClient:
             max_bytes,
             check_robots,
             raise_for_status,
+            allow_district_website_move,
         )
         pending: _PendingRequest | None = None
         owns_request = True
@@ -1178,6 +1296,7 @@ class BoardHTTPClient:
                 max_bytes=max_bytes,
                 check_robots=check_robots,
                 raise_for_status=raise_for_status,
+                allow_district_website_move=allow_district_website_move,
             )
             if result.status_code < 400 or result.status_code == 304:
                 with self._cache_lock:
@@ -1207,6 +1326,7 @@ class BoardHTTPClient:
             from_cache=from_cache,
             elapsed_seconds=result.elapsed_seconds,
             redirect_chain=result.redirect_chain,
+            website_migration_accepted=result.website_migration_accepted,
             insecure_tls=result.insecure_tls,
             tls_mode=result.tls_mode,
             insecure_tls_hosts=result.insecure_tls_hosts,

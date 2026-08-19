@@ -3,9 +3,11 @@ from __future__ import annotations
 import heapq
 import math
 import re
+import time
 from dataclasses import dataclass, field
+from html import unescape
 from typing import Any, Callable, Mapping
-from urllib.parse import urljoin, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,7 +22,7 @@ from .adapters.base import (
     RenderedPageRejected,
     assess_challenge,
 )
-from .http import BoardHTTPClient, RobotsDenied
+from .http import BoardHTTPClient, RedirectDenied, RobotsDenied
 from .provider_directories import BoardBookDirectoryCatalog, BoardBookDirectoryMatch
 
 
@@ -46,7 +48,47 @@ BOARD_LINK_TERMS = (
 )
 
 DOCUMENT_SUFFIXES = (".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx")
+MEDIA_SUFFIXES = (
+    ".avif",
+    ".bmp",
+    ".gif",
+    ".ico",
+    ".jpeg",
+    ".jpg",
+    ".m4a",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".mpeg",
+    ".png",
+    ".svg",
+    ".webm",
+    ".webp",
+    ".wmv",
+    ".zip",
+)
+PRUNED_CANDIDATE_SEGMENTS = {
+    "board-member",
+    "board-members",
+    "image",
+    "images",
+    "media",
+    "member",
+    "members",
+    "policies",
+    "policy",
+    "resource-manager",
+}
+EPHEMERAL_CANDIDATE_SEGMENTS = {
+    "article",
+    "articles",
+    "event",
+    "events",
+    "news",
+}
 TRANSPORT_BROWSER_FALLBACK_LIMIT = 2
+SOURCE_VALIDATION_LIMIT = 5
+DISCOVERY_MAX_PAGES = 8
 
 
 @dataclass(frozen=True)
@@ -125,6 +167,7 @@ def is_known_board_host(url: str) -> bool:
         or host.endswith(".community.diligentoneplatform.com")
         or host.endswith(".community.highbond.com")
         or host.endswith(".diligent.community")
+        or host.endswith(".civicweb.net")
         or host.endswith(".portal.civicclerk.com")
         or host.endswith(".civicclerk.com")
     )
@@ -223,6 +266,7 @@ def _attempt_browser_render(
     enabled: bool,
     challenge_error_prefix: str,
     http_error_prefix: str = "",
+    allow_district_website_move: bool = False,
 ) -> _BrowserRenderAttempt:
     """Render one URL through an adapter's policy gates, at most once per URL."""
 
@@ -240,7 +284,15 @@ def _attempt_browser_render(
             raise RuntimeError(
                 "Browser renderer does not expose policy-gated page metadata."
             )
-        page = render_with_metadata(url)
+        render_district_website = getattr(
+            renderer,
+            "render_district_website_with_metadata",
+            None,
+        )
+        if allow_district_website_move and callable(render_district_website):
+            page = render_district_website(url)
+        else:
+            page = render_with_metadata(url)
         if not isinstance(page, RenderedPage):
             raise TypeError("Browser renderer returned an invalid page result.")
     except RobotsDenied as exc:
@@ -304,6 +356,21 @@ def score_board_link(text: str, url: str) -> tuple[int, list[str]]:
         score -= 15
     if any(term in haystack for term in ("login", "sign in", "admin", "employee portal")):
         score -= 60
+    path_segments = {
+        segment for segment in urlparse(url).path.casefold().split("/") if segment
+    }
+    if path_segments & EPHEMERAL_CANDIDATE_SEGMENTS:
+        # A single article/event is usually evidence, not a durable source, but
+        # a strongly labeled archive hub under /events or /news can still earn
+        # validation instead of being discarded categorically.
+        score -= 12
+        evidence.append("news/article/event path penalty")
+    if any(segment in {"feed", "feeds", "rss"} for segment in path_segments):
+        score -= 12
+        evidence.append("feed path penalty")
+    if any(segment.isdigit() and len(segment) >= 4 for segment in path_segments):
+        score -= 5
+        evidence.append("opaque numeric path penalty")
     return score, evidence
 
 
@@ -320,22 +387,89 @@ def _anchor_scoring_text(anchor: Any) -> str:
     return f"{text} {parent_text}" if parent_text else text
 
 
-def extract_board_candidates(content: bytes | str, page_url: str, district_base_url: str) -> list[BoardSourceCandidate]:
+def _pruned_candidate_url(url: str, known_platform: str = "") -> bool:
+    if known_platform and known_platform != "generic":
+        return False
+    path = urlparse(url).path.casefold()
+    if path.endswith(MEDIA_SUFFIXES):
+        return True
+    segments = {segment for segment in path.split("/") if segment}
+    if segments & PRUNED_CANDIDATE_SEGMENTS:
+        return True
+    return any(
+        segment.startswith(("board-member-", "member-", "members-", "policy-", "policies-"))
+        for segment in segments
+    )
+
+
+def _decoded_embedded_text(content: bytes | str) -> str:
+    text = content.decode("utf-8", errors="ignore") if isinstance(content, bytes) else str(content or "")
+    text = unescape(text)
+    for _ in range(4):
+        decoded = unquote(text)
+        decoded = re.sub(r"\\u003a", ":", decoded, flags=re.IGNORECASE)
+        decoded = re.sub(r"\\u002f", "/", decoded, flags=re.IGNORECASE)
+        decoded = re.sub(r"\\u0026", "&", decoded, flags=re.IGNORECASE)
+        decoded = decoded.replace("\\/", "/")
+        if decoded == text:
+            break
+        text = decoded
+    return text
+
+
+def _embedded_provider_urls(content: bytes | str) -> list[str]:
+    text = _decoded_embedded_text(content)
+    found: list[str] = []
+    for match in re.finditer(
+        r"(?i)(?:https?:)?//[a-z0-9][a-z0-9.-]*(?::\d+)?(?:/[^\s<>\"']*)?",
+        text,
+    ):
+        # Escaped JSON/JavaScript strings commonly leave the backslash from a
+        # closing ``\"`` in the regex match.  A backslash is never valid in a
+        # canonical public URL, so discard it with the surrounding punctuation
+        # before platform detection and robots checks.
+        value = match.group(0).rstrip(".,;:!?)]}\\")
+        if value.startswith("//"):
+            value = f"https:{value}"
+        url = canonical_url(value)
+        if is_known_board_host(url) and url not in found:
+            found.append(url)
+    return found
+
+
+def extract_board_candidates(
+    content: bytes | str,
+    page_url: str,
+    district_base_url: str,
+    *,
+    adapters: list[Any] | None = None,
+) -> list[BoardSourceCandidate]:
     soup = BeautifulSoup(content, "lxml")
     found: dict[str, BoardSourceCandidate] = {}
-    for anchor in soup.find_all("a", href=True):
-        href = str(anchor.get("href") or "").strip()
+
+    def add_candidate(
+        href: str,
+        text: str,
+        scoring_text: str,
+        *,
+        embedded: bool = False,
+    ) -> None:
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
-            continue
+            return
         url = canonical_url(urljoin(page_url, href))
         if not board_url_allowed(url, district_base_url):
-            continue
-        text = _collapse_ws(anchor.get_text(" ", strip=True))
-        score, evidence = score_board_link(_anchor_scoring_text(anchor), url)
+            return
+        score, evidence = score_board_link(scoring_text, url)
         if score < 5:
-            continue
-        detection = detect_platform(url)
+            return
+        detection = detect_platform(url, adapters=adapters)
         platform = _platform_name(getattr(detection, "platform", "")) if getattr(detection, "matched", False) else ""
+        if is_known_board_host(url) and platform in {"", "generic"}:
+            return
+        if _pruned_candidate_url(url, platform):
+            return
+        if embedded:
+            evidence = [*evidence, "embedded public provider URL"]
         candidate = BoardSourceCandidate(
             url=url,
             text=text,
@@ -347,11 +481,27 @@ def extract_board_candidates(content: bytes | str, page_url: str, district_base_
         existing = found.get(url)
         if existing is None or candidate.score > existing.score:
             found[url] = candidate
+
+    for node in soup.find_all(["a", "iframe"]):
+        attribute = "href" if node.name == "a" else "src"
+        href = str(node.get(attribute) or "").strip()
+        text = _collapse_ws(node.get_text(" ", strip=True))
+        scoring_text = _anchor_scoring_text(node) if node.name == "a" else f"{text} board meetings"
+        add_candidate(href, text, scoring_text)
+
+    for url in _embedded_provider_urls(content):
+        add_candidate(
+            url,
+            "Embedded board meeting provider",
+            "board meetings",
+            embedded=True,
+        )
     return sorted(found.values(), key=lambda item: (-item.score, item.url))
 
 
 def _outcome_from_adapter_result(result: Any, candidate: BoardSourceCandidate) -> DiscoveryOutcome:
     source = getattr(result, "source", None)
+    detection = getattr(result, "detection", None)
     status = str(getattr(result, "status", "") or getattr(source, "status", "") or "manual_review")
     platform = _platform_name(
         getattr(result, "platform", "") or getattr(source, "platform", "") or candidate.known_platform or "generic"
@@ -361,8 +511,25 @@ def _outcome_from_adapter_result(result: Any, candidate: BoardSourceCandidate) -
         or getattr(source, "public_url", "")
         or candidate.url
     )
-    metadata = dict(getattr(source, "metadata", {}) or {})
+    detection_metadata = dict(getattr(detection, "metadata", {}) or {})
+    metadata = {**detection_metadata, **dict(getattr(source, "metadata", {}) or {})}
     raw = dict(getattr(result, "metadata", {}) or {})
+    if detection is not None:
+        raw.setdefault(
+            "detection",
+            {
+                "matched": bool(getattr(detection, "matched", False)),
+                "platform": _platform_name(getattr(detection, "platform", "")),
+                "confidence": _adapter_confidence_percent(
+                    getattr(detection, "confidence", 0)
+                ),
+                "reason": str(getattr(detection, "reason", "") or ""),
+                "canonical_url": str(
+                    getattr(detection, "canonical_url", "") or ""
+                ),
+                "metadata": detection_metadata,
+            },
+        )
     raw.setdefault("candidate_text", candidate.text)
     raw.setdefault("candidate_score", candidate.score)
     raw.setdefault("candidate_evidence", candidate.evidence)
@@ -374,6 +541,7 @@ def _outcome_from_adapter_result(result: Any, candidate: BoardSourceCandidate) -
         organization_external_id=str(
             getattr(result, "organization_external_id", "")
             or getattr(source, "external_source_id", "")
+            or metadata.get("external_source_id")
             or metadata.get("organization_external_id")
             or ""
         ),
@@ -386,6 +554,22 @@ def _outcome_from_adapter_result(result: Any, candidate: BoardSourceCandidate) -
         raw=raw,
         source=source,
     )
+
+
+def _source_validation_candidates(
+    ordered: list[BoardSourceCandidate],
+    limit: int = SOURCE_VALIDATION_LIMIT,
+) -> list[BoardSourceCandidate]:
+    """Reserve the bounded validation budget for canonical providers first."""
+
+    bounded = max(0, int(limit))
+    known = [
+        item
+        for item in ordered
+        if item.known_platform not in {"", "generic", "unknown"}
+    ]
+    other = [item for item in ordered if item not in known]
+    return [*known, *other][:bounded]
 
 
 def _provider_directory_diagnostics(
@@ -432,7 +616,7 @@ def discover_board_source(
     *,
     client: BoardHTTPClient | None = None,
     provider_directory: BoardBookDirectoryCatalog | None = None,
-    max_pages: int = 8,
+    max_pages: int = DISCOVERY_MAX_PAGES,
     allow_browser_fallback: bool = True,
     cancel_requested: Callable[[], bool] | None = None,
     debug_logger: RunDebugLogger | None = None,
@@ -561,8 +745,12 @@ def discover_board_source(
                 raw={"district_id": district_id, "provider_directory": provider_directory_raw},
             )
 
-        pending: list[tuple[int, int, str]] = [(-100, 0, canonical_url(base_url))]
-        queued = {canonical_url(base_url)}
+        configured_website_url = canonical_url(base_url)
+        crawl_base_url = configured_website_url
+        configured_website_key = _crawl_url_key(configured_website_url)
+        website_migration: dict[str, Any] = {}
+        pending: list[tuple[int, int, str]] = [(-100, 0, configured_website_url)]
+        queued = {configured_website_url}
         visited: set[str] = set()
         candidates: dict[str, BoardSourceCandidate] = {}
         candidate_content: dict[tuple[str, str, str, str], bytes] = {}
@@ -575,6 +763,70 @@ def discover_board_source(
         robots_denials: list[dict[str, Any]] = []
         successful_page_fetches = 0
         transport_browser_fallback_count = 0
+
+        def record_website_migration(
+            *,
+            final_url: str,
+            redirect_chain: list[str] | tuple[str, ...],
+            transport: str,
+            accepted: bool,
+        ) -> bool:
+            """Validate and retain one initial configured-site migration."""
+
+            nonlocal crawl_base_url, website_migration
+            if not accepted:
+                return False
+            final_canonical = canonical_url(final_url)
+            if (
+                urlparse(configured_website_url).scheme.casefold() != "https"
+                or urlparse(final_canonical).scheme.casefold() != "https"
+            ):
+                return False
+            validator = getattr(client, "validate_target_url", None)
+            if callable(validator):
+                final_canonical = canonical_url(validator(final_canonical))
+            chain: list[str] = []
+            for item in redirect_chain:
+                if not str(item).strip():
+                    continue
+                if urlparse(str(item)).scheme.casefold() != "https":
+                    return False
+                canonical_item = canonical_url(item)
+                if callable(validator):
+                    canonical_item = canonical_url(validator(canonical_item))
+                chain.append(canonical_item)
+            if not chain or chain[-1] != final_canonical:
+                chain.append(final_canonical)
+            website_migration = {
+                "status": "accepted",
+                "evidence": "initial_configured_website_https_redirect",
+                "original_url": configured_website_url,
+                "redirect_chain": chain,
+                "final_url": final_canonical,
+                "canonical_website_url": final_canonical,
+                "transport": transport,
+            }
+            crawl_base_url = final_canonical
+            debug_log(
+                debug_logger,
+                "board_district_website_migration_accepted",
+                district=district.get("agency_name"),
+                status=website_migration["status"],
+                evidence=website_migration["evidence"],
+                original_url=configured_website_url,
+                redirect_chain=chain,
+                final_url=final_canonical,
+                canonical_website_url=final_canonical,
+                transport=transport,
+            )
+            return True
+
+        def migration_diagnostics() -> dict[str, Any]:
+            return (
+                {"website_migration": dict(website_migration)}
+                if website_migration
+                else {}
+            )
 
         def record_fetch_error(error_url: str, **details: Any) -> dict[str, Any]:
             record = {"url": error_url, **details}
@@ -617,10 +869,11 @@ def discover_board_source(
                 return DiscoveryOutcome(
                     status="cancelled",
                     platform="unknown",
-                    source_url=base_url,
+                    source_url=crawl_base_url,
                     error_message="Cancellation requested.",
                     raw={
                         "visited": sorted(visited),
+                        **migration_diagnostics(),
                         **(
                             {"provider_directory": provider_directory_raw}
                             if provider_directory_raw
@@ -632,12 +885,29 @@ def discover_board_source(
             if url in visited:
                 continue
             visited.add(url)
+            is_initial_district_navigation = bool(
+                depth == 0 and _crawl_url_key(url) == configured_website_key
+            )
             debug_log(debug_logger, "board_source_candidate", district=district.get("agency_name"), url=url, depth=depth)
             try:
-                response = client.get(url, check_robots=True, raise_for_status=False)
+                response = client.get(
+                    url,
+                    check_robots=True,
+                    raise_for_status=False,
+                    allow_district_website_move=is_initial_district_navigation,
+                )
                 response_content = response.content
                 effective_status_code = response.status_code
                 effective_final_url = response.final_url or url
+                if is_initial_district_navigation and bool(
+                    getattr(response, "website_migration_accepted", False)
+                ):
+                    record_website_migration(
+                        final_url=effective_final_url,
+                        redirect_chain=getattr(response, "redirect_chain", ()),
+                        transport="http",
+                        accepted=True,
+                    )
             except RobotsDenied as exc:
                 robots_denials.append({"url": url, "error": str(exc)})
                 debug_log(
@@ -652,12 +922,13 @@ def discover_board_source(
                 requests.ConnectionError,
                 requests.Timeout,
                 requests.exceptions.ChunkedEncodingError,
+                RedirectDenied,
             ) as exc:
                 fetch_error = record_fetch_error(
                     url,
                     error=str(exc),
                     error_type=type(exc).__name__,
-                    kind="transport",
+                    kind=("redirect" if isinstance(exc, RedirectDenied) else "transport"),
                     browser_fallback_attempted=False,
                 )
                 exception_status = getattr(
@@ -672,11 +943,16 @@ def discover_board_source(
                         and exception_status != 429
                         and transport_browser_fallback_count
                         < TRANSPORT_BROWSER_FALLBACK_LIMIT
+                        and (
+                            not isinstance(exc, RedirectDenied)
+                            or is_initial_district_navigation
+                        )
                     ),
                     challenge_error_prefix=(
                         "Transport recovery browser remained challenged"
                     ),
                     http_error_prefix="Transport recovery browser returned HTTP",
+                    allow_district_website_move=is_initial_district_navigation,
                 )
                 if recovery.attempted:
                     transport_browser_fallback_count += 1
@@ -714,20 +990,37 @@ def discover_board_source(
                     continue
 
                 assert recovery.page is not None
+                if recovery.page.website_migration_accepted and not record_website_migration(
+                    final_url=recovery.page.final_url,
+                    redirect_chain=recovery.page.redirect_chain,
+                    transport="browser",
+                    accepted=is_initial_district_navigation,
+                ):
+                    record_browser_error(
+                        url,
+                        "Browser reported a district website move outside the initial "
+                        "configured-site navigation.",
+                        trigger="transport",
+                        error_type="InvalidPublicURL",
+                    )
+                    continue
                 response_content = recovery.page.content
                 effective_status_code = recovery.page.status_code
                 effective_final_url = recovery.page.final_url
                 browser_attempted_urls.add(_crawl_url_key(recovery.page.final_url))
-                transport_recoveries.append(
-                    {
-                        "url": url,
-                        "final_url": recovery.page.final_url,
-                        "status_code": recovery.page.status_code,
-                        "browser_rendered": bool(recovery.page.browser_rendered),
-                        "transport_error": str(exc),
-                        "transport_error_type": type(exc).__name__,
-                    }
-                )
+                transport_recovery = {
+                    "url": url,
+                    "final_url": recovery.page.final_url,
+                    "status_code": recovery.page.status_code,
+                    "browser_rendered": bool(recovery.page.browser_rendered),
+                    "transport_error": str(exc),
+                    "transport_error_type": type(exc).__name__,
+                }
+                if recovery.page.redirect_chain:
+                    transport_recovery["redirect_chain"] = list(
+                        recovery.page.redirect_chain
+                    )
+                transport_recoveries.append(transport_recovery)
                 debug_log(
                     debug_logger,
                     "board_transport_recovered_with_browser",
@@ -735,6 +1028,9 @@ def discover_board_source(
                     url=url,
                     final_url=recovery.page.final_url,
                     status_code=recovery.page.status_code,
+                    website_migration=bool(
+                        recovery.page.website_migration_accepted
+                    ),
                 )
             except Exception as exc:
                 record_fetch_error(
@@ -769,6 +1065,7 @@ def discover_board_source(
                         allow_browser_fallback and challenge.browser_retry_allowed
                     ),
                     challenge_error_prefix="Rendered page remained challenged",
+                    allow_district_website_move=is_initial_district_navigation,
                 )
                 browser_attempted = recovery.attempted
                 browser_error = recovery.error
@@ -780,6 +1077,23 @@ def discover_board_source(
                     robots_denials.append({"url": url, "error": browser_error})
                 if recovery.recovered:
                     assert recovery.page is not None
+                    if (
+                        recovery.page.website_migration_accepted
+                        and not record_website_migration(
+                            final_url=recovery.page.final_url,
+                            redirect_chain=recovery.page.redirect_chain,
+                            transport="browser",
+                            accepted=is_initial_district_navigation,
+                        )
+                    ):
+                        record_browser_error(
+                            challenge_url,
+                            "Browser reported a district website move outside the "
+                            "initial configured-site navigation.",
+                            trigger="challenge",
+                            error_type="InvalidPublicURL",
+                        )
+                        continue
                     effective_final_url = recovery.page.final_url
                     effective_status_code = recovery.page.status_code
                 if browser_error:
@@ -854,13 +1168,18 @@ def discover_board_source(
                     evidence=[*evidence, *list(getattr(detection, "evidence", []) or [])],
                 )
 
-            for candidate in extract_board_candidates(response_content, final_url, base_url):
+            for candidate in extract_board_candidates(
+                response_content,
+                final_url,
+                crawl_base_url,
+                adapters=adapters,
+            ):
                 existing = candidates.get(candidate.url)
                 if existing is None or candidate.score > existing.score:
                     candidates[candidate.url] = candidate
                 if (
                     depth < 2
-                    and same_organization_url(candidate.url, base_url)
+                    and same_organization_url(candidate.url, crawl_base_url)
                     and not urlparse(candidate.url).path.casefold().endswith(DOCUMENT_SUFFIXES)
                     and candidate.url not in queued
                     and all(
@@ -872,7 +1191,33 @@ def discover_board_source(
                     heapq.heappush(pending, (-candidate.score, depth + 1, candidate.url))
 
         ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.url))
-        for candidate in ordered:
+        validation_candidates = _source_validation_candidates(ordered)
+        candidate_validations: list[dict[str, Any]] = []
+        review_outcomes: list[tuple[BoardSourceCandidate, DiscoveryOutcome]] = []
+        adapter_error_outcomes: list[tuple[BoardSourceCandidate, DiscoveryOutcome]] = []
+
+        def enrich_outcome_raw(outcome: DiscoveryOutcome) -> None:
+            outcome.raw.update(
+                {
+                    "visited_urls": sorted(visited),
+                    "candidate_count": len(ordered),
+                    "candidate_validation_limit": SOURCE_VALIDATION_LIMIT,
+                    "candidate_validation_count": len(candidate_validations),
+                    "candidate_validations": candidate_validations,
+                    "successful_page_fetches": successful_page_fetches,
+                    "fetch_errors": fetch_errors,
+                    "browser_errors": browser_errors,
+                    "challenges": challenges,
+                    "challenge_recoveries": challenge_recoveries,
+                    "transport_recoveries": transport_recoveries,
+                    "robots_denials": robots_denials,
+                }
+            )
+            if provider_directory_raw:
+                outcome.raw["provider_directory"] = provider_directory_raw
+            outcome.raw.update(migration_diagnostics())
+
+        for validation_index, candidate in enumerate(validation_candidates, start=1):
             if cancel_requested and cancel_requested():
                 break
             adapter = next(
@@ -890,6 +1235,21 @@ def discover_board_source(
                 adapter = next((item for item in adapters if _platform_name(getattr(item, "platform_name", "")) == "generic"), None)
             if adapter is None:
                 continue
+            validation_started = time.monotonic()
+            validation_record: dict[str, Any] = {
+                "index": validation_index,
+                "url": candidate.url,
+                "score": candidate.score,
+                "evidence": list(candidate.evidence),
+                "expected_platform": candidate.known_platform or "generic",
+            }
+            candidate_validations.append(validation_record)
+            debug_log(
+                debug_logger,
+                "board_candidate_validation_started",
+                district=district.get("agency_name"),
+                **validation_record,
+            )
             try:
                 candidate_url = canonical_url(candidate.url)
                 candidate_key = _crawl_url_key(candidate_url)
@@ -900,6 +1260,19 @@ def discover_board_source(
                     candidate_key in browser_attempted_urls
                     and candidate_key not in candidate_content
                 ):
+                    validation_record.update(
+                        {
+                            "status": "skipped",
+                            "error": "A prior browser attempt did not produce usable content.",
+                            "elapsed_seconds": round(time.monotonic() - validation_started, 3),
+                        }
+                    )
+                    debug_log(
+                        debug_logger,
+                        "board_candidate_validation_result",
+                        district=district.get("agency_name"),
+                        **validation_record,
+                    )
                     continue
                 result = adapter.discover_source(
                     district,
@@ -907,26 +1280,36 @@ def discover_board_source(
                     html=candidate_content.get(candidate_key),
                 )
                 outcome = _outcome_from_adapter_result(result, candidate)
+                validation_record.update(
+                    {
+                        "status": outcome.status,
+                        "platform": outcome.platform,
+                        "source_url": outcome.source_url,
+                        "organization_external_id": (
+                            outcome.organization_external_id or None
+                        ),
+                        "error": outcome.error_message or None,
+                        "elapsed_seconds": round(time.monotonic() - validation_started, 3),
+                    }
+                )
+                debug_log(
+                    debug_logger,
+                    "board_candidate_validation_result",
+                    district=district.get("agency_name"),
+                    **validation_record,
+                )
                 if outcome.status == "blocked_by_robots":
                     robots_denials.append(
                         {"url": candidate.url, "error": outcome.error_message}
                     )
+                    # Retain the adapter's canonical URL and provider identity
+                    # as review evidence even though robots policy prevents
+                    # verification.  This never marks the source working or
+                    # bypasses the denied request.
+                    review_outcomes.append((candidate, outcome))
                     continue
-                if outcome.status in {"working", "requires_javascript", "manual_review", "blocked_by_challenge"}:
-                    outcome.raw.update(
-                        {
-                            "visited_urls": sorted(visited),
-                            "candidate_count": len(ordered),
-                            "fetch_errors": fetch_errors,
-                            "browser_errors": browser_errors,
-                            "challenges": challenges,
-                            "challenge_recoveries": challenge_recoveries,
-                            "transport_recoveries": transport_recoveries,
-                            "robots_denials": robots_denials,
-                        }
-                    )
-                    if provider_directory_raw:
-                        outcome.raw["provider_directory"] = provider_directory_raw
+                if outcome.status == "working":
+                    enrich_outcome_raw(outcome)
                     debug_log(
                         debug_logger,
                         "board_platform_detected",
@@ -936,7 +1319,37 @@ def discover_board_source(
                         status=outcome.status,
                     )
                     return outcome
+                if outcome.status == "error":
+                    record_fetch_error(
+                        candidate.url,
+                        platform=outcome.platform or candidate.known_platform,
+                        error=outcome.error_message or "Adapter validation failed.",
+                        error_type="AdapterResultError",
+                        kind="adapter",
+                    )
+                    adapter_error_outcomes.append((candidate, outcome))
+                    continue
+                if outcome.status in {
+                    "requires_javascript",
+                    "manual_review",
+                    "blocked_by_challenge",
+                }:
+                    review_outcomes.append((candidate, outcome))
             except Exception as exc:
+                validation_record.update(
+                    {
+                        "status": "error",
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                        "elapsed_seconds": round(time.monotonic() - validation_started, 3),
+                    }
+                )
+                debug_log(
+                    debug_logger,
+                    "board_candidate_validation_result",
+                    district=district.get("agency_name"),
+                    **validation_record,
+                )
                 record_fetch_error(
                     candidate.url,
                     platform=candidate.known_platform,
@@ -945,8 +1358,58 @@ def discover_board_source(
                     kind="adapter",
                 )
 
+        if cancel_requested and cancel_requested():
+            cancelled_outcome = DiscoveryOutcome(
+                status="cancelled",
+                platform="unknown",
+                source_url=crawl_base_url,
+                discovered_from_url=base_url,
+                error_message="Cancellation requested during source validation.",
+            )
+            enrich_outcome_raw(cancelled_outcome)
+            return cancelled_outcome
+
+        if review_outcomes:
+            status_priority = {
+                "manual_review": 1,
+                "blocked_by_challenge": 2,
+                "blocked_by_robots": 2,
+                "requires_javascript": 3,
+            }
+            selected_candidate, selected_outcome = max(
+                review_outcomes,
+                key=lambda pair: (
+                    pair[1].platform not in {"", "generic", "unknown"},
+                    status_priority.get(pair[1].status, 0),
+                    pair[0].score,
+                ),
+            )
+            enrich_outcome_raw(selected_outcome)
+            selected_outcome.raw["selected_candidate"] = selected_candidate.__dict__
+            debug_log(
+                debug_logger,
+                "board_platform_detected",
+                district=district.get("agency_name"),
+                platform=selected_outcome.platform,
+                url=selected_outcome.source_url,
+                status=selected_outcome.status,
+            )
+            return selected_outcome
+
+        validation_diagnostics = {
+            "candidate_count": len(ordered),
+            "candidate_validation_limit": SOURCE_VALIDATION_LIMIT,
+            "candidate_validation_count": len(candidate_validations),
+            "candidate_validations": candidate_validations,
+            "successful_page_fetches": successful_page_fetches,
+        }
+
         if robots_denials and not challenges:
-            candidate = ordered[0] if ordered else BoardSourceCandidate(base_url, "", base_url, 0)
+            candidate = (
+                ordered[0]
+                if ordered
+                else BoardSourceCandidate(crawl_base_url, "", base_url, 0)
+            )
             return DiscoveryOutcome(
                 status="blocked_by_robots",
                 platform=candidate.known_platform or "unknown",
@@ -956,11 +1419,13 @@ def discover_board_source(
                 error_message="robots.txt disallowed the public board-source request.",
                 raw={
                     "visited_urls": sorted(visited),
+                    **validation_diagnostics,
                     "fetch_errors": fetch_errors,
                     "browser_errors": browser_errors,
                     "challenge_recoveries": challenge_recoveries,
                     "transport_recoveries": transport_recoveries,
                     "robots_denials": robots_denials,
+                    **migration_diagnostics(),
                     **(
                         {"provider_directory": provider_directory_raw}
                         if provider_directory_raw
@@ -969,7 +1434,11 @@ def discover_board_source(
                 },
             )
         if challenges:
-            candidate = ordered[0] if ordered else BoardSourceCandidate(base_url, "", base_url, 0)
+            candidate = (
+                ordered[0]
+                if ordered
+                else BoardSourceCandidate(crawl_base_url, "", base_url, 0)
+            )
             return DiscoveryOutcome(
                 status="requires_javascript" if candidate.known_platform in {"boarddocs", "simbli"} else "blocked_by_challenge",
                 platform=candidate.known_platform or "unknown",
@@ -980,11 +1449,13 @@ def discover_board_source(
                 error_message="The public source returned an anti-bot challenge; browser or manual review is required.",
                 raw={
                     "visited_urls": sorted(visited),
+                    **validation_diagnostics,
                     "fetch_errors": fetch_errors,
                     "browser_errors": browser_errors,
                     "challenges": challenges,
                     "challenge_recoveries": challenge_recoveries,
                     "transport_recoveries": transport_recoveries,
+                    **migration_diagnostics(),
                     **(
                         {"provider_directory": provider_directory_raw}
                         if provider_directory_raw
@@ -992,6 +1463,19 @@ def discover_board_source(
                     ),
                 },
             )
+        if adapter_error_outcomes:
+            selected_candidate, selected_outcome = max(
+                adapter_error_outcomes,
+                key=lambda pair: (
+                    pair[1].platform not in {"", "generic", "unknown"},
+                    pair[0].score,
+                ),
+            )
+            enrich_outcome_raw(selected_outcome)
+            selected_outcome.raw["selected_candidate"] = (
+                selected_candidate.__dict__
+            )
+            return selected_outcome
         if ordered:
             candidate = ordered[0]
             return DiscoveryOutcome(
@@ -1004,10 +1488,12 @@ def discover_board_source(
                 raw={
                     "visited_urls": sorted(visited),
                     "candidates": [item.__dict__ for item in ordered[:25]],
+                    **validation_diagnostics,
                     "fetch_errors": fetch_errors,
                     "browser_errors": browser_errors,
                     "challenge_recoveries": challenge_recoveries,
                     "transport_recoveries": transport_recoveries,
+                    **migration_diagnostics(),
                     **(
                         {"provider_directory": provider_directory_raw}
                         if provider_directory_raw
@@ -1022,7 +1508,7 @@ def discover_board_source(
             return DiscoveryOutcome(
                 status="error",
                 platform="unknown",
-                source_url=base_url,
+                source_url=crawl_base_url,
                 discovered_from_url=base_url,
                 error_message=(
                     "No district page could be inspected because every transport "
@@ -1033,12 +1519,14 @@ def discover_board_source(
                 ),
                 raw={
                     "visited_urls": sorted(visited),
+                    **validation_diagnostics,
                     "fetch_errors": fetch_errors,
                     "browser_errors": browser_errors,
                     "challenges": challenges,
                     "challenge_recoveries": challenge_recoveries,
                     "transport_recoveries": transport_recoveries,
                     "robots_denials": robots_denials,
+                    **migration_diagnostics(),
                     **(
                         {"provider_directory": provider_directory_raw}
                         if provider_directory_raw
@@ -1049,15 +1537,17 @@ def discover_board_source(
         return DiscoveryOutcome(
             status="not_found",
             platform="unknown",
-            source_url=base_url,
+            source_url=crawl_base_url,
             discovered_from_url=base_url,
             error_message="No public school-board meeting source was found on the inspected district pages.",
             raw={
                 "visited_urls": sorted(visited),
+                **validation_diagnostics,
                 "fetch_errors": fetch_errors,
                 "browser_errors": browser_errors,
                 "challenge_recoveries": challenge_recoveries,
                 "transport_recoveries": transport_recoveries,
+                **migration_diagnostics(),
                 **(
                     {"provider_directory": provider_directory_raw}
                     if provider_directory_raw

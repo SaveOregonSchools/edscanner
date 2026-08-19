@@ -94,7 +94,9 @@ class _PinnedSOCKSHandler(socketserver.BaseRequestHandler):
         else:
             raise BoardHTTPError("Unsupported SOCKS5 address type")
         port = int.from_bytes(_recv_exact(self.request, 2), "big")
-        if port not in {80, 443} and not self.server.board_client.settings.allow_private_networks:
+        if port == 80:
+            raise BoardHTTPError("Browser proxy blocked an insecure HTTP destination")
+        if port != 443 and not self.server.board_client.settings.allow_private_networks:
             raise BoardHTTPError(f"Browser proxy blocked non-web destination port {port}")
         return host, port
 

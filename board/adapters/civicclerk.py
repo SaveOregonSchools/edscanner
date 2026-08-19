@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -28,10 +29,16 @@ from .base import (
 )
 
 
+_TENANT_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,126}[a-z0-9]$|^[a-z0-9]$", re.IGNORECASE)
+
+
 def _tenant(url: str) -> str | None:
     host = (urlsplit(url).hostname or "").casefold()
-    if host.endswith(".portal.civicclerk.com") or host.endswith(".api.civicclerk.com"):
-        return host.split(".", 1)[0]
+    for suffix in (".portal.civicclerk.com", ".api.civicclerk.com"):
+        if not host.endswith(suffix):
+            continue
+        tenant = host[: -len(suffix)]
+        return tenant if _TENANT_ID.fullmatch(tenant) else None
     return None
 
 
@@ -81,8 +88,8 @@ class CivicClerkAdapter(BoardPlatformAdapter):
                 "api.civicclerk.com/v1",
             )
         )
-        matched = host_match or html_match
         tenant = _tenant(url)
+        matched = bool(host_match and tenant)
         if tenant:
             canonical = f"https://{tenant}.portal.civicclerk.com/"
             api_base = f"https://{tenant}.api.civicclerk.com/v1"
@@ -92,8 +99,16 @@ class CivicClerkAdapter(BoardPlatformAdapter):
         return DetectionResult(
             matched=matched,
             platform=self.platform_name,
-            confidence=0.99 if host_match else 0.88 if html_match else 0.0,
-            reason=("Public CivicClerk portal detected." if matched else "No CivicClerk public markers found."),
+            confidence=0.99 if matched else 0.0,
+            reason=(
+                "Public CivicClerk tenant portal detected."
+                if matched
+                else (
+                    "CivicClerk branding was found without a canonical tenant host."
+                    if html_match
+                    else "No canonical CivicClerk tenant host found."
+                )
+            ),
             canonical_url=canonical,
             requires_javascript=False,
             metadata={"external_source_id": tenant, "tenant": tenant, "api_base": api_base},

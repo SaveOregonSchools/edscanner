@@ -115,8 +115,22 @@ class BoardExportTests(unittest.TestCase):
         )
         with connect_db(self.db_path) as conn:
             conn.execute(
-                "UPDATE board_discovery_run_items SET board_source_id = ?, status = 'completed' WHERE run_id = ?",
-                (self.source["id"], self.discovery_run_id),
+                """
+                UPDATE board_discovery_run_items
+                SET board_source_id = ?, status = 'completed',
+                    website_original_url = ?, website_final_url = ?
+                WHERE run_id = ?
+                """,
+                (
+                    self.source["id"],
+                    "https://old-district.example/",
+                    "https://district.example/",
+                    self.discovery_run_id,
+                ),
+            )
+            conn.execute(
+                "UPDATE board_discovery_runs SET website_moves_accepted = 1 WHERE id = ?",
+                (self.discovery_run_id,),
             )
             conn.commit()
         self.app = self._make_app()
@@ -263,6 +277,15 @@ class BoardExportTests(unittest.TestCase):
         self.assertEqual(len(discovery_rows), 1)
         self.assertEqual(discovery_rows[0]["run_id"], str(self.discovery_run_id))
         self.assertEqual(discovery_rows[0]["original_source_url"], self.source["source_url"])
+        self.assertEqual(discovery_rows[0]["website_moves_accepted"], "1")
+        self.assertEqual(
+            discovery_rows[0]["website_original_url"],
+            "https://old-district.example/",
+        )
+        self.assertEqual(
+            discovery_rows[0]["website_final_url"],
+            "https://district.example/",
+        )
 
         sync_response = self.client.get(
             f"/school-boards/sync-runs/{self.sync_run_id}/export.csv"

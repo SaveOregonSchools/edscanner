@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from hashlib import sha256
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 from dataclasses import asdict
@@ -10,7 +11,13 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from board.discovery import DiscoveryOutcome, discover_board_source
+from board.discovery import (
+    DISCOVERY_MAX_PAGES,
+    SOURCE_VALIDATION_LIMIT,
+    TRANSPORT_BROWSER_FALLBACK_LIMIT,
+    DiscoveryOutcome,
+    discover_board_source,
+)
 from board.documents import document_identity, store_board_document
 from board.http import (
     BoardHTTPClient,
@@ -23,7 +30,6 @@ from board.models import BoardSource, DocumentRef, DownloadedDocument, MeetingRe
 from board.provider_directories import (
     BOARD_BOOK_DIRECTORY_URL,
     BoardBookDirectoryCatalog,
-    load_enabled_boardbook_directory,
     provider_directory_enabled,
 )
 from board.storage import persist_meeting_bundle, upsert_board_source
@@ -83,6 +89,27 @@ def _read_json_values(value: Any) -> list[str]:
     except (TypeError, json.JSONDecodeError):
         return []
     return _clean_values(parsed if isinstance(parsed, list) else [])
+
+
+def _website_migration_urls(raw: Mapping[str, Any] | None) -> tuple[str | None, str | None]:
+    migration = (raw or {}).get("website_migration")
+    if not isinstance(migration, Mapping):
+        return None, None
+    original = str(
+        migration.get("original_url")
+        or migration.get("from_url")
+        or migration.get("requested_url")
+        or ""
+    ).strip()
+    final = str(
+        migration.get("final_url")
+        or migration.get("to_url")
+        or migration.get("accepted_url")
+        or ""
+    ).strip()
+    if not original or not final or original == final:
+        return None, None
+    return original, final
 
 
 def _district_conditions(
@@ -240,15 +267,19 @@ def create_board_discovery_run(
         db_path=db_path,
     )
     now = utc_now_iso()
+    network_defaults = BoardHTTPSettings()
+    provider_directory_requested = provider_directory_enabled()
     with connect_db(db_path) as conn:
         cursor = conn.execute(
             """
             INSERT INTO board_discovery_runs (
                 states_json, agency_types_json, min_enrollment, max_enrollment,
                 platform_filter, status_filter, max_districts, max_workers,
-                force, debug_logging, status, districts_matched,
+                force, provider_directory_requested, provider_directory_loaded,
+                provider_directory_organizations, network_ipv4_only,
+                network_https_only, debug_logging, status, districts_matched,
                 districts_planned, queued_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'queued', ?, ?, ?)
             """,
             (
                 _json_values(states),
@@ -260,6 +291,9 @@ def create_board_discovery_run(
                 max_districts,
                 max_workers,
                 1 if force else 0,
+                1 if provider_directory_requested else 0,
+                1 if network_defaults.ipv4_only else 0,
+                1 if getattr(network_defaults, "https_only", True) else 0,
                 1 if debug_logging else 0,
                 matched,
                 len(districts),
@@ -303,7 +337,8 @@ def _refresh_discovery_counts(run_id: int, db_path: Path | str | None) -> None:
             """
             UPDATE board_discovery_runs
             SET districts_processed = ?, sources_working = ?, sources_not_found = ?,
-                sources_manual_review = ?, sources_failed = ?
+                sources_manual_review = ?, sources_failed = ?,
+                website_moves_accepted = ?
             WHERE id = ?
             """,
             (
@@ -315,6 +350,16 @@ def _refresh_discovery_counts(run_id: int, db_path: Path | str | None) -> None:
                 + counts.get("blocked_by_challenge", 0)
                 + counts.get("blocked_by_robots", 0),
                 counts.get("failed", 0) + counts.get("error", 0),
+                int(
+                    conn.execute(
+                        """
+                        SELECT COUNT(*) FROM board_discovery_run_items
+                        WHERE run_id = ? AND website_original_url IS NOT NULL
+                              AND website_final_url IS NOT NULL
+                        """,
+                        (run_id,),
+                    ).fetchone()[0]
+                ),
                 run_id,
             ),
         )
@@ -331,6 +376,7 @@ def _execute_discovery_item(
     debug_logger: RunDebugLogger | None,
     db_path: Path | str | None,
 ) -> None:
+    item_started = time.monotonic()
     now = utc_now_iso()
     with connect_db(db_path) as conn:
         claimed = conn.execute(
@@ -362,16 +408,53 @@ def _execute_discovery_item(
                 source_row = upsert_board_source(int(district["id"]), payload, db_path=db_path)
             source_id = int(source_row["id"])
             status = outcome.status if outcome.status in TERMINAL_ITEM_STATUSES else "manual_review"
+        raw = outcome.raw if isinstance(outcome.raw, Mapping) else {}
+        website_original_url, website_final_url = _website_migration_urls(raw)
         with connect_db(db_path) as conn:
             conn.execute(
                 """
                 UPDATE board_discovery_run_items
-                SET board_source_id = ?, status = ?, error_message = ?, finished_at = ?
+                SET board_source_id = ?, status = ?, error_message = ?, finished_at = ?,
+                    website_original_url = ?, website_final_url = ?
                 WHERE id = ?
                 """,
-                (source_id, status, outcome.error_message or None, utc_now_iso(), item_id),
+                (
+                    source_id,
+                    status,
+                    outcome.error_message or None,
+                    utc_now_iso(),
+                    website_original_url,
+                    website_final_url,
+                    item_id,
+                ),
             )
             conn.commit()
+        migration = raw.get("website_migration")
+        debug_log(
+            debug_logger,
+            "board_discovery_outcome",
+            run_id=run_id,
+            item_id=item_id,
+            district_id=district.get("id"),
+            district=district.get("agency_name"),
+            status=status,
+            platform=outcome.platform,
+            source_url=outcome.source_url,
+            organization_external_id=outcome.organization_external_id or None,
+            confidence=outcome.confidence,
+            candidate_count=raw.get("candidate_count", len(raw.get("candidates") or [])),
+            visited_count=len(raw.get("visited_urls") or []),
+            successful_page_fetches=raw.get("successful_page_fetches"),
+            fetch_error_count=len(raw.get("fetch_errors") or []),
+            browser_error_count=len(raw.get("browser_errors") or []),
+            challenge_count=len(raw.get("challenges") or []),
+            challenge_recovery_count=len(raw.get("challenge_recoveries") or []),
+            transport_recovery_count=len(raw.get("transport_recoveries") or []),
+            robots_denial_count=len(raw.get("robots_denials") or []),
+            website_migration=migration,
+            error=outcome.error_message or None,
+            elapsed_seconds=round(time.monotonic() - item_started, 3),
+        )
     except Exception as exc:
         LOGGER.exception("Board discovery item %s failed", item_id)
         debug_log(debug_logger, "board_discovery_error", district=district.get("agency_name"), error=str(exc))
@@ -381,6 +464,17 @@ def _execute_discovery_item(
                 (str(exc), utc_now_iso(), item_id),
             )
             conn.commit()
+        debug_log(
+            debug_logger,
+            "board_discovery_outcome",
+            run_id=run_id,
+            item_id=item_id,
+            district_id=district.get("id"),
+            district=district.get("agency_name"),
+            status="failed",
+            error=str(exc),
+            elapsed_seconds=round(time.monotonic() - item_started, 3),
+        )
     finally:
         _refresh_discovery_counts(run_id, db_path)
 
@@ -416,16 +510,98 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
             return
         if run["debug_log_path"]:
             debug_logger = RunDebugLogger(Path(run["debug_log_path"]))
-        debug_log(debug_logger, "board_discovery_started", run_id=run_id, planned=len(items))
-        client = BoardHTTPClient(
-            BoardHTTPSettings(
-                delay_seconds=BOARD_REQUEST_DELAY_SECONDS,
-                per_host_concurrency=BOARD_PER_HOST_WORKERS,
-                global_concurrency=max(1, int(run["max_workers"])),
+        provider_directory_requested = (
+            provider_directory_enabled()
+            if run["provider_directory_requested"] is None
+            else bool(run["provider_directory_requested"])
+        )
+        network_ipv4_only = (
+            True
+            if run["network_ipv4_only"] is None
+            else bool(run["network_ipv4_only"])
+        )
+        network_https_only = (
+            True
+            if run["network_https_only"] is None
+            else bool(run["network_https_only"])
+        )
+        if any(
+            run[column] is None
+            for column in (
+                "provider_directory_requested",
+                "network_ipv4_only",
+                "network_https_only",
             )
+        ):
+            with connect_db(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE board_discovery_runs
+                    SET provider_directory_requested = COALESCE(provider_directory_requested, ?),
+                        network_ipv4_only = COALESCE(network_ipv4_only, ?),
+                        network_https_only = COALESCE(network_https_only, ?)
+                    WHERE id = ?
+                    """,
+                    (
+                        1 if provider_directory_requested else 0,
+                        1 if network_ipv4_only else 0,
+                        1 if network_https_only else 0,
+                        run_id,
+                    ),
+                )
+                conn.commit()
+        with connect_db(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE board_discovery_runs
+                SET provider_directory_loaded = COALESCE(provider_directory_loaded, 0),
+                    provider_directory_organizations = COALESCE(
+                        provider_directory_organizations, 0
+                    )
+                WHERE id = ?
+                """,
+                (run_id,),
+            )
+            conn.commit()
+        debug_log(
+            debug_logger,
+            "board_discovery_started",
+            run_id=run_id,
+            planned=len(items),
+            matched=int(run["districts_matched"] or 0),
+            states=_read_json_values(run["states_json"]),
+            agency_types=_read_json_values(run["agency_types_json"]),
+            min_enrollment=run["min_enrollment"],
+            max_enrollment=run["max_enrollment"],
+            platform_filter=run["platform_filter"],
+            status_filter=run["status_filter"],
+            max_districts=int(run["max_districts"]),
+            max_workers=int(run["max_workers"]),
+            force=bool(run["force"]),
+            provider_directory_requested=provider_directory_requested,
+            network_ipv4_only=network_ipv4_only,
+            network_https_only=network_https_only,
+            max_pages_per_district=DISCOVERY_MAX_PAGES,
+            transport_browser_fallback_limit=TRANSPORT_BROWSER_FALLBACK_LIMIT,
+            source_validation_limit=SOURCE_VALIDATION_LIMIT,
+        )
+        settings_kwargs: dict[str, Any] = {
+            "delay_seconds": BOARD_REQUEST_DELAY_SECONDS,
+            "per_host_concurrency": BOARD_PER_HOST_WORKERS,
+            "global_concurrency": max(1, int(run["max_workers"])),
+            "ipv4_only": network_ipv4_only,
+        }
+        if "https_only" in BoardHTTPSettings.__dataclass_fields__:
+            settings_kwargs["https_only"] = network_https_only
+        client = BoardHTTPClient(
+            BoardHTTPSettings(**settings_kwargs)
         )
         try:
-            provider_directory = load_enabled_boardbook_directory(client)
+            provider_directory = (
+                BoardBookDirectoryCatalog.fetch(client)
+                if provider_directory_requested
+                else None
+            )
             if provider_directory is not None:
                 with connect_db(db_path) as conn:
                     district_universe = conn.execute(
@@ -446,6 +622,17 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                     organizations=len(provider_directory.entries),
                     district_universe=len(district_universe),
                 )
+                with connect_db(db_path) as conn:
+                    conn.execute(
+                        """
+                        UPDATE board_discovery_runs
+                        SET provider_directory_loaded = 1,
+                            provider_directory_organizations = ?
+                        WHERE id = ?
+                        """,
+                        (len(provider_directory.entries), run_id),
+                    )
+                    conn.commit()
         except Exception as exc:
             LOGGER.warning(
                 "BoardBook provider directory was enabled but could not be loaded; "
@@ -498,21 +685,97 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                 "SELECT districts_processed, sources_failed FROM board_discovery_runs WHERE id = ?",
                 (run_id,),
             ).fetchone()
-            final_status = "cancelled" if cancelled else "failed" if int(counts["districts_processed"] or 0) == int(counts["sources_failed"] or 0) and int(counts["sources_failed"] or 0) else "completed"
+            processed = int(counts["districts_processed"] or 0)
+            failed = int(counts["sources_failed"] or 0)
+            final_status = (
+                "cancelled"
+                if cancelled
+                else "failed"
+                if processed == failed and failed
+                else "completed_with_errors"
+                if failed
+                else "completed"
+            )
             conn.execute(
                 "UPDATE board_discovery_runs SET status = ?, finished_at = ? WHERE id = ?",
                 (final_status, utc_now_iso(), run_id),
             )
-            conn.commit()
-        debug_log(debug_logger, "board_discovery_finished", run_id=run_id, status=final_status)
-    except Exception as exc:
-        LOGGER.exception("Board discovery run %s failed", run_id)
-        with connect_db(db_path) as conn:
-            conn.execute(
-                "UPDATE board_discovery_runs SET status = 'failed', error_message = ?, finished_at = ? WHERE id = ?",
-                (str(exc), utc_now_iso(), run_id),
+            final_counts = dict(
+                conn.execute(
+                    """
+                    SELECT districts_matched, districts_planned, districts_processed,
+                           sources_working, sources_not_found, sources_manual_review,
+                           sources_failed, website_moves_accepted,
+                           provider_directory_requested, provider_directory_loaded,
+                           provider_directory_organizations, network_ipv4_only,
+                           network_https_only
+                    FROM board_discovery_runs WHERE id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
             )
             conn.commit()
+        debug_log(
+            debug_logger,
+            "board_discovery_finished",
+            run_id=run_id,
+            status=final_status,
+            **final_counts,
+        )
+    except Exception as exc:
+        LOGGER.exception("Board discovery run %s failed", run_id)
+        error_message = str(exc) or type(exc).__name__
+        finished_at = utc_now_iso()
+        with connect_db(db_path) as conn:
+            conn.execute(
+                """
+                UPDATE board_discovery_run_items
+                SET status = 'failed',
+                    error_message = COALESCE(error_message, ?),
+                    finished_at = ?
+                WHERE run_id = ? AND status IN ('queued', 'running')
+                """,
+                (
+                    "Run failed before this district could complete: "
+                    + error_message,
+                    finished_at,
+                    run_id,
+                ),
+            )
+            conn.execute(
+                "UPDATE board_discovery_runs SET status = 'failed', error_message = ?, finished_at = ? WHERE id = ?",
+                (error_message, finished_at, run_id),
+            )
+            conn.commit()
+        _refresh_discovery_counts(run_id, db_path)
+        with connect_db(db_path) as conn:
+            final_row = conn.execute(
+                """
+                SELECT districts_matched, districts_planned, districts_processed,
+                       sources_working, sources_not_found, sources_manual_review,
+                       sources_failed, website_moves_accepted,
+                       provider_directory_requested, provider_directory_loaded,
+                       provider_directory_organizations, network_ipv4_only,
+                       network_https_only
+                FROM board_discovery_runs WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        final_counts = dict(final_row) if final_row is not None else {}
+        debug_log(
+            debug_logger,
+            "board_discovery_error",
+            run_id=run_id,
+            error=error_message,
+        )
+        debug_log(
+            debug_logger,
+            "board_discovery_finished",
+            run_id=run_id,
+            status="failed",
+            error=error_message,
+            **final_counts,
+        )
     finally:
         if client is not None:
             client.close()

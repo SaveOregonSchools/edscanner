@@ -110,14 +110,16 @@ class BoardBookAdapter(BoardPlatformAdapter):
                 "agenda-item-information",
             )
         )
-        host_match = host == "meetings.boardbook.org" or host.endswith(".boardbook.org")
-        matched = bool((host_match and path_match) or html_match)
-        confidence = 0.99 if host_match and path_match else 0.94 if host_match and html_match else 0.88 if html_match else 0.0
+        host_match = host == "meetings.boardbook.org"
         organization_id = path_match.group(1) if path_match else None
+        if organization_id and not _ORGANIZATION_ID.fullmatch(organization_id):
+            organization_id = None
+        matched = bool(host_match and organization_id)
+        confidence = 0.99 if matched else 0.0
         canonical_url = (
-            f"{origin_for(url)}/Public/Organization/{organization_id}"
-            if organization_id
-            else url if matched else None
+            f"https://meetings.boardbook.org/Public/Organization/{organization_id}"
+            if matched
+            else None
         )
         organization_name = None
         if html:
@@ -134,7 +136,15 @@ class BoardBookAdapter(BoardPlatformAdapter):
             matched=matched,
             platform=self.platform_name,
             confidence=confidence,
-            reason=("BoardBook public host/markup detected." if matched else "No BoardBook public markers found."),
+            reason=(
+                "BoardBook public organization URL detected."
+                if matched
+                else (
+                    "BoardBook branding was found without a canonical public organization URL."
+                    if html_match
+                    else "No canonical BoardBook public organization URL found."
+                )
+            ),
             canonical_url=canonical_url,
             metadata={
                 "external_source_id": organization_id,

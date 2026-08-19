@@ -31,19 +31,24 @@ from .base import (
 
 _PUBLIC_PATH = re.compile(r"^/([^/]+)/([^/]+)/Board\.nsf/(?:Public)?/?$", re.IGNORECASE)
 _ANY_BOARD_PATH = re.compile(r"^/([^/]+)/([^/]+)/Board\.nsf/", re.IGNORECASE)
+_SOURCE_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
 
 
 def _source_parts(url: str) -> tuple[str | None, str | None]:
     match = _ANY_BOARD_PATH.match(urlsplit(url).path)
-    return (match.group(1), match.group(2)) if match else (None, None)
+    if not match:
+        return None, None
+    state, district = match.group(1), match.group(2)
+    if not _SOURCE_PART.fullmatch(state) or not _SOURCE_PART.fullmatch(district):
+        return None, None
+    return state, district
 
 
 def _canonical_source(url: str) -> str:
     state, district = _source_parts(url)
-    parsed = urlsplit(url)
     if not state or not district:
         return url
-    return f"{parsed.scheme}://{parsed.netloc}/{state}/{district}/Board.nsf/Public"
+    return f"https://go.boarddocs.com/{state}/{district}/Board.nsf/Public"
 
 
 class BoardDocsAdapter(BoardPlatformAdapter):
@@ -59,14 +64,22 @@ class BoardDocsAdapter(BoardPlatformAdapter):
             marker in folded
             for marker in ("boarddocs", "btn-view-agenda", "wrap-items", "board.nsf/pfiles")
         )
-        host_match = host == "go.boarddocs.com" or host.endswith(".boarddocs.com")
-        matched = bool((host_match and path_match) or html_match)
+        host_match = host == "go.boarddocs.com"
         state, district = _source_parts(url)
+        matched = bool(host_match and path_match and state and district)
         return DetectionResult(
             matched=matched,
             platform=self.platform_name,
-            confidence=0.99 if host_match and path_match else 0.9 if html_match else 0.0,
-            reason=("Legacy public BoardDocs portal detected." if matched else "No public BoardDocs markers found."),
+            confidence=0.99 if matched else 0.0,
+            reason=(
+                "Legacy public BoardDocs source URL detected."
+                if matched
+                else (
+                    "BoardDocs branding was found without a canonical public source URL."
+                    if html_match
+                    else "No canonical public BoardDocs source URL found."
+                )
+            ),
             canonical_url=_canonical_source(url) if matched else None,
             requires_javascript=True,
             metadata={

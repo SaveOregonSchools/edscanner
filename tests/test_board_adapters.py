@@ -17,11 +17,12 @@ from board.adapters.simbli import SimbliAdapter
 from board.discovery import (
     BoardSourceCandidate,
     _outcome_from_adapter_result,
+    _source_validation_candidates,
     board_url_allowed,
     discover_board_source,
     extract_board_candidates,
 )
-from board.http import HTTPResult, RobotsDenied
+from board.http import HTTPResult, RedirectDenied, RobotsDenied
 from board.models import (
     BoardSource,
     BoardSourceResult,
@@ -121,6 +122,7 @@ class FakeGenericTransportAdapter:
             else [rendered_pages]
         )
         self.render_calls: list[str] = []
+        self.discover_calls: list[str] = []
 
     def detect(self, url: str, _html=None) -> DetectionResult:
         return DetectionResult(False, self.platform_name, 0.0, canonical_url=url)
@@ -131,12 +133,70 @@ class FakeGenericTransportAdapter:
 
     def discover_source(self, _district, candidate_url: str, html=None) -> BoardSourceResult:
         del html
+        self.discover_calls.append(candidate_url)
         return BoardSourceResult(
             detection=self.detect(candidate_url),
             source=None,
             status="manual_review",
             candidate_url=candidate_url,
             error="Fixture candidate requires manual review.",
+        )
+
+
+class FakeMovedDistrictAdapter:
+    platform_name = "generic"
+
+    def __init__(self, old_url: str, moved_url: str):
+        self.old_url = old_url
+        self.moved_url = moved_url
+        self.homepage_render_calls: list[str] = []
+        self.candidate_calls: list[str] = []
+
+    def detect(self, url: str, _html=None) -> DetectionResult:
+        return DetectionResult(False, self.platform_name, 0.0, canonical_url=url)
+
+    def render_page_with_metadata(self, _url: str) -> RenderedPage:
+        raise AssertionError("Candidate rendering must retain the strict boundary")
+
+    def render_district_website_with_metadata(self, url: str) -> RenderedPage:
+        self.homepage_render_calls.append(url)
+        return RenderedPage(
+            content=(
+                b'<html><body><a href="/school-board/meetings">'
+                b"School Board Meetings</a></body></html>"
+            ),
+            final_url=self.moved_url,
+            status_code=200,
+            browser_rendered=True,
+            redirect_chain=(self.moved_url,),
+            website_migration_accepted=True,
+        )
+
+    def discover_source(
+        self,
+        district,
+        candidate_url: str,
+        html=None,
+    ) -> BoardSourceResult:
+        del html
+        self.candidate_calls.append(candidate_url)
+        source = BoardSource(
+            platform="generic",
+            public_url=candidate_url,
+            district_id=int(district["id"]),
+            organization_name=district["agency_name"],
+            status="working",
+        )
+        return BoardSourceResult(
+            detection=DetectionResult(
+                True,
+                "generic",
+                0.78,
+                canonical_url=candidate_url,
+            ),
+            source=source,
+            status="working",
+            candidate_url=candidate_url,
         )
 
 
@@ -465,6 +525,92 @@ class BoardDiscoveryFixtureTests(unittest.TestCase):
         self.assertIn("board_source_fetch_error", events)
         self.assertIn("board_transport_recovered_with_browser", events)
 
+    def test_initial_configured_website_move_switches_the_district_crawl_base(self):
+        old_url = "https://www.estacada.k12.or.us"
+        moved_url = "https://www.estacadaschools.org"
+        moved_board_url = f"{moved_url}/school-board/meetings"
+        district = {
+            "id": 108,
+            "agency_name": "ESTACADA SD 108",
+            "website": f"{old_url}/",
+            "website_normalized": f"{old_url}/",
+        }
+        client = FakeDiscoveryClient(
+            RedirectDenied(
+                "Redirect left the allowed organization/vendor boundary: "
+                f"{old_url}/ -> {moved_url}/"
+            )
+        )
+        adapter = FakeMovedDistrictAdapter(old_url, moved_url)
+        debug_logger = Mock()
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(
+                district,
+                client=client,
+                debug_logger=debug_logger,
+                max_pages=2,
+            )
+
+        self.assertEqual(outcome.status, "working")
+        self.assertEqual(outcome.source_url, moved_board_url)
+        self.assertEqual(adapter.homepage_render_calls, [old_url])
+        self.assertEqual(adapter.candidate_calls, [moved_board_url])
+        self.assertEqual(client.calls, [old_url, moved_board_url])
+        self.assertEqual(
+            outcome.raw["website_migration"],
+            {
+                "status": "accepted",
+                "evidence": "initial_configured_website_https_redirect",
+                "original_url": old_url,
+                "redirect_chain": [moved_url],
+                "final_url": moved_url,
+                "canonical_website_url": moved_url,
+                "transport": "browser",
+            },
+        )
+        self.assertEqual(
+            outcome.raw["transport_recoveries"][0]["redirect_chain"],
+            [moved_url],
+        )
+        events = [call.args[0] for call in debug_logger.log.call_args_list]
+        self.assertIn("board_district_website_migration_accepted", events)
+
+    def test_http_website_move_is_accepted_without_browser_recovery(self):
+        old_url = "https://www.estacada.k12.or.us"
+        moved_url = "https://www.estacadaschools.org"
+        moved_board_url = f"{moved_url}/school-board/meetings"
+        client = FakeDiscoveryClient(
+            HTTPResult(
+                old_url,
+                moved_url,
+                200,
+                {"Content-Type": "text/html"},
+                b'<html><a href="/school-board/meetings">Board Meetings</a></html>',
+                redirect_chain=(moved_url,),
+                website_migration_accepted=True,
+            )
+        )
+        adapter = FakeMovedDistrictAdapter(old_url, moved_url)
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(
+                {
+                    "id": 108,
+                    "agency_name": "ESTACADA SD 108",
+                    "website": f"{old_url}/",
+                    "website_normalized": f"{old_url}/",
+                },
+                client=client,
+                max_pages=1,
+            )
+
+        self.assertEqual(outcome.status, "working")
+        self.assertEqual(outcome.source_url, moved_board_url)
+        self.assertEqual(adapter.homepage_render_calls, [])
+        self.assertEqual(outcome.raw["website_migration"]["transport"], "http")
+        self.assertEqual(outcome.raw["website_migration"]["final_url"], moved_url)
+
     def test_unrecovered_transport_error_is_classified_as_error(self):
         district_url = "https://district.example/"
         district = {
@@ -500,6 +646,61 @@ class BoardDiscoveryFixtureTests(unittest.TestCase):
         events = [call.args[0] for call in debug_logger.log.call_args_list]
         self.assertIn("board_source_fetch_error", events)
         self.assertIn("board_browser_fallback_error", events)
+
+    def test_provider_adapter_error_is_not_mislabeled_not_found(self):
+        district_url = "https://district.example/"
+        source_url = "https://meetings.boardbook.org/Public/Organization/2413"
+        client = FakeDiscoveryClient(
+            HTTPResult(
+                district_url,
+                district_url,
+                200,
+                {"Content-Type": "text/html"},
+                f'<html><a href="{source_url}">Board meetings</a></html>'.encode(),
+            )
+        )
+
+        class FailingBoardBookAdapter:
+            platform_name = "boardbook"
+
+            def detect(self, url, _html=None):
+                matched = url == source_url
+                return DetectionResult(
+                    matched,
+                    "boardbook",
+                    0.99 if matched else 0.0,
+                    canonical_url=source_url if matched else None,
+                    metadata={"external_source_id": "2413"} if matched else {},
+                )
+
+            def discover_source(self, _district, candidate_url, html=None):
+                del html
+                return BoardSourceResult(
+                    detection=self.detect(candidate_url),
+                    status="error",
+                    candidate_url=candidate_url,
+                    error="fixture provider timeout",
+                )
+
+        adapter = FailingBoardBookAdapter()
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(
+                {
+                    "id": 9,
+                    "agency_name": "Example Schools",
+                    "website": district_url,
+                    "website_normalized": district_url,
+                },
+                client=client,
+                max_pages=1,
+            )
+
+        self.assertEqual(outcome.status, "error")
+        self.assertEqual(outcome.platform, "boardbook")
+        self.assertEqual(outcome.source_url, source_url)
+        self.assertEqual(outcome.organization_external_id, "2413")
+        self.assertEqual(outcome.raw["fetch_errors"][0]["kind"], "adapter")
+        self.assertIn("provider timeout", outcome.error_message)
 
     def test_transport_then_rendered_challenge_stays_blocked_by_challenge(self):
         district_url = "https://district.example/"
@@ -627,6 +828,49 @@ class BoardDiscoveryFixtureTests(unittest.TestCase):
             outcome.raw["fetch_errors"][2]["browser_fallback_attempted"]
         )
 
+    def test_candidate_validation_is_bounded_and_logged(self):
+        district_url = "https://district.example/"
+        links = "".join(
+            f'<a href="/school-board/meetings/archive-{index}">'
+            f"Board meetings agendas and minutes {index}</a>"
+            for index in range(8)
+        )
+        client = FakeDiscoveryClient(
+            HTTPResult(
+                district_url,
+                district_url,
+                200,
+                {"Content-Type": "text/html"},
+                f"<html><body>{links}</body></html>".encode(),
+            )
+        )
+        adapter = FakeGenericTransportAdapter(
+            RenderedPage(b"", district_url, 200, browser_rendered=True)
+        )
+        debug_logger = Mock()
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(
+                {
+                    "id": 9,
+                    "agency_name": "Example Schools",
+                    "website": district_url,
+                    "website_normalized": district_url,
+                },
+                client=client,
+                max_pages=1,
+                debug_logger=debug_logger,
+            )
+
+        self.assertEqual(outcome.status, "manual_review")
+        self.assertEqual(outcome.raw["candidate_count"], 8)
+        self.assertEqual(outcome.raw["candidate_validation_limit"], 5)
+        self.assertEqual(outcome.raw["candidate_validation_count"], 5)
+        self.assertEqual(len(adapter.discover_calls), 5)
+        events = [call.args[0] for call in debug_logger.log.call_args_list]
+        self.assertEqual(events.count("board_candidate_validation_started"), 5)
+        self.assertEqual(events.count("board_candidate_validation_result"), 5)
+
     def test_adapter_confidence_is_normalized_without_rescaling_candidate_scores(self):
         candidate = BoardSourceCandidate(
             url="https://meetings.boardbook.org/Public/Organization/2221",
@@ -714,6 +958,206 @@ class BoardDiscoveryFixtureTests(unittest.TestCase):
             [candidate.url for candidate in candidates],
             ["https://district.example/schoolboard"],
         )
+
+    def test_provider_brand_markers_on_district_wrappers_do_not_verify_sources(self):
+        district = {"id": 1, "agency_name": "Example School District"}
+        cases = (
+            (
+                BoardBookAdapter(),
+                "https://district.example/board-meetings",
+                b"<h1>BoardBook Premier - Agendas and Minutes</h1>",
+            ),
+            (
+                DiligentCommunityAdapter(),
+                "https://district.example/Portal",
+                b"<h1>Diligent Community</h1><script>MeetingsService.svc</script>",
+            ),
+            (
+                BoardDocsAdapter(),
+                "https://district.example/board",
+                b"<h1>BoardDocs</h1><div id='btn-view-agenda'></div>",
+            ),
+            (
+                SimbliAdapter(),
+                "https://district.example/",
+                b"<a href='https://simbli.eboardsolutions.com'>Simbli</a>",
+            ),
+            (
+                CivicClerkAdapter(),
+                "https://district.example/board",
+                b"<h1>CivicClerk Events and Agendas</h1>",
+            ),
+        )
+
+        for adapter, url, content in cases:
+            with self.subTest(platform=adapter.platform_name):
+                detection = adapter.detect(url, content)
+                result = adapter.discover_source(district, url, html=content)
+                self.assertFalse(detection.matched)
+                self.assertEqual(result.status, "manual_review")
+                self.assertIsNone(result.source)
+
+    def test_legacy_civicweb_tenant_is_treated_as_diligent_community(self):
+        detection = DiligentCommunityAdapter().detect(
+            "https://example-district.civicweb.net/Portal/"
+        )
+
+        self.assertTrue(detection.matched)
+        self.assertEqual(detection.metadata["tenant"], "example-district")
+        self.assertEqual(
+            detection.canonical_url,
+            "https://example-district.civicweb.net/Portal/",
+        )
+
+    def test_pendleton_wrapper_extracts_canonical_boardbook_organization(self):
+        content = fixture_bytes("pendleton_board_wrapper.html")
+        wrapper_url = "https://pendleton.k12.or.us/board-meetings/"
+
+        self.assertFalse(BoardBookAdapter().detect(wrapper_url, content).matched)
+        candidates = extract_board_candidates(content, wrapper_url, "https://pendleton.k12.or.us/")
+
+        boardbook = [item for item in candidates if item.known_platform == "boardbook"]
+        self.assertEqual(len(boardbook), 1)
+        self.assertEqual(
+            boardbook[0].url,
+            "https://meetings.boardbook.org/Public/Organization/1559",
+        )
+
+    def test_tillamook_wrapper_extracts_escaped_diligent_tenant_url(self):
+        content = fixture_bytes("tillamook_board_wrapper.html")
+        wrapper_url = "https://www.tillamook.k12.or.us/en-US/school-board-9a741690"
+
+        self.assertFalse(DiligentCommunityAdapter().detect(wrapper_url, content).matched)
+        candidates = extract_board_candidates(content, wrapper_url, "https://www.tillamook.k12.or.us/")
+
+        diligent = [item for item in candidates if item.known_platform == "diligent_community"]
+        self.assertEqual(len(diligent), 1)
+        self.assertEqual(
+            diligent[0].url,
+            "https://tillamook-k12-or.community.diligentoneplatform.com/Portal/MeetingInformation.aspx?Id=175",
+        )
+        self.assertIn("embedded public provider URL", diligent[0].evidence)
+
+    def test_robots_blocked_provider_retains_canonical_identity(self):
+        district_url = "https://www.tillamook.k12.or.us/school-board"
+        content = fixture_bytes("tillamook_board_wrapper.html")
+
+        class RobotsClient:
+            def get(self, url, **_kwargs):
+                if "tillamook.k12.or.us" in url:
+                    return HTTPResult(
+                        district_url,
+                        district_url,
+                        200,
+                        {"Content-Type": "text/html"},
+                        content,
+                    )
+                raise RobotsDenied(f"robots.txt disallows {url}")
+
+        client = RobotsClient()
+        adapter = DiligentCommunityAdapter(client, allow_browser_fallback=True)
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(
+                {
+                    "id": 82,
+                    "agency_name": "TILLAMOOK SD 9",
+                    "website": district_url,
+                    "website_normalized": district_url,
+                },
+                client=client,
+                max_pages=1,
+            )
+
+        self.assertEqual(outcome.status, "blocked_by_robots")
+        self.assertEqual(outcome.platform, "diligent_community")
+        self.assertEqual(
+            outcome.source_url,
+            "https://tillamook-k12-or.community.diligentoneplatform.com/Portal/",
+        )
+        self.assertEqual(outcome.organization_external_id, "tillamook-k12-or")
+        self.assertEqual(outcome.platform_tenant, "tillamook-k12-or")
+        self.assertEqual(
+            outcome.raw["detection"]["metadata"]["external_source_id"],
+            "tillamook-k12-or",
+        )
+
+    def test_crook_simbli_policy_link_is_not_a_meeting_source(self):
+        content = fixture_bytes("crook_policy_only.html")
+        page_url = "https://www.crookcountyschools.org/"
+        policy_url = (
+            "https://simbli.eboardsolutions.com/Policy/PolicyListing.aspx?S=36032023"
+        )
+
+        self.assertFalse(SimbliAdapter().detect(policy_url, content).matched)
+        candidates = extract_board_candidates(content, page_url, page_url)
+        urls = {candidate.url for candidate in candidates}
+
+        self.assertNotIn(policy_url, urls)
+        self.assertNotIn(
+            "https://www.crookcountyschools.org/school-board/board-members",
+            urls,
+        )
+        self.assertIn(
+            "https://www.crookcountyschools.org/school-board/agendas-minutes",
+            urls,
+        )
+
+    def test_willamina_one_off_board_news_article_remains_manual_review(self):
+        adapter = GenericBoardAdapter()
+        url = (
+            "https://www.willamina.k12.or.us/district/news/2025-2026-news/"
+            "12325-monday-dec-8th-school-board-meeting-to-take-place-on-ctgr-campus"
+        )
+        content = fixture_bytes("willamina_board_news.html")
+
+        detection = adapter.detect(url, content)
+        source = adapter.parse_source(content, url, {"id": 1, "agency_name": "Willamina SD 30J"})
+
+        self.assertTrue(detection.matched)
+        self.assertTrue(detection.metadata["one_off_content_url"])
+        self.assertFalse(detection.metadata["durable_meeting_hub"])
+        self.assertEqual(source.status, "manual_review")
+
+    def test_candidate_pruning_keeps_hubs_and_provider_iframes(self):
+        candidates = extract_board_candidates(
+            fixture_bytes("candidate_pruning.html"),
+            "https://district.example/",
+            "https://district.example/",
+        )
+        urls = {candidate.url for candidate in candidates}
+
+        self.assertEqual(
+            urls,
+            {
+                "https://district.example/board-meetings",
+                "https://district.example/school-board/agendas-minutes",
+                "https://usbe.portal.civicclerk.com",
+            },
+        )
+
+    def test_validation_budget_reserves_slots_for_known_providers(self):
+        generic = [
+            BoardSourceCandidate(
+                f"https://district.example/board-{index}",
+                "Board meetings",
+                "https://district.example/",
+                100 - index,
+                "generic",
+            )
+            for index in range(5)
+        ]
+        provider = BoardSourceCandidate(
+            "https://meetings.boardbook.org/Public/Organization/2413",
+            "BoardBook",
+            "https://district.example/",
+            40,
+            "boardbook",
+        )
+
+        selected = _source_validation_candidates([*generic, provider], limit=5)
+
+        self.assertEqual(selected[0], provider)
+        self.assertEqual(len(selected), 5)
 
     def test_registry_and_generic_detection_use_deterministic_markers(self):
         cases = (
@@ -996,6 +1440,8 @@ class OtherPlatformFixtureTests(unittest.TestCase):
         content = fixture_bytes("generic_board_page.html")
         detection = adapter.detect(url, content)
         self.assertTrue(detection.matched)
+        self.assertTrue(detection.metadata["durable_meeting_hub"])
+        self.assertEqual(adapter.parse_source(content, url).status, "working")
         meetings = adapter.parse_meeting_list(content, url)
         self.assertEqual(len(meetings), 3)
         self.assertTrue(all(meeting.meeting_date == "2026-08-10" for meeting in meetings))

@@ -294,6 +294,12 @@ workflow for public school-board records:
    only after at least one page was inspected; all-page transport failures are
    reported as errors instead. This distinction applies to new runs; older
    `not_found` records may predate it and should be rediscovered if uncertain.
+   Imported HTTP addresses are upgraded to HTTPS and board discovery never
+   falls back to unencrypted HTTP. A configured district homepage's initial
+   move to another public HTTPS hostname is accepted as the current crawl base
+   and recorded in the run ledger; subsequent page, vendor, document, and
+   candidate redirects retain the strict boundary. Browser subresources retain
+   public-target/DNS-pinning checks and cannot authorize another website move.
 2. **Review Sources** lets an operator validate and save a public portal URL for
    a district when automatic discovery misses or misidentifies it. A source
    becomes working only after the adapter verifies the public endpoint and the
@@ -316,6 +322,18 @@ backfills idempotent. Cancellation keeps records and versions already saved.
 Requests use shared global and per-host concurrency gates, a configurable delay,
 finite timeouts, bounded retries, `Retry-After`, within-run URL caching, and
 conditional `ETag`/`Last-Modified` document requests where servers support them.
+Discovery validates only a bounded set of high-quality source candidates,
+records each validation's duration and result, and emits a terminal debug event
+for every district. Known platforms must resolve to a canonical vendor endpoint
+with a usable organization, tenant, or site identifier. Generic sources require
+a durable meeting hub or archive with repeated meeting/document evidence; a
+single news article, event, policy page, media asset, or opaque resource-manager
+URL cannot become a working source.
+At startup, EdScanner audits older `working` rows against these identity rules.
+It repairs an organization, tenant, or site ID only when it can be derived from
+a canonical provider URL; otherwise the evidence is preserved and the row is
+downgraded to `manual_review`. Operator-confirmed manual sources are excluded
+from this automatic reclassification.
 
 BoardBook provider-directory lookup is available only as an explicit opt-in. Its
 public directory exposes names and organization IDs but no state, so EdScanner
@@ -329,6 +347,9 @@ enable it only if your organization has confirmed permission under the current
 Manual source entry remains available without this option. The initial provider-
 directory implementation covers BoardBook only; other platforms continue through
 district-site links or manual entry until an authorized directory is documented.
+The run record and CSV ledger state whether lookup was requested, whether the
+catalog loaded, and the organization count, so an operator can distinguish a
+disabled directory from a directory that failed to load.
 
 The adapter status for this release is:
 
@@ -338,7 +359,7 @@ The adapter status for this release is:
 - **Diligent Community / iCompass and modern CivicClerk:** anonymous public JSON
   listing/detail/document adapters.
 - **Legacy BoardDocs and Simbli/eBOARDsolutions:** rendered-public-page parsers
-  are included. Sites that return a WAF/Incapsula challenge to ordinary HTTP get
+  are included. Sites that return a WAF/Incapsula challenge to an ordinary request get
   one bounded Chromium recovery; a remaining challenge is recorded for manual
   review rather than bypassed.
 - **Generic:** conservative fallback for obvious public meeting/agenda links.
@@ -498,7 +519,8 @@ The School Board module also provides CSV exports for:
 - filtered Board Search results with meeting, agenda-item/document, retrieval,
   and original-public-source provenance
 - discovery-run and sync-run item ledgers with per-district/source status,
-  counters, timing, and errors
+  counters, timing, errors, accepted district-website moves, network policy, and
+  provider-directory provenance
 
 Export links preserve active filters but intentionally omit pagination so the
 CSV contains the full filtered result set. Columns and row ordering are stable,
@@ -580,8 +602,11 @@ $env:EDSCANNER_LLM_API_KEY="optional"
 
 Board collection rejects localhost, private, link-local, and reserved network
 targets by default, validates each bounded redirect hop, and never silently
-retries with TLS verification disabled. Ordinary hosts use Requests' normal
-certificate verifier. The exact compatibility host `meetings.boardbook.org`
+retries with TLS verification disabled. Ordinary hosts use a pinned OpenSSL
+context loaded before network I/O with certifi plus a static snapshot of Windows
+ROOT certificates trusted for server authentication. This fixes incomplete-chain
+sites without allowing operating-system AIA retrieval for arbitrary district
+hosts. The exact compatibility host `meetings.boardbook.org`
 uses the operating system's native trust store for Windows certificate-chain
 handling; this is not extended to arbitrary district or manually entered hosts.
 Board networking is IPv4-only by default (`EDSCANNER_BOARD_IPV4_ONLY=true`) so
@@ -597,6 +622,12 @@ also requires both an explicit opt-in and a comma-separated exact/domain-suffix
 host allowlist in `EDSCANNER_BOARD_INSECURE_SSL_HOSTS`; affected responses are
 logged and marked with `insecure_tls` provenance. The per-client board response
 cache is an LRU bounded by both entry count and total bytes.
+
+Board discovery debug logs include the complete submitted run configuration,
+provider-directory load state, candidate validation start/result timing, one
+terminal outcome per district, accepted website-move evidence, and final run
+counters. A mixed run is marked `completed_with_errors`; `completed` now means
+that no district work item failed.
 
 Use `EDSCANNER_DISABLE_WORKER=1` only for tests or diagnostics when the
 background worker should not start automatically.

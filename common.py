@@ -680,6 +680,12 @@ def init_db(db_path: Path | str | None = None) -> None:
                 max_districts INTEGER NOT NULL,
                 max_workers INTEGER NOT NULL,
                 force INTEGER NOT NULL DEFAULT 0,
+                provider_directory_requested INTEGER,
+                provider_directory_loaded INTEGER,
+                provider_directory_organizations INTEGER,
+                network_ipv4_only INTEGER,
+                network_https_only INTEGER,
+                website_moves_accepted INTEGER NOT NULL DEFAULT 0,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
                 debug_logging INTEGER NOT NULL DEFAULT 1,
                 status TEXT NOT NULL,
@@ -706,6 +712,8 @@ def init_db(db_path: Path | str | None = None) -> None:
                 error_message TEXT,
                 started_at TEXT,
                 finished_at TEXT,
+                website_original_url TEXT,
+                website_final_url TEXT,
                 UNIQUE(run_id, district_id)
             );
 
@@ -1091,6 +1099,32 @@ def init_db(db_path: Path | str | None = None) -> None:
             "CREATE INDEX IF NOT EXISTS idx_board_sources_district_active "
             "ON board_sources(district_id, is_active, updated_at DESC)"
         )
+        existing_board_discovery_run_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_discovery_runs)")
+        }
+        board_discovery_run_migrations = {
+            "provider_directory_requested": "INTEGER",
+            "provider_directory_loaded": "INTEGER",
+            "provider_directory_organizations": "INTEGER",
+            "network_ipv4_only": "INTEGER",
+            "network_https_only": "INTEGER",
+            "website_moves_accepted": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, declaration in board_discovery_run_migrations.items():
+            if column not in existing_board_discovery_run_columns:
+                conn.execute(
+                    f"ALTER TABLE board_discovery_runs ADD COLUMN {column} {declaration};"
+                )
+        existing_board_discovery_item_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_discovery_run_items)")
+        }
+        for column in ("website_original_url", "website_final_url"):
+            if column not in existing_board_discovery_item_columns:
+                conn.execute(
+                    f"ALTER TABLE board_discovery_run_items ADD COLUMN {column} TEXT;"
+                )
         existing_board_document_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(board_documents)")

@@ -322,6 +322,8 @@ class RenderedPage:
     final_url: str
     status_code: int
     browser_rendered: bool = False
+    redirect_chain: tuple[str, ...] = ()
+    website_migration_accepted: bool = False
 
 
 class RenderedPageRejected(RuntimeError):
@@ -445,6 +447,10 @@ def _validate_browser_route(
     validation without being mistaken for top-level redirects.
     """
 
+    if urlsplit(str(request_url or "")).scheme.casefold() != "https":
+        raise InvalidPublicURL(
+            f"Browser network requests must use HTTPS: {request_url}"
+        )
     target_url = client.validate_target_url(request_url)
     if main_frame_navigation and not client.redirect_allowed(requested_url, target_url):
         raise InvalidPublicURL(
@@ -454,6 +460,95 @@ def _validate_browser_route(
     if main_frame_navigation and not client.can_fetch(target_url):
         raise RobotsDenied(f"robots.txt disallows browser rendering for {target_url}")
     return target_url
+
+
+class _BrowserNavigationPolicy:
+    """Keep one explicitly enabled district-homepage move narrowly bounded.
+
+    Ordinary adapter rendering retains the existing organization/vendor
+    boundary.  Discovery may opt the district's *initial configured website*
+    into one cross-host server redirect while ``initial_navigation_open`` is
+    true.  Both ends must be HTTPS, every target is still resolved through the
+    client's public-address policy, and any later main-frame navigation must
+    remain related to the newly accepted host.
+    """
+
+    def __init__(
+        self,
+        client: BoardHTTPClient,
+        requested_url: str,
+        *,
+        allow_district_website_move: bool = False,
+    ) -> None:
+        self.client = client
+        self.requested_url = client.validate_target_url(requested_url)
+        self.active_base_url = self.requested_url
+        self.allow_district_website_move = bool(allow_district_website_move)
+        self.initial_navigation_open = True
+        self.website_migration_accepted = False
+        self.redirect_chain: list[str] = []
+
+    def close_initial_navigation(self) -> None:
+        self.initial_navigation_open = False
+
+    def _may_accept_district_website_move(
+        self,
+        target_url: str,
+        redirected_from_url: str,
+    ) -> bool:
+        if (
+            not self.allow_district_website_move
+            or not self.initial_navigation_open
+            or self.website_migration_accepted
+            or not redirected_from_url
+        ):
+            return False
+        source = self.client.validate_target_url(redirected_from_url)
+        if urlsplit(self.requested_url).scheme.casefold() != "https":
+            return False
+        if urlsplit(target_url).scheme.casefold() != "https":
+            return False
+        if urlsplit(redirected_from_url).scheme.casefold() != "https":
+            return False
+        # The redirect that establishes the move must itself originate inside
+        # the configured district site's ordinary boundary.  A vendor page or
+        # a previously moved host cannot bootstrap another unrelated move.
+        return self.client.redirect_allowed(self.requested_url, source)
+
+    def validate(
+        self,
+        request_url: str,
+        *,
+        main_frame_navigation: bool,
+        redirected_from_url: str = "",
+    ) -> str:
+        if urlsplit(str(request_url or "")).scheme.casefold() != "https":
+            raise InvalidPublicURL(
+                f"Browser network requests must use HTTPS: {request_url}"
+            )
+        target_url = self.client.validate_target_url(request_url)
+        if not main_frame_navigation:
+            return target_url
+
+        if not self.client.redirect_allowed(self.active_base_url, target_url):
+            if not self._may_accept_district_website_move(
+                target_url,
+                redirected_from_url,
+            ):
+                raise InvalidPublicURL(
+                    "Browser navigation left the allowed public boundary: "
+                    f"{self.active_base_url} -> {target_url}"
+                )
+            self.active_base_url = target_url
+            self.website_migration_accepted = True
+
+        if not self.client.can_fetch(target_url):
+            raise RobotsDenied(f"robots.txt disallows browser rendering for {target_url}")
+        if target_url != self.requested_url and (
+            not self.redirect_chain or self.redirect_chain[-1] != target_url
+        ):
+            self.redirect_chain.append(target_url)
+        return target_url
 
 
 def _browser_navigation_scope(request: Any, page: Any) -> str:
@@ -801,12 +896,27 @@ class BoardPlatformAdapter(ABC):
             )
         return self._render_page_result(url)
 
+    def render_district_website_with_metadata(self, url: str) -> RenderedPage:
+        """Render only the configured district homepage with move detection.
+
+        Discovery calls this narrow entry point for its initial website URL.
+        Candidate pages and normal adapter/browser work continue to call
+        :meth:`render_page_with_metadata` and cannot opt into a website move.
+        """
+
+        return self._render_page_result(url, allow_district_website_move=True)
+
     def render_page(self, url: str) -> bytes:
         """Backward-compatible bytes-only wrapper for rendered pages."""
 
         return self._render_page_result(url).content
 
-    def _render_page_result(self, url: str) -> RenderedPage:
+    def _render_page_result(
+        self,
+        url: str,
+        *,
+        allow_district_website_move: bool = False,
+    ) -> RenderedPage:
         if not self.allow_browser_fallback:
             raise RuntimeError("Browser fallback is disabled for this adapter.")
         if not self.client.can_fetch(url):
@@ -823,6 +933,11 @@ class BoardPlatformAdapter(ABC):
 
         timeout_ms = max(1000, int(self.client.settings.timeout_seconds * 1000))
         requested_url = self.client.validate_target_url(url)
+        navigation_policy = _BrowserNavigationPolicy(
+            self.client,
+            requested_url,
+            allow_district_website_move=allow_district_website_move,
+        )
         navigation_status = 200
         navigation_seen = False
         navigation_policy_error: BoardHTTPError | None = None
@@ -880,9 +995,9 @@ class BoardPlatformAdapter(ABC):
                     }:
                         route.continue_()
                         return
-                    if request_scheme not in {"http", "https"}:
+                    if request_scheme != "https":
                         LOGGER.warning(
-                            "Blocked unsupported browser network scheme %s for %s",
+                            "Blocked non-HTTPS browser network scheme %s for %s",
                             request_scheme or "(missing)",
                             request_url,
                         )
@@ -897,11 +1012,19 @@ class BoardPlatformAdapter(ABC):
                         route.abort("blockedbyclient")
                         return
                     try:
-                        _validate_browser_route(
-                            self.client,
-                            requested_url,
+                        redirected_from_url = ""
+                        if navigation_scope == "main":
+                            try:
+                                redirected_from = route.request.redirected_from
+                                redirected_from_url = str(
+                                    getattr(redirected_from, "url", "") or ""
+                                )
+                            except Exception:
+                                redirected_from_url = ""
+                        navigation_policy.validate(
                             request_url,
                             main_frame_navigation=navigation_scope == "main",
+                            redirected_from_url=redirected_from_url,
                         )
                     except RobotsDenied as exc:
                         if navigation_scope == "main":
@@ -936,17 +1059,17 @@ class BoardPlatformAdapter(ABC):
                     if navigation_policy_error is not None:
                         raise navigation_policy_error from exc
                     raise
+                finally:
+                    navigation_policy.close_initial_navigation()
                 if navigation_policy_error is not None:
                     raise navigation_policy_error
                 details = _main_frame_response_details(page, navigation_response)
                 if details is not None and not navigation_seen:
                     navigation_status = details[0]
-                final_url = self.client.validate_target_url(page.url)
-                if not self.client.redirect_allowed(requested_url, final_url):
-                    raise InvalidPublicURL(
-                        f"Browser navigation left the allowed public boundary: "
-                        f"{requested_url} -> {final_url}"
-                    )
+                final_url = navigation_policy.validate(
+                    page.url,
+                    main_frame_navigation=True,
+                )
                 try:
                     page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 5000))
                 except PlaywrightTimeoutError:
@@ -961,12 +1084,10 @@ class BoardPlatformAdapter(ABC):
                     raise
                 if navigation_policy_error is not None:
                     raise navigation_policy_error
-                final_url = self.client.validate_target_url(page.url)
-                if not self.client.redirect_allowed(requested_url, final_url):
-                    raise InvalidPublicURL(
-                        f"Browser interaction left the allowed public boundary: "
-                        f"{requested_url} -> {final_url}"
-                    )
+                final_url = navigation_policy.validate(
+                    page.url,
+                    main_frame_navigation=True,
+                )
                 content = page.content().encode("utf-8")
             finally:
                 browser.close()
@@ -979,6 +1100,10 @@ class BoardPlatformAdapter(ABC):
             final_url=final_url,
             status_code=navigation_status,
             browser_rendered=True,
+            redirect_chain=tuple(navigation_policy.redirect_chain),
+            website_migration_accepted=(
+                navigation_policy.website_migration_accepted
+            ),
         )
         browser_challenge = assess_challenge(navigation_status, content, final_url)
         if browser_challenge.is_challenge:
