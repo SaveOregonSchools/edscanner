@@ -10,8 +10,8 @@
   {% include "_board_nav.html" %}
 
   <section class="guidance-card">
-    <h3>How discovery handles blocked pages</h3>
-    <p>If an ordinary public request returns a likely access challenge, EdScanner can make one bounded retry with a real Chromium browser and feed the rendered page back into normal link detection. It does not retry rate limits, solve CAPTCHAs, rotate browser identities, or bypass robots policy. If recovery still fails, use <a href="{{ url_for('boards.sources') }}">Board Sources</a> to add or correct the public source manually.</p>
+    <h3>How discovery handles blocked or unreachable pages</h3>
+    <p>If an ordinary public request returns a likely access challenge, EdScanner can make one bounded retry with a real Chromium browser and feed the rendered page back into normal link detection. Connection-stack or certificate-chain failures have a separate two-page browser budget so a district homepage can lead to its board page. It does not retry rate limits, solve CAPTCHAs, rotate browser identities, or bypass robots policy. If recovery still fails, use <a href="{{ url_for('boards.sources') }}">Board Sources</a> to add or correct the public source manually.</p>
     <p><strong>Provider-directory matching is {{ 'enabled' if provider_directory_enabled else 'disabled' }}.</strong> {{ provider_directory_warning }} {% if not provider_directory_enabled %}After confirming permission, set <code>EDSCANNER_BOARD_PROVIDER_DIRECTORY_ENABLED=true</code> and restart EdScanner to enable it.{% endif %} When authorized and enabled, BoardBook names are only candidate leads; EdScanner requires state evidence plus a unique reciprocal NCES name-and-city match (or district-homepage evidence) and rejects ambiguous matches. See the <a href="https://www.boardbook.org/boardbook-terms-and-conditions-of-use" target="_blank" rel="noopener">current BoardBook terms</a> before enabling it.</p>
   </section>
 
@@ -25,7 +25,14 @@
       <div><label for="max_enrollment">Max enrollment</label><input id="max_enrollment" name="max_enrollment" type="number" value="{{ max_enrollment or '' }}"></div>
       <div><label for="max_districts">Maximum districts</label><input id="max_districts" name="max_districts" type="number" min="1" max="1000" value="{{ max_districts }}"></div>
       <div><label for="max_workers">District workers</label><input id="max_workers" name="max_workers" type="number" min="1" max="8" value="{{ max_workers }}"><p class="field-note">Vendor requests are also limited per host.</p></div>
-      <div class="checkbox-field"><input id="force" name="force" type="checkbox" value="1" {% if force %}checked{% endif %}><label for="force">Recheck existing sources</label></div>
+      <div>
+        <label for="force">Discovery scope</label>
+        <select id="force" name="force">
+          <option value="0" {% if not force %}selected{% endif %}>Default — districts not yet checked</option>
+          <option value="1" {% if force %}selected{% endif %}>Rediscover — include districts with saved sources</option>
+        </select>
+        <p class="field-note">Default scope selects districts with no saved source. Choosing a specific source status instead selects districts with that saved status. Rediscover treats “Not yet checked” as “Any status” and reruns discovery from each selected district's public website; a specific status or platform narrows that rediscovery. A platform filter requires saved-source records, so combine it with Rediscover or a specific status.</p>
+      </div>
       <div class="checkbox-field"><input id="debug_logging" name="debug_logging" type="checkbox" value="1" {% if debug_logging %}checked{% endif %}><label for="debug_logging">Capture debug log</label></div>
       <div class="form-actions full"><button type="submit">Queue source discovery</button></div>
     </form>

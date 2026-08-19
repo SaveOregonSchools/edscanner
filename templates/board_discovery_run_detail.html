@@ -32,7 +32,7 @@
   <section class="content-section"><h2>Run Settings</h2><table class="key-table"><tbody>
     <tr><th>States</th><td>{{ states|join(', ') if states else 'All' }}</td></tr><tr><th>Agency types</th><td>{{ agency_types|join(', ') if agency_types else 'All' }}</td></tr>
     <tr><th>Enrollment</th><td>{{ run.min_enrollment|fmt_int or 'Any' }} to {{ run.max_enrollment|fmt_int or 'Any' }}</td></tr><tr><th>Platform/status</th><td>{{ run.platform_filter or 'Any' }} / {{ run.status_filter or 'Any' }}</td></tr>
-    <tr><th>Workers</th><td>{{ run.max_workers }}</td></tr><tr><th>Force</th><td>{{ 'Yes' if run.force else 'No' }}</td></tr><tr><th>Started</th><td>{{ run.started_at|fmt_dt }}</td></tr><tr><th>Finished</th><td>{{ run.finished_at|fmt_dt }}</td></tr>
+    <tr><th>Workers</th><td>{{ run.max_workers }}</td></tr><tr><th>Discovery scope</th><td>{{ 'Rediscover district sites, including districts with saved sources' if run.force else 'Districts not yet checked by default (or an explicitly selected saved-source status)' }}</td></tr><tr><th>Started</th><td>{{ run.started_at|fmt_dt }}</td></tr><tr><th>Finished</th><td>{{ run.finished_at|fmt_dt }}</td></tr>
     {% if run.error_message %}<tr><th>Message</th><td>{{ run.error_message }}</td></tr>{% endif %}
   </tbody></table></section>
 

@@ -174,7 +174,12 @@ class BoardRouteSmokeTests(unittest.TestCase):
         cases = (
             ("/school-boards", "School Boards", "Working sources"),
             ("/school-boards/sources?state=OR", "Board Sources", "Route Test District"),
-            ("/school-boards/discover", "Discover Board Sources", "Matching districts"),
+            (
+                "/school-boards/discover",
+                "Discover Board Sources",
+                "Matching districts",
+                "Discovery scope",
+            ),
             ("/school-boards/sync", "Sync Board Meetings", "Working sources"),
             ("/school-boards/meetings", "Board Meetings", "Route Test Board Meeting"),
             (
@@ -192,6 +197,7 @@ class BoardRouteSmokeTests(unittest.TestCase):
                 f"/school-boards/discovery-runs/{self.discovery_run_id}",
                 f"Board Source Discovery #{self.discovery_run_id}",
                 "Route Test District",
+                "Rediscover district sites, including districts with saved sources",
             ),
             (
                 f"/school-boards/sync-runs/{self.sync_run_id}",
@@ -280,11 +286,26 @@ class BoardRouteSmokeTests(unittest.TestCase):
         self.assertEqual(discovery["districts_planned"], 1)
         self.assertEqual(accidental_sync, 0)
 
-    def test_force_recheck_overrides_the_default_unchecked_filter(self):
+    def test_discovery_scope_control_submits_an_explicit_default_value(self):
+        response = self.client.get("/school-boards/discover")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn('<select id="force" name="force">', body)
+        self.assertIn('<option value="0" selected>', body)
+        self.assertIn('<option value="1"', body)
+        self.assertNotIn('name="force" type="checkbox"', body)
+
+    def test_rediscovery_scope_persists_force_and_plans_existing_sources(self):
         with patch("board.web.enqueue_discovery_run") as enqueue:
             response = self.client.post(
                 "/school-boards/discover",
-                data={"states": "OR", "force": "1", "max_districts": "10"},
+                data={
+                    "states": "OR",
+                    "status_filter": "__unchecked__",
+                    "force": "1",
+                    "max_districts": "10",
+                },
             )
         self.assertEqual(response.status_code, 302)
         run_id = enqueue.call_args.args[0]
@@ -296,6 +317,89 @@ class BoardRouteSmokeTests(unittest.TestCase):
         self.assertIsNone(run["status_filter"])
         self.assertEqual(run["force"], 1)
         self.assertEqual(run["districts_planned"], 1)
+
+        detail = self.client.get(f"/school-boards/discovery-runs/{run_id}")
+        self.assertEqual(detail.status_code, 200)
+        self.assertIn("Discovery scope", detail.get_data(as_text=True))
+        self.assertIn(
+            "Rediscover district sites, including districts with saved sources",
+            detail.get_data(as_text=True),
+        )
+
+    def test_default_scope_explicit_force_zero_excludes_existing_sources(self):
+        with patch("board.web.enqueue_discovery_run") as enqueue:
+            response = self.client.post(
+                "/school-boards/discover",
+                data={
+                    "states": "OR",
+                    "status_filter": "__unchecked__",
+                    "force": "0",
+                    "max_districts": "10",
+                },
+            )
+        self.assertEqual(response.status_code, 302)
+        run_id = enqueue.call_args.args[0]
+        with connect_db(self.db_path) as conn:
+            run = conn.execute(
+                "SELECT status_filter, force, districts_matched, districts_planned "
+                "FROM board_discovery_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        self.assertEqual(run["status_filter"], "__unchecked__")
+        self.assertEqual(run["force"], 0)
+        self.assertEqual(run["districts_matched"], 0)
+        self.assertEqual(run["districts_planned"], 0)
+
+    def test_specific_status_selects_saved_sources_without_rediscovery_mode(self):
+        with patch("board.web.enqueue_discovery_run") as enqueue:
+            response = self.client.post(
+                "/school-boards/discover",
+                data={
+                    "states": "OR",
+                    "status_filter": "working",
+                    "force": "0",
+                    "max_districts": "10",
+                },
+            )
+        self.assertEqual(response.status_code, 302)
+        run_id = enqueue.call_args.args[0]
+        with connect_db(self.db_path) as conn:
+            run = conn.execute(
+                "SELECT status_filter, force, districts_planned "
+                "FROM board_discovery_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+        self.assertEqual(run["status_filter"], "working")
+        self.assertEqual(run["force"], 0)
+        self.assertEqual(run["districts_planned"], 1)
+
+    def test_platform_filter_needs_rediscovery_when_status_is_unchecked(self):
+        planned_by_force = {}
+        for force in ("0", "1"):
+            with self.subTest(force=force):
+                with patch("board.web.enqueue_discovery_run") as enqueue:
+                    response = self.client.post(
+                        "/school-boards/discover",
+                        data={
+                            "states": "OR",
+                            "status_filter": "__unchecked__",
+                            "platform_filter": "boardbook",
+                            "force": force,
+                            "max_districts": "10",
+                        },
+                    )
+                self.assertEqual(response.status_code, 302)
+                run_id = enqueue.call_args.args[0]
+                with connect_db(self.db_path) as conn:
+                    run = conn.execute(
+                        "SELECT status_filter, platform_filter, force, districts_planned "
+                        "FROM board_discovery_runs WHERE id = ?",
+                        (run_id,),
+                    ).fetchone()
+                planned_by_force[force] = run["districts_planned"]
+                self.assertEqual(run["platform_filter"], "boardbook")
+
+        self.assertEqual(planned_by_force, {"0": 0, "1": 1})
 
     def test_route_validation_and_missing_records_return_clear_http_errors(self):
         self.assertEqual(self.client.get("/school-boards/meetings/999999").status_code, 404)

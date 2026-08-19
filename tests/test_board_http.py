@@ -6,7 +6,6 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
 
-from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import SSLError
 from requests.adapters import HTTPAdapter
 
@@ -465,7 +464,7 @@ class BoardHTTPPolicyTests(unittest.TestCase):
             origin.server_close()
             origin_thread.join(timeout=2)
 
-    def test_each_validated_address_is_tried_even_when_retries_are_disabled(self):
+    def test_mixed_dns_answers_pin_only_ipv4_by_default(self):
         answers = [
             (socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("2001:4860::1", 443, 0, 0)),
             (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("93.184.216.34", 443)),
@@ -474,20 +473,72 @@ class BoardHTTPPolicyTests(unittest.TestCase):
             self.settings(max_retries=0, backoff_base_seconds=0, backoff_max_seconds=0),
             session=SequenceSession([]),
         )
-        response = FakeResponse("https://district.example/", content=b"fallback")
+        response = FakeResponse("https://district.example/", content=b"ipv4")
         with (
-            patch("board.http.socket.getaddrinfo", return_value=answers),
+            patch("board.http.socket.getaddrinfo", return_value=answers) as resolver,
             patch.object(
                 client,
                 "_perform_get",
-                side_effect=[RequestsConnectionError("IPv6 unavailable"), (response, "verified")],
+                return_value=(response, "verified"),
             ) as perform_get,
         ):
             result = client.get("https://district.example/", force=True)
-        self.assertEqual(result.content, b"fallback")
+        self.assertEqual(result.content, b"ipv4")
         self.assertEqual(
             [call.args[2] for call in perform_get.call_args_list],
-            ["2001:4860::1", "93.184.216.34"],
+            ["93.184.216.34"],
+        )
+        self.assertTrue(resolver.call_args_list)
+        self.assertTrue(
+            all(call.args[2] == socket.AF_INET for call in resolver.call_args_list)
+        )
+
+    def test_ipv6_only_dns_answer_is_rejected_by_default(self):
+        answers = [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("2001:4860::1", 443, 0, 0),
+            )
+        ]
+        client = BoardHTTPClient(self.settings())
+
+        with patch("board.http.socket.getaddrinfo", return_value=answers) as resolver:
+            with self.assertRaisesRegex(InvalidPublicURL, "no usable IPv4 addresses"):
+                client.validated_connection_target("https://district.example/")
+
+        resolver.assert_called_once_with(
+            "district.example",
+            443,
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+        )
+
+    def test_ipv6_may_be_enabled_explicitly(self):
+        answers = [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("2001:4860::1", 443, 0, 0),
+            )
+        ]
+        client = BoardHTTPClient(self.settings(ipv4_only=False))
+
+        with patch("board.http.socket.getaddrinfo", return_value=answers) as resolver:
+            _canonical, addresses = client.validated_connection_target(
+                "https://district.example/"
+            )
+
+        self.assertEqual(addresses, ("2001:4860::1",))
+        resolver.assert_called_once_with(
+            "district.example",
+            443,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
         )
 
     def test_browser_proxy_connects_to_the_validated_address(self):
@@ -542,6 +593,28 @@ class BoardHTTPPolicyTests(unittest.TestCase):
             origin.shutdown()
             origin.server_close()
             origin_thread.join(timeout=2)
+
+    def test_browser_proxy_rejects_ipv6_destination_when_ipv4_only(self):
+        client = BoardHTTPClient(
+            self.settings(allow_private_networks=True, ipv4_only=True)
+        )
+        try:
+            with pinned_browser_proxy(client) as proxy_url:
+                proxy = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                proxy.settimeout(2)
+                proxy.connect(("127.0.0.1", int(proxy_url.rsplit(":", 1)[1])))
+                with proxy:
+                    proxy.sendall(bytes((5, 1, 0)))
+                    self.assertEqual(recv_exact(proxy, 2), bytes((5, 0)))
+                    proxy.sendall(
+                        bytes((5, 1, 0, 4))
+                        + socket.inet_pton(socket.AF_INET6, "2001:4860::1")
+                        + (443).to_bytes(2, "big")
+                    )
+                    self.assertEqual(recv_exact(proxy, 2), bytes((5, 2)))
+                    recv_exact(proxy, 8)
+        finally:
+            client.close()
 
     def test_allowed_vendor_redirect_retains_provenance(self):
         session = SequenceSession(

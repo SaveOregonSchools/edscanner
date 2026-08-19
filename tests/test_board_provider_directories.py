@@ -397,7 +397,7 @@ class BoardBookProviderDirectoryTests(unittest.TestCase):
     def test_ambiguous_directory_result_does_not_seed_source_and_uses_site_fallback(self):
         numeric_url = "https://meetings.boardbook.org/Public/Organization/915"
         alias_url = "https://meetings.boardbook.org/Public/Organization/portland"
-        district_url = "https://portland.example/"
+        district_url = "https://portland.example"
         client = FakeClient(
             {
                 numeric_url: fixture_bytes("boardbook_portland_or_directory_match.html"),

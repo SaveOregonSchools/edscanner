@@ -283,9 +283,17 @@ workflow for public school-board records:
 
 1. **Discover Sources** follows high-signal governance links on district sites
    and permits known external board-platform hosts without weakening the normal
-   district crawler's same-domain boundary. A likely challenge can receive one
-   bounded Chromium render; rate limits, robots denials, and a remaining CAPTCHA
-   stop without browser rotation or challenge bypass.
+   district crawler's same-domain boundary. The Discovery scope control makes
+   the choice between unchecked districts and rediscovering districts with
+   saved sources explicit. Rediscovery starts again from the district website;
+   it does not directly health-check the previously saved source URL. A likely
+   challenge can receive one bounded Chromium render;
+   connection or certificate-chain failures can use a separately bounded browser
+   recovery. Rate limits, robots denials, and a remaining CAPTCHA stop without
+   browser rotation or challenge bypass. A district is reported as `not_found`
+   only after at least one page was inspected; all-page transport failures are
+   reported as errors instead. This distinction applies to new runs; older
+   `not_found` records may predate it and should be rediscovered if uncertain.
 2. **Review Sources** lets an operator validate and save a public portal URL for
    a district when automatic discovery misses or misidentifies it. A source
    becomes working only after the adapter verifies the public endpoint and the
@@ -548,6 +556,7 @@ $env:EDSCANNER_BOARD_HTTP_CACHE_MAX_ENTRIES="128"
 $env:EDSCANNER_BOARD_HTTP_CACHE_MAX_MB="32"
 $env:EDSCANNER_BOARD_PROVIDER_DIRECTORY_ENABLED="false"
 $env:EDSCANNER_BOARD_ALLOW_PRIVATE_NETWORKS="false"
+$env:EDSCANNER_BOARD_IPV4_ONLY="true"
 $env:EDSCANNER_BOARD_ALLOW_INSECURE_SSL_FALLBACK="false"
 $env:EDSCANNER_BOARD_INSECURE_SSL_HOSTS="legacy-board.example.org"
 $env:EDSCANNER_BOARD_MAX_DOCUMENT_MB="25"
@@ -575,8 +584,11 @@ retries with TLS verification disabled. Ordinary hosts use Requests' normal
 certificate verifier. The exact compatibility host `meetings.boardbook.org`
 uses the operating system's native trust store for Windows certificate-chain
 handling; this is not extended to arbitrary district or manually entered hosts.
-Each ordinary connection is pinned to its validated DNS answer while retaining
-the public hostname for HTTP Host, TLS SNI, and certificate verification.
+Board networking is IPv4-only by default (`EDSCANNER_BOARD_IPV4_ONLY=true`) so
+an unusable IPv6 route cannot mask the IPv4 result; IPv6 can be explicitly
+re-enabled for an environment that has verified connectivity. Each ordinary
+connection is pinned to its validated DNS answer while retaining the public
+hostname for HTTP Host, TLS SNI, and certificate verification.
 Playwright fallback uses a loopback SOCKS proxy that
 applies the same address validation/pinning to every browser tunnel; unnecessary
 WebSockets and non-HTTP network schemes are blocked. `EDSCANNER_BOARD_ALLOW_PRIVATE_NETWORKS=true`

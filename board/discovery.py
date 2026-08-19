@@ -7,13 +7,19 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 from urllib.parse import urljoin, urlparse
 
+import requests
 from bs4 import BeautifulSoup
 
 from common import normalize_website, prefer_https_url
 from search_engine import RunDebugLogger, canonical_url, debug_log, same_organization_url
 
 from .adapters import build_adapters, detect_platform
-from .adapters.base import ChallengeAssessment, assess_challenge
+from .adapters.base import (
+    ChallengeAssessment,
+    RenderedPage,
+    RenderedPageRejected,
+    assess_challenge,
+)
 from .http import BoardHTTPClient, RobotsDenied
 from .provider_directories import BoardBookDirectoryCatalog, BoardBookDirectoryMatch
 
@@ -40,6 +46,7 @@ BOARD_LINK_TERMS = (
 )
 
 DOCUMENT_SUFFIXES = (".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx")
+TRANSPORT_BROWSER_FALLBACK_LIMIT = 2
 
 
 @dataclass(frozen=True)
@@ -194,6 +201,88 @@ def _browser_renderer_for_url(url: str, adapters: list[Any]) -> Any | None:
     )
 
 
+@dataclass(frozen=True)
+class _BrowserRenderAttempt:
+    attempted: bool = False
+    page: RenderedPage | None = None
+    challenge: ChallengeAssessment | None = None
+    error: str = ""
+    error_type: str = ""
+    robots_denied: bool = False
+
+    @property
+    def recovered(self) -> bool:
+        return self.page is not None and not self.error
+
+
+def _attempt_browser_render(
+    url: str,
+    adapters: list[Any],
+    attempted_urls: set[tuple[str, str, str, str]],
+    *,
+    enabled: bool,
+    challenge_error_prefix: str,
+    http_error_prefix: str = "",
+) -> _BrowserRenderAttempt:
+    """Render one URL through an adapter's policy gates, at most once per URL."""
+
+    key = _crawl_url_key(url)
+    if not enabled or key in attempted_urls:
+        return _BrowserRenderAttempt()
+    renderer = _browser_renderer_for_url(url, adapters)
+    if renderer is None:
+        return _BrowserRenderAttempt()
+
+    attempted_urls.add(key)
+    try:
+        render_with_metadata = getattr(renderer, "render_page_with_metadata", None)
+        if not callable(render_with_metadata):
+            raise RuntimeError(
+                "Browser renderer does not expose policy-gated page metadata."
+            )
+        page = render_with_metadata(url)
+        if not isinstance(page, RenderedPage):
+            raise TypeError("Browser renderer returned an invalid page result.")
+    except RobotsDenied as exc:
+        return _BrowserRenderAttempt(
+            attempted=True,
+            error=str(exc),
+            error_type=type(exc).__name__,
+            robots_denied=True,
+        )
+    except RenderedPageRejected as exc:
+        return _BrowserRenderAttempt(
+            attempted=True,
+            page=exc.page,
+            challenge=exc.challenge,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+    except Exception as exc:
+        return _BrowserRenderAttempt(
+            attempted=True,
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+
+    challenge = assess_challenge(page.status_code, page.content, page.final_url)
+    if challenge.is_challenge:
+        error = (
+            f"{challenge_error_prefix} "
+            f"({challenge.marker or challenge.category})."
+        )
+    elif http_error_prefix and page.status_code >= 400:
+        error = f"{http_error_prefix} {page.status_code}."
+    else:
+        error = ""
+    return _BrowserRenderAttempt(
+        attempted=True,
+        page=page,
+        challenge=challenge,
+        error=error,
+    )
+
+
 def score_board_link(text: str, url: str) -> tuple[int, list[str]]:
     text_fold = _collapse_ws(text).casefold()
     url_fold = str(url or "").casefold()
@@ -218,6 +307,19 @@ def score_board_link(text: str, url: str) -> tuple[int, list[str]]:
     return score, evidence
 
 
+def _anchor_scoring_text(anchor: Any) -> str:
+    """Keep useful local context without borrowing labels from sibling links."""
+
+    text = _collapse_ws(anchor.get_text(" ", strip=True))
+    parent = anchor.parent
+    if parent is None or parent.name in {"nav", "ul", "ol", "header", "footer"}:
+        return text
+    if len(parent.find_all("a", href=True)) > 1:
+        return text
+    parent_text = _collapse_ws(parent.get_text(" ", strip=True))[:500]
+    return f"{text} {parent_text}" if parent_text else text
+
+
 def extract_board_candidates(content: bytes | str, page_url: str, district_base_url: str) -> list[BoardSourceCandidate]:
     soup = BeautifulSoup(content, "lxml")
     found: dict[str, BoardSourceCandidate] = {}
@@ -229,8 +331,7 @@ def extract_board_candidates(content: bytes | str, page_url: str, district_base_
         if not board_url_allowed(url, district_base_url):
             continue
         text = _collapse_ws(anchor.get_text(" ", strip=True))
-        parent_text = _collapse_ws(anchor.parent.get_text(" ", strip=True) if anchor.parent else "")[:500]
-        score, evidence = score_board_link(f"{text} {parent_text}", url)
+        score, evidence = score_board_link(_anchor_scoring_text(anchor), url)
         if score < 5:
             continue
         detection = detect_platform(url)
@@ -468,8 +569,48 @@ def discover_board_source(
         browser_attempted_urls: set[tuple[str, str, str, str]] = set()
         challenges: list[dict[str, Any]] = []
         challenge_recoveries: list[dict[str, Any]] = []
+        transport_recoveries: list[dict[str, Any]] = []
         fetch_errors: list[dict[str, Any]] = []
+        browser_errors: list[dict[str, Any]] = []
         robots_denials: list[dict[str, Any]] = []
+        successful_page_fetches = 0
+        transport_browser_fallback_count = 0
+
+        def record_fetch_error(error_url: str, **details: Any) -> dict[str, Any]:
+            record = {"url": error_url, **details}
+            fetch_errors.append(record)
+            debug_log(
+                debug_logger,
+                "board_source_fetch_error",
+                district=district.get("agency_name"),
+                url=error_url,
+                **{
+                    key: value
+                    for key, value in details.items()
+                    if key != "browser_fallback_attempted"
+                },
+            )
+            return record
+
+        def record_browser_error(
+            error_url: str,
+            error: str,
+            *,
+            trigger: str,
+            **details: Any,
+        ) -> None:
+            browser_errors.append(
+                {"url": error_url, "error": error, "trigger": trigger, **details}
+            )
+            debug_log(
+                debug_logger,
+                "board_browser_fallback_error",
+                district=district.get("agency_name"),
+                url=error_url,
+                error=error,
+                trigger=trigger,
+                **details,
+            )
 
         while pending and len(visited) < max(1, max_pages):
             if cancel_requested and cancel_requested():
@@ -494,6 +635,9 @@ def discover_board_source(
             debug_log(debug_logger, "board_source_candidate", district=district.get("agency_name"), url=url, depth=depth)
             try:
                 response = client.get(url, check_robots=True, raise_for_status=False)
+                response_content = response.content
+                effective_status_code = response.status_code
+                effective_final_url = response.final_url or url
             except RobotsDenied as exc:
                 robots_denials.append({"url": url, "error": str(exc)})
                 debug_log(
@@ -504,16 +648,108 @@ def discover_board_source(
                     error=str(exc),
                 )
                 continue
+            except (
+                requests.ConnectionError,
+                requests.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+            ) as exc:
+                fetch_error = record_fetch_error(
+                    url,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    kind="transport",
+                    browser_fallback_attempted=False,
+                )
+                exception_status = getattr(
+                    getattr(exc, "response", None), "status_code", None
+                )
+                recovery = _attempt_browser_render(
+                    url,
+                    adapters,
+                    browser_attempted_urls,
+                    enabled=(
+                        allow_browser_fallback
+                        and exception_status != 429
+                        and transport_browser_fallback_count
+                        < TRANSPORT_BROWSER_FALLBACK_LIMIT
+                    ),
+                    challenge_error_prefix=(
+                        "Transport recovery browser remained challenged"
+                    ),
+                    http_error_prefix="Transport recovery browser returned HTTP",
+                )
+                if recovery.attempted:
+                    transport_browser_fallback_count += 1
+                    fetch_error["browser_fallback_attempted"] = True
+                if recovery.attempted and not recovery.recovered:
+                    fetch_error["browser_fallback_error"] = recovery.error
+                    error_details = (
+                        {
+                            "final_url": recovery.page.final_url,
+                            "status_code": recovery.page.status_code,
+                        }
+                        if recovery.page is not None
+                        else {"error_type": recovery.error_type}
+                    )
+                    record_browser_error(
+                        url,
+                        recovery.error,
+                        trigger="transport",
+                        **error_details,
+                    )
+                if recovery.robots_denied:
+                    robots_denials.append({"url": url, "error": recovery.error})
+                if recovery.challenge and recovery.challenge.is_challenge:
+                    assert recovery.page is not None
+                    challenges.append(
+                        _challenge_record(
+                            recovery.challenge,
+                            url=recovery.page.final_url,
+                            status_code=recovery.page.status_code,
+                            browser_fallback_attempted=True,
+                            browser_fallback_error=recovery.error,
+                        )
+                    )
+                if not recovery.recovered:
+                    continue
+
+                assert recovery.page is not None
+                response_content = recovery.page.content
+                effective_status_code = recovery.page.status_code
+                effective_final_url = recovery.page.final_url
+                browser_attempted_urls.add(_crawl_url_key(recovery.page.final_url))
+                transport_recoveries.append(
+                    {
+                        "url": url,
+                        "final_url": recovery.page.final_url,
+                        "status_code": recovery.page.status_code,
+                        "browser_rendered": bool(recovery.page.browser_rendered),
+                        "transport_error": str(exc),
+                        "transport_error_type": type(exc).__name__,
+                    }
+                )
+                debug_log(
+                    debug_logger,
+                    "board_transport_recovered_with_browser",
+                    district=district.get("agency_name"),
+                    url=url,
+                    final_url=recovery.page.final_url,
+                    status_code=recovery.page.status_code,
+                )
             except Exception as exc:
-                fetch_errors.append({"url": url, "error": str(exc)})
+                record_fetch_error(
+                    url,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    kind="fetch",
+                )
                 continue
-            response_content = response.content
-            effective_status_code = response.status_code
-            effective_final_url = response.final_url or url
+            challenge_status_code = effective_status_code
+            challenge_url = effective_final_url
             challenge = assess_challenge(
-                response.status_code,
+                challenge_status_code,
                 response_content,
-                response.final_url,
+                challenge_url,
             )
             if challenge.is_challenge:
                 debug_log(
@@ -521,63 +757,41 @@ def discover_board_source(
                     "challenge_detected",
                     district=district.get("agency_name"),
                     url=url,
-                    status_code=response.status_code,
+                    status_code=challenge_status_code,
                     category=challenge.category,
                     marker=challenge.marker,
                 )
-                browser_attempted = False
-                browser_error = ""
-                browser_robots_denied = False
-                recovered_content: bytes | None = None
-                browser_key = _crawl_url_key(response.final_url or url)
-                if (
-                    allow_browser_fallback
-                    and challenge.browser_retry_allowed
-                    and browser_key not in browser_attempted_urls
-                ):
-                    renderer = _browser_renderer_for_url(response.final_url or url, adapters)
-                    if renderer is not None:
-                        browser_attempted = True
-                        browser_attempted_urls.add(browser_key)
-                        try:
-                            render_with_metadata = getattr(
-                                renderer,
-                                "render_page_with_metadata",
-                                None,
-                            )
-                            if callable(render_with_metadata):
-                                rendered_page = render_with_metadata(response.final_url or url)
-                                rendered = rendered_page.content
-                                rendered_status = rendered_page.status_code
-                                rendered_final_url = rendered_page.final_url
-                            else:
-                                rendered = renderer.render_page(response.final_url or url)
-                                rendered_status = 200
-                                rendered_final_url = response.final_url or url
-                            rendered_challenge = assess_challenge(
-                                rendered_status,
-                                rendered,
-                                rendered_final_url,
-                            )
-                            if rendered_challenge.is_challenge:
-                                browser_error = (
-                                    "Rendered page remained challenged "
-                                    f"({rendered_challenge.marker or rendered_challenge.category})."
-                                )
-                            else:
-                                recovered_content = rendered
-                                effective_final_url = rendered_final_url
-                                effective_status_code = rendered_status
-                        except RobotsDenied as exc:
-                            browser_error = str(exc)
-                            browser_robots_denied = True
-                            robots_denials.append({"url": url, "error": str(exc)})
-                        except Exception as exc:
-                            browser_error = str(exc)
+                recovery = _attempt_browser_render(
+                    challenge_url,
+                    adapters,
+                    browser_attempted_urls,
+                    enabled=(
+                        allow_browser_fallback and challenge.browser_retry_allowed
+                    ),
+                    challenge_error_prefix="Rendered page remained challenged",
+                )
+                browser_attempted = recovery.attempted
+                browser_error = recovery.error
+                browser_robots_denied = recovery.robots_denied
+                recovered_content = (
+                    recovery.page.content if recovery.recovered else None
+                )
+                if browser_robots_denied:
+                    robots_denials.append({"url": url, "error": browser_error})
+                if recovery.recovered:
+                    assert recovery.page is not None
+                    effective_final_url = recovery.page.final_url
+                    effective_status_code = recovery.page.status_code
+                if browser_error:
+                    record_browser_error(
+                        challenge_url,
+                        browser_error,
+                        trigger="challenge",
+                    )
                 record = _challenge_record(
                     challenge,
-                    url=response.final_url or url,
-                    status_code=response.status_code,
+                    url=challenge_url,
+                    status_code=challenge_status_code,
                     browser_fallback_attempted=browser_attempted,
                     browser_fallback_error=browser_error,
                 )
@@ -586,7 +800,7 @@ def discover_board_source(
                         continue
                     challenges.append(record)
                     score, evidence = score_board_link("", url)
-                    challenged_url = canonical_url(response.final_url or url)
+                    challenged_url = canonical_url(challenge_url)
                     if is_known_board_host(challenged_url):
                         candidates[challenged_url] = BoardSourceCandidate(
                             url=challenged_url,
@@ -611,12 +825,18 @@ def discover_board_source(
                     "challenge_recovered_with_browser",
                     district=district.get("agency_name"),
                     url=url,
-                    status_code=response.status_code,
+                    status_code=challenge_status_code,
+                    rendered_status_code=effective_status_code,
                 )
             if effective_status_code >= 400:
-                fetch_errors.append({"url": url, "status_code": response.status_code})
+                record_fetch_error(
+                    url,
+                    status_code=effective_status_code,
+                    kind="http_status",
+                )
                 continue
 
+            successful_page_fetches += 1
             final_url = canonical_url(effective_final_url)
             candidate_content[_crawl_url_key(final_url)] = response_content
             detection = detect_platform(final_url, response_content, adapters=adapters)
@@ -673,9 +893,9 @@ def discover_board_source(
             try:
                 candidate_url = canonical_url(candidate.url)
                 candidate_key = _crawl_url_key(candidate_url)
-                # A challenged page gets at most one browser attempt. Recovered
-                # HTML is validated directly instead of refetching the cached
-                # challenge and launching a second browser.
+                # A browser-rendered page gets at most one attempt per URL.
+                # Recovered HTML is validated directly instead of refetching it
+                # and launching a second browser.
                 if (
                     candidate_key in browser_attempted_urls
                     and candidate_key not in candidate_content
@@ -698,8 +918,10 @@ def discover_board_source(
                             "visited_urls": sorted(visited),
                             "candidate_count": len(ordered),
                             "fetch_errors": fetch_errors,
+                            "browser_errors": browser_errors,
                             "challenges": challenges,
                             "challenge_recoveries": challenge_recoveries,
+                            "transport_recoveries": transport_recoveries,
                             "robots_denials": robots_denials,
                         }
                     )
@@ -715,7 +937,13 @@ def discover_board_source(
                     )
                     return outcome
             except Exception as exc:
-                fetch_errors.append({"url": candidate.url, "platform": candidate.known_platform, "error": str(exc)})
+                record_fetch_error(
+                    candidate.url,
+                    platform=candidate.known_platform,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    kind="adapter",
+                )
 
         if robots_denials and not challenges:
             candidate = ordered[0] if ordered else BoardSourceCandidate(base_url, "", base_url, 0)
@@ -729,7 +957,9 @@ def discover_board_source(
                 raw={
                     "visited_urls": sorted(visited),
                     "fetch_errors": fetch_errors,
+                    "browser_errors": browser_errors,
                     "challenge_recoveries": challenge_recoveries,
+                    "transport_recoveries": transport_recoveries,
                     "robots_denials": robots_denials,
                     **(
                         {"provider_directory": provider_directory_raw}
@@ -751,8 +981,10 @@ def discover_board_source(
                 raw={
                     "visited_urls": sorted(visited),
                     "fetch_errors": fetch_errors,
+                    "browser_errors": browser_errors,
                     "challenges": challenges,
                     "challenge_recoveries": challenge_recoveries,
+                    "transport_recoveries": transport_recoveries,
                     **(
                         {"provider_directory": provider_directory_raw}
                         if provider_directory_raw
@@ -773,7 +1005,40 @@ def discover_board_source(
                     "visited_urls": sorted(visited),
                     "candidates": [item.__dict__ for item in ordered[:25]],
                     "fetch_errors": fetch_errors,
+                    "browser_errors": browser_errors,
                     "challenge_recoveries": challenge_recoveries,
+                    "transport_recoveries": transport_recoveries,
+                    **(
+                        {"provider_directory": provider_directory_raw}
+                        if provider_directory_raw
+                        else {}
+                    ),
+                },
+            )
+        if successful_page_fetches == 0 and fetch_errors:
+            transport_failed = any(
+                error.get("kind") == "transport" for error in fetch_errors
+            )
+            return DiscoveryOutcome(
+                status="error",
+                platform="unknown",
+                source_url=base_url,
+                discovered_from_url=base_url,
+                error_message=(
+                    "No district page could be inspected because every transport "
+                    "attempt failed. See the fetch and browser diagnostics."
+                    if transport_failed
+                    else "No district page could be inspected because every fetch failed. "
+                    "See the fetch diagnostics."
+                ),
+                raw={
+                    "visited_urls": sorted(visited),
+                    "fetch_errors": fetch_errors,
+                    "browser_errors": browser_errors,
+                    "challenges": challenges,
+                    "challenge_recoveries": challenge_recoveries,
+                    "transport_recoveries": transport_recoveries,
+                    "robots_denials": robots_denials,
                     **(
                         {"provider_directory": provider_directory_raw}
                         if provider_directory_raw
@@ -790,7 +1055,9 @@ def discover_board_source(
             raw={
                 "visited_urls": sorted(visited),
                 "fetch_errors": fetch_errors,
+                "browser_errors": browser_errors,
                 "challenge_recoveries": challenge_recoveries,
+                "transport_recoveries": transport_recoveries,
                 **(
                     {"provider_directory": provider_directory_raw}
                     if provider_directory_raw

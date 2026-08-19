@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from board.adapters import detect_platform
-from board.adapters.base import RenderedPage, assess_challenge
+from board.adapters.base import RenderedPage, RenderedPageRejected, assess_challenge
 from board.adapters.boardbook import BoardBookAdapter, resolve_boardbook_document_url
 from board.adapters.boarddocs import BoardDocsAdapter
 from board.adapters.civicclerk import CivicClerkAdapter
@@ -53,9 +53,16 @@ class FakeDiscoveryClient:
 class FakeBoardBookRecoveryAdapter:
     platform_name = "boardbook"
 
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        rendered_final_url: str | None = None,
+        render_error: BaseException | None = None,
+    ):
         self.render_calls: list[str] = []
         self.discover_calls: list[str] = []
+        self.rendered_final_url = rendered_final_url
+        self.render_error = render_error
 
     def detect(self, url: str, _html=None) -> DetectionResult:
         matched = "meetings.boardbook.org/public/organization/2413" in url.casefold()
@@ -66,13 +73,23 @@ class FakeBoardBookRecoveryAdapter:
             canonical_url=url if matched else None,
         )
 
-    def render_page(self, url: str) -> bytes:
+    def render_page_with_metadata(self, url: str) -> RenderedPage:
         self.render_calls.append(url)
-        return (
-            b'<html><title>Bend-La Pine Schools</title><body>'
-            b'<a href="https://meetings.boardbook.org/public/Organization/2413">'
-            b'BoardBook agendas and minutes</a></body></html>'
+        if self.render_error is not None:
+            raise self.render_error
+        return RenderedPage(
+            content=(
+                b'<html><title>Bend-La Pine Schools</title><body>'
+                b'<a href="https://meetings.boardbook.org/public/Organization/2413">'
+                b'BoardBook agendas and minutes</a></body></html>'
+            ),
+            final_url=self.rendered_final_url or url,
+            status_code=200,
+            browser_rendered=True,
         )
+
+    def render_page(self, url: str) -> bytes:
+        return self.render_page_with_metadata(url).content
 
     def discover_source(self, district, candidate_url: str, html=None) -> BoardSourceResult:
         del html
@@ -91,6 +108,35 @@ class FakeBoardBookRecoveryAdapter:
             source=source,
             status="working",
             candidate_url=candidate_url,
+        )
+
+
+class FakeGenericTransportAdapter:
+    platform_name = "generic"
+
+    def __init__(self, rendered_pages: RenderedPage | list[RenderedPage]):
+        self.rendered_pages = (
+            list(rendered_pages)
+            if isinstance(rendered_pages, list)
+            else [rendered_pages]
+        )
+        self.render_calls: list[str] = []
+
+    def detect(self, url: str, _html=None) -> DetectionResult:
+        return DetectionResult(False, self.platform_name, 0.0, canonical_url=url)
+
+    def render_page_with_metadata(self, url: str) -> RenderedPage:
+        self.render_calls.append(url)
+        return self.rendered_pages[len(self.render_calls) - 1]
+
+    def discover_source(self, _district, candidate_url: str, html=None) -> BoardSourceResult:
+        del html
+        return BoardSourceResult(
+            detection=self.detect(candidate_url),
+            source=None,
+            status="manual_review",
+            candidate_url=candidate_url,
+            error="Fixture candidate requires manual review.",
         )
 
 
@@ -374,6 +420,213 @@ class BoardDiscoveryFixtureTests(unittest.TestCase):
         self.assertEqual(outcome.status, "blocked_by_robots")
         self.assertEqual(denied_adapter.render_calls, [])
 
+    def test_district_transport_error_recovers_once_with_rendered_metadata(self):
+        district_url = "https://district.example/"
+        rendered_url = "https://district.example/about/board?rendered=1"
+        district = {
+            "id": 9,
+            "agency_name": "Example Schools",
+            "website": district_url,
+            "website_normalized": district_url,
+        }
+        client = FakeDiscoveryClient(requests.exceptions.SSLError("fixture TLS failure"))
+        adapter = FakeBoardBookRecoveryAdapter(rendered_final_url=rendered_url)
+        debug_logger = Mock()
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(
+                district,
+                client=client,
+                debug_logger=debug_logger,
+            )
+
+        self.assertEqual(outcome.status, "working")
+        self.assertEqual(adapter.render_calls, ["https://district.example"])
+        self.assertEqual(client.calls, ["https://district.example"])
+        self.assertEqual(len(outcome.raw["fetch_errors"]), 1)
+        self.assertEqual(outcome.raw["fetch_errors"][0]["kind"], "transport")
+        self.assertTrue(
+            outcome.raw["fetch_errors"][0]["browser_fallback_attempted"]
+        )
+        self.assertEqual(
+            outcome.raw["transport_recoveries"],
+            [
+                {
+                    "url": "https://district.example",
+                    "final_url": rendered_url,
+                    "status_code": 200,
+                    "browser_rendered": True,
+                    "transport_error": "fixture TLS failure",
+                    "transport_error_type": "SSLError",
+                }
+            ],
+        )
+        events = [call.args[0] for call in debug_logger.log.call_args_list]
+        self.assertIn("board_source_fetch_error", events)
+        self.assertIn("board_transport_recovered_with_browser", events)
+
+    def test_unrecovered_transport_error_is_classified_as_error(self):
+        district_url = "https://district.example/"
+        district = {
+            "id": 9,
+            "agency_name": "Example Schools",
+            "website": district_url,
+            "website_normalized": district_url,
+        }
+        client = FakeDiscoveryClient(
+            requests.exceptions.ConnectionError("fixture connection failure")
+        )
+        adapter = FakeBoardBookRecoveryAdapter(
+            render_error=RuntimeError("fixture browser unavailable")
+        )
+        debug_logger = Mock()
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(
+                district,
+                client=client,
+                debug_logger=debug_logger,
+            )
+
+        self.assertEqual(outcome.status, "error")
+        self.assertIn("transport", outcome.error_message.casefold())
+        self.assertEqual(adapter.render_calls, ["https://district.example"])
+        self.assertEqual(len(outcome.raw["fetch_errors"]), 1)
+        self.assertEqual(
+            outcome.raw["fetch_errors"][0]["browser_fallback_error"],
+            "fixture browser unavailable",
+        )
+        self.assertEqual(len(outcome.raw["browser_errors"]), 1)
+        events = [call.args[0] for call in debug_logger.log.call_args_list]
+        self.assertIn("board_source_fetch_error", events)
+        self.assertIn("board_browser_fallback_error", events)
+
+    def test_transport_then_rendered_challenge_stays_blocked_by_challenge(self):
+        district_url = "https://district.example/"
+        rendered_page = RenderedPage(
+            content=b"<html><body><h1>Access Denied</h1></body></html>",
+            final_url="https://district.example/challenge",
+            status_code=403,
+            browser_rendered=True,
+        )
+        challenge = assess_challenge(
+            rendered_page.status_code,
+            rendered_page.content,
+            rendered_page.final_url,
+        )
+        client = FakeDiscoveryClient(
+            requests.exceptions.ConnectionError("fixture connection failure")
+        )
+        adapter = FakeBoardBookRecoveryAdapter(
+            render_error=RenderedPageRejected(
+                "Browser received an anti-bot challenge or access-denied page.",
+                page=rendered_page,
+                challenge=challenge,
+            )
+        )
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(
+                {
+                    "id": 9,
+                    "agency_name": "Example Schools",
+                    "website": district_url,
+                    "website_normalized": district_url,
+                },
+                client=client,
+            )
+
+        self.assertTrue(challenge.is_challenge)
+        self.assertEqual(outcome.status, "blocked_by_challenge")
+        self.assertEqual(adapter.render_calls, ["https://district.example"])
+        self.assertEqual(len(outcome.raw["challenges"]), 1)
+        self.assertEqual(
+            outcome.raw["challenges"][0]["url"], rendered_page.final_url
+        )
+
+    def test_transport_browser_fallback_preserves_robots_denial(self):
+        district_url = "https://district.example/"
+        district = {
+            "id": 9,
+            "agency_name": "Example Schools",
+            "website": district_url,
+            "website_normalized": district_url,
+        }
+        client = FakeDiscoveryClient(
+            requests.exceptions.ConnectionError("fixture connection failure")
+        )
+        adapter = FakeBoardBookRecoveryAdapter(
+            render_error=RobotsDenied("robots.txt disallows browser rendering")
+        )
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(district, client=client)
+
+        self.assertEqual(outcome.status, "blocked_by_robots")
+        self.assertEqual(adapter.render_calls, ["https://district.example"])
+        self.assertEqual(len(outcome.raw["robots_denials"]), 1)
+        self.assertEqual(outcome.raw["transport_recoveries"], [])
+
+    def test_transport_browser_fallback_has_two_render_budget(self):
+        district_url = "https://district.example/"
+        board_url = "https://district.example/school-board"
+        meetings_url = "https://district.example/school-board/meetings"
+        district = {
+            "id": 9,
+            "agency_name": "Example Schools",
+            "website": district_url,
+            "website_normalized": district_url,
+        }
+        client = FakeDiscoveryClient(
+            requests.exceptions.ConnectionError("fixture connection failure")
+        )
+        adapter = FakeGenericTransportAdapter(
+            [
+                RenderedPage(
+                    content=(
+                        b'<html><body><a href="/school-board">'
+                        b"School Board</a></body></html>"
+                    ),
+                    final_url="https://district.example",
+                    status_code=200,
+                    browser_rendered=True,
+                ),
+                RenderedPage(
+                    content=(
+                        b'<html><body><a href="/school-board/meetings">'
+                        b"Board Meetings</a></body></html>"
+                    ),
+                    final_url=board_url,
+                    status_code=200,
+                    browser_rendered=True,
+                ),
+            ]
+        )
+
+        with patch("board.discovery.build_adapters", return_value=[adapter]):
+            outcome = discover_board_source(district, client=client, max_pages=3)
+
+        self.assertEqual(outcome.status, "manual_review")
+        self.assertEqual(
+            adapter.render_calls,
+            ["https://district.example", board_url],
+        )
+        self.assertEqual(
+            client.calls,
+            ["https://district.example", board_url, meetings_url],
+        )
+        self.assertEqual(len(outcome.raw["transport_recoveries"]), 2)
+        self.assertEqual(len(outcome.raw["fetch_errors"]), 3)
+        self.assertTrue(
+            outcome.raw["fetch_errors"][0]["browser_fallback_attempted"]
+        )
+        self.assertTrue(
+            outcome.raw["fetch_errors"][1]["browser_fallback_attempted"]
+        )
+        self.assertFalse(
+            outcome.raw["fetch_errors"][2]["browser_fallback_attempted"]
+        )
+
     def test_adapter_confidence_is_normalized_without_rescaling_candidate_scores(self):
         candidate = BoardSourceCandidate(
             url="https://meetings.boardbook.org/Public/Organization/2221",
@@ -443,6 +696,23 @@ class BoardDiscoveryFixtureTests(unittest.TestCase):
         self.assertTrue(
             {"boardbook", "boarddocs", "diligent_community", "simbli", "civicclerk"}
             <= platforms
+        )
+
+    def test_navigation_parent_text_does_not_turn_sibling_links_into_candidates(self):
+        candidates = extract_board_candidates(
+            b"""
+            <nav><ul><li>
+              <a href="/about">About</a>
+              <ul><li><a href="/schoolboard">School Board</a></li></ul>
+            </li></ul></nav>
+            """,
+            "https://district.example/",
+            "https://district.example/",
+        )
+
+        self.assertEqual(
+            [candidate.url for candidate in candidates],
+            ["https://district.example/schoolboard"],
         )
 
     def test_registry_and_generic_detection_use_deterministic_markers(self):

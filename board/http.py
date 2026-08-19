@@ -29,6 +29,7 @@ from common import (
     BOARD_HTTP_CACHE_MAX_ENTRIES,
     BOARD_HTTP_MAX_REDIRECTS,
     BOARD_INSECURE_SSL_FALLBACK_HOSTS,
+    BOARD_IPV4_ONLY,
     BOARD_MAX_DOCUMENT_SIZE_BYTES,
     BOARD_PER_HOST_WORKERS,
     BOARD_REQUEST_DELAY_SECONDS,
@@ -106,6 +107,7 @@ class BoardHTTPSettings:
     cache_max_entries: int = BOARD_HTTP_CACHE_MAX_ENTRIES
     cache_max_bytes: int = BOARD_HTTP_CACHE_MAX_BYTES
     allow_private_networks: bool = BOARD_ALLOW_PRIVATE_NETWORKS
+    ipv4_only: bool = BOARD_IPV4_ONLY
     allow_insecure_ssl_fallback: bool = BOARD_ALLOW_INSECURE_SSL_FALLBACK
     insecure_ssl_fallback_hosts: tuple[str, ...] | str = BOARD_INSECURE_SSL_FALLBACK_HOSTS
     # Windows' native certificate verifier may retrieve missing intermediate
@@ -324,6 +326,7 @@ def _validated_public_target(
     url: str,
     *,
     allow_private_networks: bool = False,
+    ipv4_only: bool = BOARD_IPV4_ONLY,
 ) -> tuple[str, tuple[str, ...]]:
     """Return a canonical URL and the exact DNS answers approved for connection.
 
@@ -341,13 +344,15 @@ def _validated_public_target(
     host = parsed.hostname or ""
     literal = _literal_ip(host)
     if literal is not None:
+        if ipv4_only and literal.version != 4:
+            raise InvalidPublicURL("IPv6 board destinations are disabled by configuration.")
         return canonical, (str(literal),)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     try:
         answers = socket.getaddrinfo(
             host,
             port,
-            socket.AF_UNSPEC,
+            socket.AF_INET if ipv4_only else socket.AF_UNSPEC,
             socket.SOCK_STREAM,
         )
     except (OSError, UnicodeError) as exc:
@@ -360,6 +365,8 @@ def _validated_public_target(
             address = ipaddress.ip_address(address_text)
         except (IndexError, TypeError, ValueError):
             continue
+        if ipv4_only and (answer[0] != socket.AF_INET or address.version != 4):
+            continue
         normalized_address = str(address)
         if normalized_address in seen_addresses:
             continue
@@ -370,7 +377,10 @@ def _validated_public_target(
                 f"Hostname {host} resolved to non-public address {address}"
             )
     if not addresses:
-        raise InvalidPublicURL(f"Public hostname produced no usable addresses: {host}")
+        address_kind = "IPv4 " if ipv4_only else ""
+        raise InvalidPublicURL(
+            f"Public hostname produced no usable {address_kind}addresses: {host}"
+        )
     return canonical, tuple(addresses)
 
 
@@ -378,12 +388,14 @@ def validate_public_url(
     url: str,
     *,
     allow_private_networks: bool = False,
+    ipv4_only: bool = BOARD_IPV4_ONLY,
 ) -> str:
     """Canonicalize a URL and reject DNS answers that are not globally routable."""
 
     canonical, _addresses = _validated_public_target(
         url,
         allow_private_networks=allow_private_networks,
+        ipv4_only=ipv4_only,
     )
     return canonical
 
@@ -710,6 +722,7 @@ class BoardHTTPClient:
         return validate_public_url(
             url,
             allow_private_networks=self.settings.allow_private_networks,
+            ipv4_only=self.settings.ipv4_only,
         )
 
     def validated_connection_target(self, url: str) -> tuple[str, tuple[str, ...]]:
@@ -721,6 +734,7 @@ class BoardHTTPClient:
         return _validated_public_target(
             url,
             allow_private_networks=self.settings.allow_private_networks,
+            ipv4_only=self.settings.ipv4_only,
         )
 
     def _validate_target(self, url: str) -> str:

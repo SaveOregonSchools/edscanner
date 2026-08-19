@@ -324,6 +324,21 @@ class RenderedPage:
     browser_rendered: bool = False
 
 
+class RenderedPageRejected(RuntimeError):
+    """A rendered document that callers must not treat as usable content."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        page: RenderedPage,
+        challenge: ChallengeAssessment | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.page = page
+        self.challenge = challenge
+
+
 _TITLE_PATTERN = re.compile(r"<title\b[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _CHALLENGE_TITLE_MARKERS = (
     "access denied",
@@ -959,22 +974,26 @@ class BoardPlatformAdapter(ABC):
             raise ResponseTooLarge(
                 f"Rendered page exceeded {self.client.settings.max_html_size_bytes} bytes: {url}"
             )
-        browser_challenge = assess_challenge(navigation_status, content, final_url)
-        if browser_challenge.is_challenge:
-            raise RuntimeError(
-                "Browser received an anti-bot challenge or access-denied page "
-                f"({browser_challenge.marker or browser_challenge.category})."
-            )
-        if navigation_status >= 400:
-            raise RuntimeError(
-                f"Browser received HTTP {navigation_status} for {final_url}."
-            )
-        return RenderedPage(
+        rendered_page = RenderedPage(
             content=content,
             final_url=final_url,
             status_code=navigation_status,
             browser_rendered=True,
         )
+        browser_challenge = assess_challenge(navigation_status, content, final_url)
+        if browser_challenge.is_challenge:
+            raise RenderedPageRejected(
+                "Browser received an anti-bot challenge or access-denied page "
+                f"({browser_challenge.marker or browser_challenge.category}).",
+                page=rendered_page,
+                challenge=browser_challenge,
+            )
+        if navigation_status >= 400:
+            raise RenderedPageRejected(
+                f"Browser received HTTP {navigation_status} for {final_url}.",
+                page=rendered_page,
+            )
+        return rendered_page
 
 
 __all__ = [
@@ -983,6 +1002,7 @@ __all__ = [
     "Content",
     "MeetingLike",
     "RenderedPage",
+    "RenderedPageRejected",
     "SourceLike",
     "_browser_navigation_scope",
     "_main_frame_response_details",

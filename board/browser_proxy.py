@@ -25,8 +25,16 @@ def _recv_exact(connection: socket.socket, length: int) -> bytes:
     return bytes(data)
 
 
-def _connect_address(address: str, port: int, timeout: float) -> socket.socket:
+def _connect_address(
+    address: str,
+    port: int,
+    timeout: float,
+    *,
+    ipv4_only: bool = True,
+) -> socket.socket:
     parsed = ipaddress.ip_address(address)
+    if ipv4_only and parsed.version != 4:
+        raise BoardHTTPError("IPv6 browser destinations are disabled by configuration.")
     family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
     upstream = socket.socket(family, socket.SOCK_STREAM)
     upstream.settimeout(timeout)
@@ -116,6 +124,7 @@ class _PinnedSOCKSHandler(socketserver.BaseRequestHandler):
                             address,
                             port,
                             self.server.board_client.settings.timeout_seconds,
+                            ipv4_only=self.server.board_client.settings.ipv4_only,
                         )
                         break
                     except OSError as exc:

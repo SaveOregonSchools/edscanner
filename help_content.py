@@ -265,6 +265,7 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                         "title": "Do I have to run discovery first?",
                         "paragraphs": [
                             "Usually. Discovery is the fastest way to identify sources in bulk, but you can instead open Board Sources and use Add or correct source for an individual district.",
+                            "Use Discovery scope to choose explicitly between districts not yet checked and rediscovering districts that already have a saved source. Rediscovery starts again from each district website; it does not directly health-check the saved URL. Choosing a specific source status selects that saved-source group, while platform filters should be combined with Rediscover or a specific status. Every run detail page records the submitted scope.",
                             "A manually submitted URL is safely fetched and checked by a platform adapter. It becomes working only after the adapter verifies the endpoint and you confirm that the page belongs to the selected district; otherwise it remains manual-review evidence.",
                             "Discovery does not collect the full meeting archive. Sync performs that collection and creates versions only when normalized content or document bytes actually change.",
                         ],
@@ -272,7 +273,7 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                     {
                         "title": "Challenges and provider directories",
                         "paragraphs": [
-                            "When a district page returns a likely access challenge, EdScanner can try that page once with a real Chromium browser. Rate limits and robots denials do not trigger the retry, and a remaining CAPTCHA or challenge is recorded for manual review rather than bypassed.",
+                            "When a district page returns a likely access challenge, EdScanner can try that page once with a real Chromium browser. A separately bounded browser recovery handles connection-stack or certificate-chain failures without disabling TLS verification. Rate limits and robots denials do not trigger the retry, and a remaining CAPTCHA or challenge is recorded for manual review rather than bypassed.",
                             "BoardBook publishes an organization directory, but the directory has names and opaque organization IDs without state. Provider-directory lookup is therefore disabled by default and must only be enabled after the operator confirms permission under the provider's current terms.",
                             "When authorized, EdScanner fetches the directory once per discovery run, generates local name candidates, and requires state evidence plus a unique reciprocal NCES name-and-city match (or district-homepage evidence) before a source can become working. Ambiguous or state-less matches are never activated automatically.",
                         ],
@@ -299,8 +300,8 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                             ("blocked_by_challenge", "A public WAF or bot challenge prevented reliable anonymous collection."),
                             ("blocked_by_robots", "The configured robots policy disallowed the attempted public request."),
                             ("platform_changed_or_parser_broken", "A previously usable platform now returns an unexpected structure and needs adapter review."),
-                            ("not_found", "Discovery did not find a credible public board portal for the district."),
-                            ("error", "Discovery or sync ended with an unexpected request, parsing, or persistence error."),
+                            ("not_found", "In new discovery runs, at least one district page was inspected but no credible public board portal was found. Older results may predate this distinction; rediscover them if uncertain."),
+                            ("error", "Discovery or sync could not complete because of a request, transport, parsing, or persistence error."),
                         ],
                     },
                     {

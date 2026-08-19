@@ -8,6 +8,7 @@ from tempfile import NamedTemporaryFile, TemporaryDirectory
 from unittest.mock import patch
 
 from board.adapters.boardbook import BoardBookAdapter
+from board.discovery import DiscoveryOutcome
 from board.documents import extract_document_text, store_board_document
 from board.http import HTTPResult
 from board.models import (
@@ -21,6 +22,7 @@ from board.runs import (
     _meeting_needs_refresh,
     create_board_discovery_run,
     create_board_sync_run,
+    execute_board_discovery_run,
     execute_board_sync_run,
 )
 from board.search import search_board_content
@@ -761,6 +763,56 @@ class BoardRunTests(BoardDatabaseTestCase):
             [(row["district_id"], row["board_source_id"], row["status"]) for row in sync_items],
             [(self.district_id, source["id"], "queued")],
         )
+
+    def test_discovery_transport_error_counts_as_failure_not_not_found(self):
+        run_id = create_board_discovery_run(
+            states=["OR"],
+            force=False,
+            max_districts=10,
+            max_workers=1,
+            debug_logging=False,
+            db_path=self.db_path,
+        )
+
+        class NoNetworkClient:
+            def __init__(self, settings) -> None:
+                self.settings = settings
+
+            def close(self) -> None:
+                return None
+
+        outcome = DiscoveryOutcome(
+            status="error",
+            platform="unknown",
+            source_url="https://district.example/",
+            discovered_from_url="https://district.example/",
+            error_message="No district page could be inspected because every transport attempt failed.",
+            raw={"fetch_errors": [{"kind": "transport", "error": "fixture TLS failure"}]},
+        )
+        with (
+            patch("board.runs.BoardHTTPClient", NoNetworkClient),
+            patch("board.runs.discover_board_source", return_value=outcome),
+        ):
+            execute_board_discovery_run(run_id, db_path=self.db_path)
+
+        with connect_db(self.db_path) as conn:
+            run = conn.execute(
+                "SELECT * FROM board_discovery_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            item = conn.execute(
+                "SELECT * FROM board_discovery_run_items WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            source = conn.execute(
+                "SELECT * FROM board_sources WHERE id = ?", (item["board_source_id"],)
+            ).fetchone()
+
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["districts_processed"], 1)
+        self.assertEqual(run["sources_failed"], 1)
+        self.assertEqual(run["sources_not_found"], 0)
+        self.assertEqual(item["status"], "error")
+        self.assertEqual(source["source_status"], "error")
+        self.assertEqual(source["is_active"], 0)
 
     def test_queued_sync_item_is_cancelled_if_its_source_was_superseded(self):
         original = self.add_source()
