@@ -13,8 +13,13 @@ from requests.adapters import HTTPAdapter
 
 from board.adapters.base import (
     _BrowserNavigationPolicy,
+    _browser_context_options,
+    _browser_navigation_source_url,
     _browser_navigation_scope,
+    _coherent_browser_user_agent,
+    _launch_mainstream_chromium,
     _main_frame_response_details,
+    _usable_rendered_main_document,
     _validate_browser_route,
 )
 from board.browser_proxy import pinned_browser_proxy
@@ -104,15 +109,20 @@ class FakeNavigationRequest:
         *,
         navigation: bool = True,
         redirected_from=None,
+        referer: str = "",
         url: str = "",
     ):
         self.frame = frame
         self._navigation = navigation
         self.redirected_from = redirected_from
+        self.headers = {"referer": referer} if referer else {}
         self.url = url
 
     def is_navigation_request(self) -> bool:
         return self._navigation
+
+    def header_value(self, name: str) -> str | None:
+        return self.headers.get(name.casefold())
 
 
 class FakeNavigationResponse:
@@ -283,6 +293,207 @@ class BoardHTTPPolicyTests(unittest.TestCase):
         self.assertEqual(policy.active_base_url, moved_url)
         self.assertEqual(policy.redirect_chain, [moved_url])
 
+    def test_initial_district_homepage_policy_accepts_attributed_client_side_move(self):
+        client = Mock()
+        client.validate_target_url.side_effect = lambda url: url
+        client.can_fetch.return_value = True
+        client.redirect_allowed.side_effect = lambda source, target: (
+            source.split("/", 3)[2].removeprefix("www.")
+            == target.split("/", 3)[2].removeprefix("www.")
+        )
+        old_url = "https://www.bend.k12.or.us/"
+        moved_url = "https://www.blschools.org/"
+        policy = _BrowserNavigationPolicy(
+            client,
+            old_url,
+            allow_district_website_move=True,
+        )
+
+        policy.validate(old_url, main_frame_navigation=True)
+        self.assertEqual(
+            policy.validate(
+                moved_url,
+                main_frame_navigation=True,
+                navigation_source_url=old_url,
+            ),
+            moved_url,
+        )
+
+        self.assertTrue(policy.website_migration_accepted)
+        self.assertEqual(policy.active_base_url, moved_url)
+        self.assertEqual(policy.redirect_chain, [moved_url])
+
+    def test_initial_district_homepage_policy_accepts_one_source_less_move(self):
+        client = Mock()
+        client.validate_target_url.side_effect = lambda url: url
+        client.can_fetch.return_value = True
+        client.redirect_allowed.side_effect = lambda source, target: (
+            source.split("/", 3)[2].removeprefix("www.")
+            == target.split("/", 3)[2].removeprefix("www.")
+        )
+        old_url = "https://www.bend.k12.or.us/"
+        moved_url = "https://www.blschools.org/"
+
+        for source_url in ("", moved_url):
+            with self.subTest(source_url=source_url):
+                policy = _BrowserNavigationPolicy(
+                    client,
+                    old_url,
+                    allow_district_website_move=True,
+                )
+                policy.validate(old_url, main_frame_navigation=True)
+
+                self.assertEqual(
+                    policy.validate(
+                        moved_url,
+                        main_frame_navigation=True,
+                        navigation_source_url=source_url,
+                    ),
+                    moved_url,
+                )
+                self.assertTrue(policy.website_migration_accepted)
+                self.assertEqual(
+                    policy.website_migration_evidence,
+                    "browser_observed_unattributed_initial_website_move",
+                )
+
+    def test_browser_observed_final_move_must_be_checked_before_window_closes(self):
+        client = Mock()
+        client.validate_target_url.side_effect = lambda url: url
+        client.can_fetch.return_value = True
+        client.redirect_allowed.side_effect = lambda source, target: (
+            source.split("/", 3)[2].removeprefix("www.")
+            == target.split("/", 3)[2].removeprefix("www.")
+        )
+        old_url = "https://www.bend.k12.or.us/"
+        moved_url = "https://www.blschools.org/"
+
+        before_close = _BrowserNavigationPolicy(
+            client,
+            old_url,
+            allow_district_website_move=True,
+        )
+        before_close.validate(old_url, main_frame_navigation=True)
+        # Models a final ``page.url`` that changed even though no target route,
+        # Redirected-From, or Referer was observable.
+        before_close.validate(moved_url, main_frame_navigation=True)
+        before_close.close_initial_navigation()
+        self.assertEqual(
+            before_close.validate(moved_url, main_frame_navigation=True),
+            moved_url,
+        )
+        self.assertEqual(
+            before_close.website_migration_evidence,
+            "browser_observed_unattributed_initial_website_move",
+        )
+
+        after_close = _BrowserNavigationPolicy(
+            client,
+            old_url,
+            allow_district_website_move=True,
+        )
+        after_close.validate(old_url, main_frame_navigation=True)
+        after_close.close_initial_navigation()
+        with self.assertRaises(InvalidPublicURL):
+            after_close.validate(moved_url, main_frame_navigation=True)
+
+    def test_source_less_move_rejects_closed_window_second_move_and_robots_denial(self):
+        client = Mock()
+        client.validate_target_url.side_effect = lambda url: url
+        client.can_fetch.side_effect = lambda url: "robots-denied" not in url
+        client.redirect_allowed.side_effect = lambda source, target: (
+            source.split("/", 3)[2].removeprefix("www.")
+            == target.split("/", 3)[2].removeprefix("www.")
+        )
+        old_url = "https://old-district.example/"
+        moved_url = "https://new-district.example/"
+
+        closed = _BrowserNavigationPolicy(
+            client,
+            old_url,
+            allow_district_website_move=True,
+        )
+        closed.validate(old_url, main_frame_navigation=True)
+        closed.close_initial_navigation()
+        with self.assertRaises(InvalidPublicURL):
+            closed.validate(moved_url, main_frame_navigation=True)
+
+        moved = _BrowserNavigationPolicy(
+            client,
+            old_url,
+            allow_district_website_move=True,
+        )
+        moved.validate(old_url, main_frame_navigation=True)
+        moved.validate(moved_url, main_frame_navigation=True)
+        with self.assertRaises(InvalidPublicURL):
+            moved.validate(
+                "https://third-district.example/",
+                main_frame_navigation=True,
+            )
+
+        robots_denied = _BrowserNavigationPolicy(
+            client,
+            old_url,
+            allow_district_website_move=True,
+        )
+        robots_denied.validate(old_url, main_frame_navigation=True)
+        with self.assertRaises(RobotsDenied):
+            robots_denied.validate(
+                "https://robots-denied.example/",
+                main_frame_navigation=True,
+            )
+        self.assertFalse(robots_denied.website_migration_accepted)
+
+    def test_source_less_move_rejects_private_target_before_acceptance(self):
+        client = Mock()
+        old_url = "https://old-district.example/"
+        private_url = "https://127.0.0.1/"
+
+        def validate(url):
+            if url == private_url:
+                raise InvalidPublicURL("private address")
+            return url
+
+        client.validate_target_url.side_effect = validate
+        client.can_fetch.return_value = True
+        client.redirect_allowed.side_effect = lambda source, target: source == target
+        policy = _BrowserNavigationPolicy(
+            client,
+            old_url,
+            allow_district_website_move=True,
+        )
+        policy.validate(old_url, main_frame_navigation=True)
+
+        with self.assertRaises(InvalidPublicURL):
+            policy.validate(private_url, main_frame_navigation=True)
+        self.assertFalse(policy.website_migration_accepted)
+
+    def test_client_side_website_move_requires_original_site_attribution(self):
+        client = Mock()
+        client.validate_target_url.side_effect = lambda url: url
+        client.can_fetch.return_value = True
+        client.redirect_allowed.side_effect = lambda source, target: (
+            source.split("/", 3)[2].removeprefix("www.")
+            == target.split("/", 3)[2].removeprefix("www.")
+        )
+        old_url = "https://www.bend.k12.or.us/"
+        moved_url = "https://www.blschools.org/"
+
+        for source_url in ("", "https://unrelated.example/"):
+            with self.subTest(source_url=source_url):
+                policy = _BrowserNavigationPolicy(
+                    client,
+                    old_url,
+                    allow_district_website_move=True,
+                )
+                with self.assertRaises(InvalidPublicURL):
+                    policy.validate(
+                        moved_url,
+                        main_frame_navigation=True,
+                        navigation_source_url=source_url,
+                    )
+                self.assertFalse(policy.website_migration_accepted)
+
     def test_initial_district_homepage_policy_rejects_https_downgrade(self):
         client = Mock()
         client.validate_target_url.side_effect = lambda url: url
@@ -379,6 +590,121 @@ class BoardHTTPPolicyTests(unittest.TestCase):
                 page,
             ),
             "subresource",
+        )
+
+    def test_browser_navigation_source_uses_redirect_referer_then_page(self):
+        page = type(
+            "FakePage",
+            (),
+            {"url": "https://district.example/current"},
+        )()
+        redirected_from = type(
+            "RedirectedFrom",
+            (),
+            {"url": "https://district.example/server-source"},
+        )()
+
+        self.assertEqual(
+            _browser_navigation_source_url(
+                FakeNavigationRequest(
+                    object(),
+                    redirected_from=redirected_from,
+                    referer="https://district.example/referrer",
+                ),
+                page,
+            ),
+            "https://district.example/server-source",
+        )
+        self.assertEqual(
+            _browser_navigation_source_url(
+                FakeNavigationRequest(
+                    object(),
+                    referer="https://district.example/referrer",
+                ),
+                page,
+            ),
+            "https://district.example/referrer",
+        )
+        self.assertEqual(
+            _browser_navigation_source_url(
+                FakeNavigationRequest(object()),
+                page,
+            ),
+            "https://district.example/current",
+        )
+
+    def test_browser_context_uses_desktop_defaults_and_version_aligned_user_agent(self):
+        user_agent = _coherent_browser_user_agent(
+            "149.0.7827.55",
+            "Mozilla/5.0 HeadlessChrome/148.0.0.0 Safari/537.36",
+        )
+        options = _browser_context_options(
+            ignore_https_errors=False,
+            user_agent=user_agent,
+        )
+
+        self.assertIn("Chrome/149.0.0.0", options["user_agent"])
+        self.assertNotIn("HeadlessChrome", options["user_agent"])
+        self.assertEqual(options["viewport"], {"width": 1365, "height": 768})
+        self.assertEqual(options["screen"], options["viewport"])
+        self.assertEqual(options["locale"], "en-US")
+        self.assertNotIn("timezone_id", options)
+        self.assertFalse(options["ignore_https_errors"])
+
+    def test_browser_user_agent_preserves_deliberate_operator_identity(self):
+        self.assertEqual(
+            _coherent_browser_user_agent("149.0.7827.55", "EdScanner/1.0"),
+            "EdScanner/1.0",
+        )
+
+    def test_browser_launch_prefers_system_chrome_then_falls_back(self):
+        browser = object()
+        playwright = Mock()
+        playwright.chromium.launch.side_effect = [
+            RuntimeError("Chrome unavailable"),
+            browser,
+        ]
+
+        selected, channel = _launch_mainstream_chromium(
+            playwright,
+            proxy_server="socks5://127.0.0.1:12345",
+            launch_args=["--disable-quic"],
+        )
+
+        self.assertIs(selected, browser)
+        self.assertEqual(channel, "chromium")
+        self.assertEqual(
+            [call.kwargs["channel"] for call in playwright.chromium.launch.call_args_list],
+            ["chrome", "chromium"],
+        )
+
+    def test_committed_browser_timeout_requires_useful_non_challenge_document(self):
+        final_url = "https://district.example/board"
+        useful = b"""
+            <html><body><h1>District School Board Meetings</h1>
+            <p>Agendas and minutes for regular public meetings are available here.</p>
+            </body></html>
+        """
+        challenge = b"""
+            <html><head><title>Attention Required! | Cloudflare</title></head>
+            <body><h1>Sorry, you have been blocked</h1></body></html>
+        """
+
+        self.assertTrue(
+            _usable_rendered_main_document(200, useful, final_url)
+        )
+        self.assertFalse(
+            _usable_rendered_main_document(
+                200,
+                b"<html><head></head><body></body></html>",
+                final_url,
+            )
+        )
+        self.assertFalse(
+            _usable_rendered_main_document(200, challenge, final_url)
+        )
+        self.assertFalse(
+            _usable_rendered_main_document(403, useful, final_url)
         )
 
     def test_browser_uses_latest_main_document_response_after_challenge_reload(self):

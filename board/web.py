@@ -70,6 +70,7 @@ from common import (
     BOARD_SYNC_RUN_LOGS_DIR,
     BOARD_WORKERS,
     connect_db,
+    has_brave_search_api_key,
     init_db,
     list_filter_options,
     utc_now_iso,
@@ -584,6 +585,12 @@ def discovery() -> str | Response:
     max_workers = _clamp(request.values.get("max_workers"), BOARD_WORKERS, 1, 8)
     force = request.form.get("force") == "1" if request.method == "POST" else False
     debug_logging = request.form.get("debug_logging") == "1" if request.method == "POST" else True
+    brave_search_available = has_brave_search_api_key()
+    search_fallback = (
+        request.form.get("search_fallback") == "1"
+        if request.method == "POST"
+        else False
+    )
     if request.method == "POST":
         if force and status_filter == "__unchecked__":
             status_filter = ""
@@ -597,6 +604,7 @@ def discovery() -> str | Response:
             max_districts=max_districts,
             max_workers=max_workers,
             force=force,
+            search_fallback=search_fallback,
             debug_logging=debug_logging,
         )
         enqueue_discovery_run(run_id)
@@ -631,6 +639,8 @@ def discovery() -> str | Response:
         max_districts=max_districts,
         max_workers=max_workers,
         force=force,
+        search_fallback=search_fallback,
+        brave_search_available=brave_search_available,
         debug_logging=debug_logging,
         provider_directory_enabled=provider_directory_enabled(),
         provider_directory_warning=BOARD_PROVIDER_DIRECTORY_WARNING,
@@ -876,10 +886,23 @@ def discovery_run_detail(run_id: int) -> str:
             """,
             (run_id,),
         ).fetchall()
+        status_counts = {
+            str(row["status"]): int(row["count"])
+            for row in conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM board_discovery_run_items
+                WHERE run_id = ?
+                GROUP BY status
+                """,
+                (run_id,),
+            )
+        }
     return render_template(
         "board_discovery_run_detail.html",
         run=run,
         items=items,
+        status_counts=status_counts,
         states=_json_list(run["states_json"]),
         agency_types=_json_list(run["agency_types_json"]),
         elapsed=_elapsed(run["started_at"], run["finished_at"]),

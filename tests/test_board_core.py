@@ -1090,6 +1090,107 @@ class BoardRunTests(BoardDatabaseTestCase):
             ).fetchone()[0]
         self.assertEqual(requested, 1)
 
+    def test_discovery_run_persists_explicit_search_fallback_choice(self):
+        with patch("board.runs.has_brave_search_api_key", return_value=True):
+            enabled_run_id = create_board_discovery_run(
+                states=["OR"],
+                force=True,
+                search_fallback=True,
+                max_workers=1,
+                debug_logging=False,
+                db_path=self.db_path,
+            )
+            disabled_run_id = create_board_discovery_run(
+                states=["OR"],
+                force=True,
+                search_fallback=False,
+                max_workers=1,
+                debug_logging=False,
+                db_path=self.db_path,
+            )
+        with patch("board.runs.has_brave_search_api_key", return_value=False):
+            unavailable_run_id = create_board_discovery_run(
+                states=["OR"],
+                force=True,
+                search_fallback=True,
+                max_workers=1,
+                debug_logging=False,
+                db_path=self.db_path,
+            )
+
+        with connect_db(self.db_path) as conn:
+            choices = {
+                row["id"]: row["search_fallback_requested"]
+                for row in conn.execute(
+                    """
+                    SELECT id, search_fallback_requested
+                    FROM board_discovery_runs WHERE id IN (?, ?, ?)
+                    """,
+                    (enabled_run_id, disabled_run_id, unavailable_run_id),
+                )
+            }
+
+        self.assertEqual(choices[enabled_run_id], 1)
+        self.assertEqual(choices[disabled_run_id], 0)
+        self.assertEqual(choices[unavailable_run_id], 0)
+
+    def test_legacy_discovery_run_does_not_implicitly_enable_search_fallback(self):
+        class NoNetworkClient:
+            def __init__(self, settings) -> None:
+                self.settings = settings
+
+            def close(self) -> None:
+                return None
+
+        outcome = DiscoveryOutcome(
+            status="working",
+            platform="boardbook",
+            source_url="https://meetings.boardbook.org/Public/Organization/2221",
+            organization_external_id="2221",
+            confidence=99,
+        )
+        with (
+            patch("board.runs.has_brave_search_api_key", return_value=True),
+            patch("board.runs.provider_directory_enabled", return_value=False),
+        ):
+            run_id = create_board_discovery_run(
+                states=["OR"],
+                force=True,
+                search_fallback=False,
+                max_workers=1,
+                debug_logging=False,
+                db_path=self.db_path,
+            )
+            with connect_db(self.db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE board_discovery_runs
+                    SET search_fallback_requested = NULL
+                    WHERE id = ?
+                    """,
+                    (run_id,),
+                )
+                conn.commit()
+            with (
+                patch("board.runs.BoardHTTPClient", NoNetworkClient),
+                patch(
+                    "board.runs.discover_board_source",
+                    return_value=outcome,
+                ) as discover,
+            ):
+                execute_board_discovery_run(run_id, db_path=self.db_path)
+
+        self.assertFalse(discover.call_args.kwargs["search_fallback"])
+        with connect_db(self.db_path) as conn:
+            persisted = conn.execute(
+                """
+                SELECT search_fallback_requested
+                FROM board_discovery_runs WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()[0]
+        self.assertEqual(persisted, 0)
+
     def test_discovery_transport_error_counts_as_failure_not_not_found(self):
         run_id = create_board_discovery_run(
             states=["OR"],

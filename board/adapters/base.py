@@ -324,6 +324,7 @@ class RenderedPage:
     browser_rendered: bool = False
     redirect_chain: tuple[str, ...] = ()
     website_migration_accepted: bool = False
+    website_migration_evidence: str = ""
 
 
 class RenderedPageRejected(RuntimeError):
@@ -467,10 +468,11 @@ class _BrowserNavigationPolicy:
 
     Ordinary adapter rendering retains the existing organization/vendor
     boundary.  Discovery may opt the district's *initial configured website*
-    into one cross-host server redirect while ``initial_navigation_open`` is
-    true.  Both ends must be HTTPS, every target is still resolved through the
-    client's public-address policy, and any later main-frame navigation must
-    remain related to the newly accepted host.
+    into one cross-host server redirect or browser-attributed top-frame move
+    while ``initial_navigation_open`` is true. Both ends must be HTTPS, every
+    target is still resolved through the client's public-address policy, and
+    any later main-frame navigation must remain related to the newly accepted
+    host.
     """
 
     def __init__(
@@ -485,35 +487,62 @@ class _BrowserNavigationPolicy:
         self.active_base_url = self.requested_url
         self.allow_district_website_move = bool(allow_district_website_move)
         self.initial_navigation_open = True
+        self.configured_homepage_navigation_seen = False
         self.website_migration_accepted = False
+        self.website_migration_evidence = ""
         self.redirect_chain: list[str] = []
 
     def close_initial_navigation(self) -> None:
         self.initial_navigation_open = False
 
-    def _may_accept_district_website_move(
+    def _district_website_move_evidence(
         self,
         target_url: str,
         redirected_from_url: str,
-    ) -> bool:
+        navigation_source_url: str,
+    ) -> str:
         if (
             not self.allow_district_website_move
             or not self.initial_navigation_open
             or self.website_migration_accepted
-            or not redirected_from_url
+            or self.active_base_url != self.requested_url
         ):
-            return False
-        source = self.client.validate_target_url(redirected_from_url)
+            return ""
+        source_url = str(redirected_from_url or navigation_source_url or "")
         if urlsplit(self.requested_url).scheme.casefold() != "https":
-            return False
+            return ""
         if urlsplit(target_url).scheme.casefold() != "https":
-            return False
-        if urlsplit(redirected_from_url).scheme.casefold() != "https":
-            return False
-        # The redirect that establishes the move must itself originate inside
-        # the configured district site's ordinary boundary.  A vendor page or
-        # a previously moved host cannot bootstrap another unrelated move.
-        return self.client.redirect_allowed(self.requested_url, source)
+            return ""
+        if source_url:
+            if urlsplit(source_url).scheme.casefold() != "https":
+                return ""
+            try:
+                source = self.client.validate_target_url(source_url)
+            except BoardHTTPError:
+                return ""
+            if self.client.redirect_allowed(self.requested_url, source):
+                return (
+                    "browser_redirect_attributed_initial_website_move"
+                    if redirected_from_url
+                    else "browser_source_attributed_initial_website_move"
+                )
+            # During a client-side redirect Playwright can expose only the
+            # already-committed target as ``page.url``. That is not source
+            # attribution; treat it like an absent Referer, not an invalid
+            # unrelated source. An explicit unrelated source still fails.
+            if redirected_from_url or not self.client.redirect_allowed(
+                target_url,
+                source,
+            ):
+                return ""
+
+        # Source-less recovery is allowed only after the router observed the
+        # original configured homepage request in this still-open navigation.
+        # It cannot bootstrap a candidate render, popup, subresource, or later
+        # main-frame move.
+        if not self.configured_homepage_navigation_seen:
+            return ""
+        return "browser_observed_unattributed_initial_website_move"
 
     def validate(
         self,
@@ -521,6 +550,7 @@ class _BrowserNavigationPolicy:
         *,
         main_frame_navigation: bool,
         redirected_from_url: str = "",
+        navigation_source_url: str = "",
     ) -> str:
         if urlsplit(str(request_url or "")).scheme.casefold() != "https":
             raise InvalidPublicURL(
@@ -530,20 +560,34 @@ class _BrowserNavigationPolicy:
         if not main_frame_navigation:
             return target_url
 
-        if not self.client.redirect_allowed(self.active_base_url, target_url):
-            if not self._may_accept_district_website_move(
+        boundary_move = not self.client.redirect_allowed(
+            self.active_base_url,
+            target_url,
+        )
+        move_evidence = ""
+        if boundary_move:
+            move_evidence = self._district_website_move_evidence(
                 target_url,
                 redirected_from_url,
-            ):
+                navigation_source_url,
+            )
+            if not move_evidence:
                 raise InvalidPublicURL(
                     "Browser navigation left the allowed public boundary: "
                     f"{self.active_base_url} -> {target_url}"
                 )
-            self.active_base_url = target_url
-            self.website_migration_accepted = True
 
         if not self.client.can_fetch(target_url):
             raise RobotsDenied(f"robots.txt disallows browser rendering for {target_url}")
+        if boundary_move:
+            self.active_base_url = target_url
+            self.website_migration_accepted = True
+            self.website_migration_evidence = move_evidence
+        elif (
+            self.active_base_url == self.requested_url
+            and self.client.redirect_allowed(self.requested_url, target_url)
+        ):
+            self.configured_homepage_navigation_seen = True
         if target_url != self.requested_url and (
             not self.redirect_chain or self.redirect_chain[-1] != target_url
         ):
@@ -576,6 +620,54 @@ def _browser_navigation_scope(request: Any, page: Any) -> str:
     return "child" if owning_page is page else "popup"
 
 
+def _browser_navigation_source_url(request: Any, page: Any) -> str:
+    """Return a browser-attested HTTPS source for a top-frame navigation.
+
+    Server redirects expose ``redirected_from``. A legitimate website move can
+    instead be initiated by ``location.replace`` or a meta refresh, for which
+    Playwright does not populate that property. In that case the
+    browser-generated Referer, followed by the main page's committed URL, is a
+    trustworthy source hint. The navigation policy still validates that hint
+    against the configured district boundary before accepting a move.
+    """
+
+    candidates: list[str] = []
+    try:
+        redirected_from = request.redirected_from
+        candidates.append(str(getattr(redirected_from, "url", "") or ""))
+    except Exception:
+        pass
+    try:
+        candidates.append(str(request.header_value("referer") or ""))
+    except Exception:
+        try:
+            headers = request.headers
+            candidates.append(
+                str(
+                    next(
+                        (
+                            value
+                            for name, value in dict(headers or {}).items()
+                            if str(name).casefold() == "referer"
+                        ),
+                        "",
+                    )
+                    or ""
+                )
+            )
+        except Exception:
+            pass
+    try:
+        candidates.append(str(page.url or ""))
+    except Exception:
+        pass
+
+    for candidate in candidates:
+        if urlsplit(candidate).scheme.casefold() == "https":
+            return candidate
+    return ""
+
+
 def _main_frame_response_details(page: Any, response: Any) -> tuple[int, str] | None:
     """Return status/URL only for a response that committed the main document."""
 
@@ -586,6 +678,116 @@ def _main_frame_response_details(page: Any, response: Any) -> tuple[int, str] | 
         return int(response.status), str(response.url or "")
     except (AttributeError, TypeError, ValueError):
         return None
+
+
+def _usable_rendered_main_document(
+    status_code: int,
+    content: Content,
+    final_url: str,
+) -> bool:
+    """Return whether a committed but slow document is safe to inspect.
+
+    This is deliberately stricter than merely checking that ``page.content``
+    returned an HTML shell. Browser timeout recovery is allowed only for a
+    successful, non-challenge document with enough visible text or links to be
+    useful to discovery.
+    """
+
+    if int(status_code) < 200 or int(status_code) >= 400:
+        return False
+    content_value = content_bytes(content)
+    if assess_challenge(status_code, content_value, final_url).is_challenge:
+        return False
+    soup = html_soup(content_value)
+    visible_text = collapse_ws(soup.get_text(" ", strip=True))
+    return len(visible_text) >= 40 or len(soup.find_all("a", href=True)) >= 2
+
+
+def _coherent_browser_user_agent(
+    browser_version: str,
+    configured_user_agent: str,
+) -> str:
+    """Keep the desktop UA on Chromium's installed major version.
+
+    Playwright's headless default advertises ``HeadlessChrome`` even when the
+    regular bundled Chromium executable is used. That alone causes some public
+    CMS/WAF rules to reject an otherwise ordinary page. This is a narrow
+    desktop-UA correction, not a stealth layer: ``navigator.webdriver`` and
+    the rest of Playwright's normal automation behavior are left unchanged.
+    A deliberate non-Chrome operator UA is preserved.
+    """
+
+    configured = collapse_ws(configured_user_agent)
+    version_match = re.match(r"\s*(\d+)", str(browser_version or ""))
+    if not version_match:
+        return configured
+    major = version_match.group(1)
+    configured_match = re.search(
+        r"\b(?:HeadlessChrome|Chrome)/(\d+)(?:\.\d+){0,3}\b",
+        configured,
+        flags=re.IGNORECASE,
+    )
+    if configured and configured_match is None:
+        return configured
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.0.0.0 Safari/537.36"
+    )
+
+
+def _browser_context_options(
+    *,
+    ignore_https_errors: bool,
+    user_agent: str,
+) -> dict[str, Any]:
+    """Build a coherent fresh desktop context without stealth overrides."""
+
+    return {
+        "ignore_https_errors": bool(ignore_https_errors),
+        "accept_downloads": False,
+        "service_workers": "block",
+        "viewport": {"width": 1365, "height": 768},
+        "screen": {"width": 1365, "height": 768},
+        "device_scale_factor": 1,
+        "is_mobile": False,
+        "has_touch": False,
+        "locale": "en-US",
+        "color_scheme": "light",
+        "user_agent": user_agent,
+    }
+
+
+def _launch_mainstream_chromium(
+    playwright: Any,
+    *,
+    proxy_server: str,
+    launch_args: list[str],
+) -> tuple[Any, str]:
+    """Launch the first available maintained desktop Chromium distribution.
+
+    A system Chrome build is closer to what district IT teams test than
+    Playwright's bundled testing build. The bundled regular Chromium remains
+    the deterministic fallback for hosts without Chrome. This
+    is availability/compatibility selection, not per-request identity rotation.
+    """
+
+    errors: list[str] = []
+    for channel in ("chrome", "chromium"):
+        try:
+            browser = playwright.chromium.launch(
+                headless=True,
+                channel=channel,
+                proxy={"server": proxy_server},
+                args=list(launch_args),
+            )
+            return browser, channel
+        except Exception as exc:
+            errors.append(f"{channel}: {exc}")
+    raise RuntimeError(
+        "No supported Chrome or bundled Chromium runtime could be "
+        "launched. " + "; ".join(errors)
+    )
 
 
 class BoardPlatformAdapter(ABC):
@@ -946,21 +1148,29 @@ class BoardPlatformAdapter(ABC):
             pinned_browser_proxy(self.client) as proxy_server,
             sync_playwright() as playwright,
         ):
-            browser = playwright.chromium.launch(
-                headless=True,
-                proxy={"server": proxy_server},
-                args=[
+            browser, browser_channel = _launch_mainstream_chromium(
+                playwright,
+                proxy_server=proxy_server,
+                launch_args=[
                     "--disable-quic",
                     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
                     "--proxy-bypass-list=<-loopback>",
                 ],
             )
+            LOGGER.info(
+                "Rendering public board page with browser channel %s: %s",
+                browser_channel,
+                requested_url,
+            )
             try:
                 context = browser.new_context(
-                    user_agent=self.client.settings.user_agent,
-                    ignore_https_errors=not self.client.settings.verify_ssl,
-                    accept_downloads=False,
-                    service_workers="block",
+                    **_browser_context_options(
+                        ignore_https_errors=not self.client.settings.verify_ssl,
+                        user_agent=_coherent_browser_user_agent(
+                            browser.version,
+                            self.client.settings.user_agent,
+                        ),
+                    )
                 )
 
                 if not hasattr(context, "route_web_socket"):
@@ -1013,6 +1223,7 @@ class BoardPlatformAdapter(ABC):
                         return
                     try:
                         redirected_from_url = ""
+                        navigation_source_url = ""
                         if navigation_scope == "main":
                             try:
                                 redirected_from = route.request.redirected_from
@@ -1021,10 +1232,15 @@ class BoardPlatformAdapter(ABC):
                                 )
                             except Exception:
                                 redirected_from_url = ""
+                            navigation_source_url = _browser_navigation_source_url(
+                                route.request,
+                                page,
+                            )
                         navigation_policy.validate(
                             request_url,
                             main_frame_navigation=navigation_scope == "main",
                             redirected_from_url=redirected_from_url,
+                            navigation_source_url=navigation_source_url,
                         )
                     except RobotsDenied as exc:
                         if navigation_scope == "main":
@@ -1049,33 +1265,82 @@ class BoardPlatformAdapter(ABC):
                 # first request of a popup. It also lets us apply policy to
                 # every matching main-document request in a redirect chain.
                 context.route("**/*", guard_public_route)
+                dom_timeout_error: Exception | None = None
                 try:
-                    navigation_response = page.goto(
-                        requested_url,
-                        wait_until="domcontentloaded",
-                        timeout=timeout_ms,
-                    )
-                except Exception as exc:
+                    try:
+                        # A committed public main document is sufficient to
+                        # begin a bounded DOM settle. This avoids discarding a
+                        # useful page solely because one script delays the
+                        # DOMContentLoaded event for the full request timeout.
+                        navigation_response = page.goto(
+                            requested_url,
+                            wait_until="commit",
+                            timeout=timeout_ms,
+                        )
+                    except Exception as exc:
+                        if navigation_policy_error is not None:
+                            raise navigation_policy_error from exc
+                        raise
+                    details = _main_frame_response_details(page, navigation_response)
+                    if details is not None:
+                        navigation_status = details[0]
+                        navigation_seen = True
+                    try:
+                        page.wait_for_load_state(
+                            "domcontentloaded",
+                            timeout=min(timeout_ms, 5000),
+                        )
+                    except PlaywrightTimeoutError as exc:
+                        dom_timeout_error = exc
+                    # Keep the one-move window open through the same bounded
+                    # settling period so an old district page may perform one
+                    # attributable location/meta-refresh migration.
+                    try:
+                        page.wait_for_load_state(
+                            "networkidle",
+                            timeout=min(timeout_ms, 5000),
+                        )
+                    except PlaywrightTimeoutError:
+                        pass
                     if navigation_policy_error is not None:
-                        raise navigation_policy_error from exc
-                    raise
+                        raise navigation_policy_error
+                    # Chromium can commit a server/client redirect without
+                    # exposing the target hop to ``context.route``. Validate
+                    # that browser-observed final URL while the one-move
+                    # configured-homepage window is still open. This remains a
+                    # fail-closed public/DNS/robots check before any DOM is
+                    # parsed; the validation immediately after this ``finally``
+                    # runs again with the window closed.
+                    navigation_policy.validate(
+                        page.url,
+                        main_frame_navigation=True,
+                    )
                 finally:
                     navigation_policy.close_initial_navigation()
                 if navigation_policy_error is not None:
                     raise navigation_policy_error
-                details = _main_frame_response_details(page, navigation_response)
-                if details is not None and not navigation_seen:
-                    navigation_status = details[0]
                 final_url = navigation_policy.validate(
                     page.url,
                     main_frame_navigation=True,
                 )
-                try:
-                    page.wait_for_load_state("networkidle", timeout=min(timeout_ms, 5000))
-                except PlaywrightTimeoutError:
-                    pass
                 if navigation_policy_error is not None:
                     raise navigation_policy_error
+                content = page.content().encode("utf-8")
+                if dom_timeout_error is not None and not (
+                    navigation_seen
+                    and _usable_rendered_main_document(
+                        navigation_status,
+                        content,
+                        final_url,
+                    )
+                ):
+                    raise dom_timeout_error
+                if dom_timeout_error is not None:
+                    LOGGER.info(
+                        "Continuing with committed browser document after bounded "
+                        "DOMContentLoaded timeout: %s",
+                        final_url,
+                    )
                 try:
                     self._prepare_rendered_page(page, url, timeout_ms)
                 except Exception as exc:
@@ -1104,6 +1369,9 @@ class BoardPlatformAdapter(ABC):
             website_migration_accepted=(
                 navigation_policy.website_migration_accepted
             ),
+            website_migration_evidence=(
+                navigation_policy.website_migration_evidence
+            ),
         )
         browser_challenge = assess_challenge(navigation_status, content, final_url)
         if browser_challenge.is_challenge:
@@ -1130,6 +1398,7 @@ __all__ = [
     "RenderedPageRejected",
     "SourceLike",
     "_browser_navigation_scope",
+    "_launch_mainstream_chromium",
     "_main_frame_response_details",
     "assess_challenge",
     "collapse_ws",

@@ -122,16 +122,30 @@ class BoardBookAdapter(BoardPlatformAdapter):
             else None
         )
         organization_name = None
-        if html:
-            soup = html_soup(html)
-            heading = soup.find(["h1", "h2"], string=re.compile(r"Public View|Meetings", re.IGNORECASE))
-            if heading:
-                organization_name = re.sub(
-                    r"\s+(?:Public View|Meetings)\s*$",
-                    "",
-                    collapse_ws(heading.get_text(" ", strip=True)),
-                    flags=re.IGNORECASE,
-                )
+        evidence_metadata: dict[str, Any] = {}
+        if html and organization_id:
+            # Reuse the same bounded, deterministic evidence parser used by
+            # the opt-in directory matcher. These fields let independent
+            # search evidence be checked against the district before a source
+            # is activated; they do not enumerate provider organizations.
+            from board.provider_directories import (
+                BoardBookDirectoryEntry,
+                parse_boardbook_organization_evidence,
+            )
+
+            entry = BoardBookDirectoryEntry(
+                external_id=organization_id,
+                organization_name="",
+                public_url=canonical_url or url,
+            )
+            evidence = parse_boardbook_organization_evidence(html, entry)
+            organization_name = evidence.organization_name or None
+            evidence_metadata = {
+                "states": sorted(evidence.states),
+                "cities": sorted(evidence.cities),
+                "meeting_count": evidence.meeting_count,
+                "homepage_urls": list(evidence.homepage_urls),
+            }
         return DetectionResult(
             matched=matched,
             platform=self.platform_name,
@@ -149,6 +163,7 @@ class BoardBookAdapter(BoardPlatformAdapter):
             metadata={
                 "external_source_id": organization_id,
                 "organization_name": organization_name,
+                **evidence_metadata,
             },
         )
 

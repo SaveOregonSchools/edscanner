@@ -47,6 +47,7 @@ from common import (
     BOARD_SNAPSHOTS_DIR,
     BOARD_WORKERS,
     connect_db,
+    has_brave_search_api_key,
     init_db,
     utc_now_iso,
 )
@@ -249,6 +250,7 @@ def create_board_discovery_run(
     max_districts: int = 1000,
     max_workers: int = BOARD_WORKERS,
     force: bool = False,
+    search_fallback: bool = False,
     debug_logging: bool = True,
     db_path: Path | str | None = None,
 ) -> int:
@@ -269,17 +271,20 @@ def create_board_discovery_run(
     now = utc_now_iso()
     network_defaults = BoardHTTPSettings()
     provider_directory_requested = provider_directory_enabled()
+    search_fallback_requested = bool(
+        search_fallback and has_brave_search_api_key()
+    )
     with connect_db(db_path) as conn:
         cursor = conn.execute(
             """
             INSERT INTO board_discovery_runs (
                 states_json, agency_types_json, min_enrollment, max_enrollment,
                 platform_filter, status_filter, max_districts, max_workers,
-                force, provider_directory_requested, provider_directory_loaded,
-                provider_directory_organizations, network_ipv4_only,
+                force, provider_directory_requested, search_fallback_requested,
+                provider_directory_loaded, provider_directory_organizations, network_ipv4_only,
                 network_https_only, debug_logging, status, districts_matched,
                 districts_planned, queued_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'queued', ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'queued', ?, ?, ?)
             """,
             (
                 _json_values(states),
@@ -292,6 +297,7 @@ def create_board_discovery_run(
                 max_workers,
                 1 if force else 0,
                 1 if provider_directory_requested else 0,
+                1 if search_fallback_requested else 0,
                 1 if network_defaults.ipv4_only else 0,
                 1 if getattr(network_defaults, "https_only", True) else 0,
                 1 if debug_logging else 0,
@@ -373,6 +379,8 @@ def _execute_discovery_item(
     *,
     client: BoardHTTPClient,
     provider_directory: BoardBookDirectoryCatalog | None,
+    search_fallback: bool,
+    identity_catalog: BoardBookDirectoryCatalog | None,
     debug_logger: RunDebugLogger | None,
     db_path: Path | str | None,
 ) -> None:
@@ -394,6 +402,8 @@ def _execute_discovery_item(
             district,
             client=client,
             provider_directory=provider_directory,
+            search_fallback=search_fallback,
+            identity_catalog=identity_catalog,
             allow_browser_fallback=True,
             cancel_requested=lambda: _run_cancelled("board_discovery_runs", run_id, db_path),
             debug_logger=debug_logger,
@@ -515,6 +525,14 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
             if run["provider_directory_requested"] is None
             else bool(run["provider_directory_requested"])
         )
+        # Runs created before this option existed have NULL here. Keep those
+        # legacy runs opted out even if a Brave key is configured later; an
+        # external search must always reflect an explicit choice on this run.
+        search_fallback_requested = (
+            False
+            if run["search_fallback_requested"] is None
+            else bool(run["search_fallback_requested"])
+        )
         network_ipv4_only = (
             True
             if run["network_ipv4_only"] is None
@@ -529,6 +547,7 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
             run[column] is None
             for column in (
                 "provider_directory_requested",
+                "search_fallback_requested",
                 "network_ipv4_only",
                 "network_https_only",
             )
@@ -538,12 +557,14 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                     """
                     UPDATE board_discovery_runs
                     SET provider_directory_requested = COALESCE(provider_directory_requested, ?),
+                        search_fallback_requested = COALESCE(search_fallback_requested, ?),
                         network_ipv4_only = COALESCE(network_ipv4_only, ?),
                         network_https_only = COALESCE(network_https_only, ?)
                     WHERE id = ?
                     """,
                     (
                         1 if provider_directory_requested else 0,
+                        1 if search_fallback_requested else 0,
                         1 if network_ipv4_only else 0,
                         1 if network_https_only else 0,
                         run_id,
@@ -579,6 +600,7 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
             max_workers=int(run["max_workers"]),
             force=bool(run["force"]),
             provider_directory_requested=provider_directory_requested,
+            search_fallback_requested=search_fallback_requested,
             network_ipv4_only=network_ipv4_only,
             network_https_only=network_https_only,
             max_pages_per_district=DISCOVERY_MAX_PAGES,
@@ -596,6 +618,22 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
         client = BoardHTTPClient(
             BoardHTTPSettings(**settings_kwargs)
         )
+        district_rows: list[Mapping[str, Any]] = []
+        identity_catalog: BoardBookDirectoryCatalog | None = None
+        if search_fallback_requested or provider_directory_requested:
+            with connect_db(db_path) as conn:
+                district_rows = [
+                    dict(row)
+                    for row in conn.execute(
+                        """
+                        SELECT id, agency_name, state, website,
+                               website_normalized, raw_json
+                        FROM districts
+                        """
+                    ).fetchall()
+                ]
+            identity_catalog = BoardBookDirectoryCatalog(entries=())
+            identity_catalog.configure_district_universe(district_rows)
         try:
             provider_directory = (
                 BoardBookDirectoryCatalog.fetch(client)
@@ -603,24 +641,17 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                 else None
             )
             if provider_directory is not None:
-                with connect_db(db_path) as conn:
-                    district_universe = conn.execute(
-                        """
-                        SELECT id, agency_name, state, website,
-                               website_normalized, raw_json
-                        FROM districts
-                        """
-                    ).fetchall()
                 provider_directory.configure_district_universe(
-                    [dict(row) for row in district_universe]
+                    district_rows
                 )
+                identity_catalog = provider_directory
                 debug_log(
                     debug_logger,
                     "board_provider_directory_loaded",
                     provider="boardbook",
                     catalog_url=provider_directory.source_url,
                     organizations=len(provider_directory.entries),
-                    district_universe=len(district_universe),
+                    district_universe=len(district_rows),
                 )
                 with connect_db(db_path) as conn:
                     conn.execute(
@@ -646,6 +677,9 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                 catalog_url=BOARD_BOOK_DIRECTORY_URL,
                 error=str(exc),
             )
+        # Both catalogs retain a compact state/city/name index. Release the
+        # imported NCES raw JSON rows before district workers begin.
+        district_rows = []
         with ThreadPoolExecutor(
             max_workers=max(1, int(run["max_workers"])),
             thread_name_prefix="BoardDiscovery",
@@ -658,6 +692,8 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                     dict(item),
                     client=client,
                     provider_directory=provider_directory,
+                    search_fallback=search_fallback_requested,
+                    identity_catalog=identity_catalog,
                     debug_logger=debug_logger,
                     db_path=db_path,
                 )
@@ -706,7 +742,8 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                     SELECT districts_matched, districts_planned, districts_processed,
                            sources_working, sources_not_found, sources_manual_review,
                            sources_failed, website_moves_accepted,
-                           provider_directory_requested, provider_directory_loaded,
+                           provider_directory_requested, search_fallback_requested,
+                           provider_directory_loaded,
                            provider_directory_organizations, network_ipv4_only,
                            network_https_only
                     FROM board_discovery_runs WHERE id = ?
@@ -754,7 +791,8 @@ def execute_board_discovery_run(run_id: int, *, db_path: Path | str | None = Non
                 SELECT districts_matched, districts_planned, districts_processed,
                        sources_working, sources_not_found, sources_manual_review,
                        sources_failed, website_moves_accepted,
-                       provider_directory_requested, provider_directory_loaded,
+                       provider_directory_requested, search_fallback_requested,
+                       provider_directory_loaded,
                        provider_directory_organizations, network_ipv4_only,
                        network_https_only
                 FROM board_discovery_runs WHERE id = ?

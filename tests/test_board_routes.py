@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -320,6 +321,39 @@ class BoardRouteSmokeTests(unittest.TestCase):
         self.assertIn('<option value="0" selected>', body)
         self.assertIn('<option value="1"', body)
         self.assertNotIn('name="force" type="checkbox"', body)
+        self.assertIn("Review / blocked", body)
+
+    def test_discovery_detail_separates_manual_and_blocked_statuses(self):
+        with connect_db(self.db_path) as conn:
+            conn.execute(
+                """
+                UPDATE board_discovery_run_items
+                SET status = 'blocked_by_challenge'
+                WHERE run_id = ?
+                """,
+                (self.discovery_run_id,),
+            )
+            conn.execute(
+                """
+                UPDATE board_discovery_runs
+                SET sources_manual_review = 1
+                WHERE id = ?
+                """,
+                (self.discovery_run_id,),
+            )
+            conn.commit()
+
+        response = self.client.get(
+            f"/school-boards/discovery-runs/{self.discovery_run_id}"
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.get_data(as_text=True)
+        self.assertIn("Challenge / JavaScript", body)
+        self.assertRegex(
+            body,
+            r"Challenge / JavaScript</span><strong>1</strong>",
+        )
+        self.assertRegex(body, r"Manual review</span><strong>0</strong>")
 
     def test_rediscovery_scope_persists_force_and_plans_existing_sources(self):
         with patch("board.web.enqueue_discovery_run") as enqueue:
@@ -425,6 +459,41 @@ class BoardRouteSmokeTests(unittest.TestCase):
                 self.assertEqual(run["platform_filter"], "boardbook")
 
         self.assertEqual(planned_by_force, {"0": 0, "1": 1})
+
+    def test_brave_fallback_is_explicit_and_persisted_per_run(self):
+        with patch("board.web.has_brave_search_api_key", return_value=True):
+            page = self.client.get("/school-boards/discover")
+        html = page.get_data(as_text=True)
+        checkbox = re.search(
+            r'<input[^>]+id="search_fallback"[^>]*>',
+            html,
+        )
+        self.assertIsNotNone(checkbox)
+        self.assertNotIn("checked", checkbox.group(0))
+
+        with (
+            patch("board.web.has_brave_search_api_key", return_value=True),
+            patch("board.runs.has_brave_search_api_key", return_value=True),
+            patch("board.web.enqueue_discovery_run") as enqueue,
+        ):
+            response = self.client.post(
+                "/school-boards/discover",
+                data={
+                    "states": "OR",
+                    "status_filter": "working",
+                    "force": "0",
+                    "max_districts": "10",
+                    "search_fallback": "1",
+                },
+            )
+        self.assertEqual(response.status_code, 302)
+        run_id = enqueue.call_args.args[0]
+        with connect_db(self.db_path) as conn:
+            enabled = conn.execute(
+                "SELECT search_fallback_requested FROM board_discovery_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()[0]
+        self.assertEqual(enabled, 1)
 
     def test_route_validation_and_missing_records_return_clear_http_errors(self):
         self.assertEqual(self.client.get("/school-boards/meetings/999999").status_code, 404)

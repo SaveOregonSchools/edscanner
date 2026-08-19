@@ -24,7 +24,9 @@
     <div class="stat"><span class="stat-label">Processed</span><strong>{{ run.districts_processed|fmt_int }}</strong></div>
     <div class="stat"><span class="stat-label">Working</span><strong>{{ run.sources_working|fmt_int }}</strong></div>
     <div class="stat"><span class="stat-label">Not found</span><strong>{{ run.sources_not_found|fmt_int }}</strong></div>
-    <div class="stat"><span class="stat-label">Manual review</span><strong>{{ run.sources_manual_review|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Manual review</span><strong>{{ status_counts.get('manual_review', 0)|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Challenge / JavaScript</span><strong>{{ (status_counts.get('blocked_by_challenge', 0) + status_counts.get('requires_javascript', 0))|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Blocked by robots</span><strong>{{ status_counts.get('blocked_by_robots', 0)|fmt_int }}</strong></div>
     <div class="stat"><span class="stat-label">Failed</span><strong>{{ run.sources_failed|fmt_int }}</strong></div>
     <div class="stat"><span class="stat-label">Website moves accepted</span><strong>{{ run.website_moves_accepted|fmt_int }}</strong></div>
     <div class="stat"><span class="stat-label">Elapsed</span><strong>{{ elapsed }}</strong></div>
@@ -36,6 +38,7 @@
     <tr><th>Workers</th><td>{{ run.max_workers }}</td></tr>
     <tr><th>Network policy</th><td>{% if run.network_ipv4_only is none or run.network_https_only is none %}Not recorded for this legacy run{% else %}{{ 'IPv4 only' if run.network_ipv4_only else 'IPv4 and IPv6' }}; {{ 'HTTPS only' if run.network_https_only else 'HTTP and HTTPS' }}{% endif %}</td></tr>
     <tr><th>BoardBook directory</th><td>{% if run.provider_directory_requested is none %}Not recorded for this legacy run{% elif run.provider_directory_requested %}Requested; {% if run.provider_directory_loaded %}loaded {{ run.provider_directory_organizations|fmt_int }} organizations{% elif run.status in ['queued', 'running'] %}pending{% else %}not loaded{% endif %}{% else %}Disabled for this run{% endif %}</td></tr>
+    <tr><th>Additional search evidence</th><td>{% if run.search_fallback_requested is none %}Not recorded for this legacy run{% elif run.search_fallback_requested %}Enabled; one Brave Search API query was allowed for each selected district{% else %}Disabled for this run{% endif %}</td></tr>
     <tr><th>Discovery scope</th><td>{{ 'Rediscover district sites, including districts with saved sources' if run.force else 'Districts not yet checked by default (or an explicitly selected saved-source status)' }}</td></tr><tr><th>Started</th><td>{{ run.started_at|fmt_dt }}</td></tr><tr><th>Finished</th><td>{{ run.finished_at|fmt_dt }}</td></tr>
     {% if run.error_message %}<tr><th>Message</th><td>{{ run.error_message }}</td></tr>{% endif %}
   </tbody></table></section>

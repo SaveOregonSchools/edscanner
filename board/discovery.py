@@ -12,7 +12,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-from common import normalize_website, prefer_https_url
+from common import normalize_state, normalize_website, prefer_https_url
 from search_engine import RunDebugLogger, canonical_url, debug_log, same_organization_url
 
 from .adapters import build_adapters, detect_platform
@@ -23,7 +23,14 @@ from .adapters.base import (
     assess_challenge,
 )
 from .http import BoardHTTPClient, RedirectDenied, RobotsDenied
-from .provider_directories import BoardBookDirectoryCatalog, BoardBookDirectoryMatch
+from .provider_directories import (
+    BoardBookDirectoryCatalog,
+    BoardBookDirectoryMatch,
+    district_location_values,
+    normalized_organization_name,
+    organization_name_score,
+)
+from .search_fallback import BRAVE_BOARD_SEARCH_ENDPOINT, search_known_board_sources
 
 
 BOARD_LINK_TERMS = (
@@ -86,9 +93,25 @@ EPHEMERAL_CANDIDATE_SEGMENTS = {
     "events",
     "news",
 }
+ADMIN_CANDIDATE_SEGMENTS = {
+    "a-z",
+    "about-us",
+    "contact",
+    "contacts",
+    "directory",
+    "district-report-cards",
+    "handbook",
+    "handbooks",
+    "public-records",
+    "report-cards",
+    "site-map",
+    "sitemap",
+    "staff",
+}
 TRANSPORT_BROWSER_FALLBACK_LIMIT = 2
 SOURCE_VALIDATION_LIMIT = 5
 DISCOVERY_MAX_PAGES = 8
+SEARCH_FALLBACK_EVIDENCE = "Brave Search API known-provider result"
 
 
 @dataclass(frozen=True)
@@ -338,7 +361,13 @@ def _attempt_browser_render(
 def score_board_link(text: str, url: str) -> tuple[int, list[str]]:
     text_fold = _collapse_ws(text).casefold()
     url_fold = str(url or "").casefold()
-    haystack = f"{text_fold} {url_fold}"
+    # District CMS paths frequently encode labels as ``school-board`` or
+    # ``Agendas--Minutes``. Treat punctuation as word boundaries so those
+    # durable board phrases outrank unrelated pages that merely live below a
+    # broad ``/Board/`` site prefix.
+    haystack = _collapse_ws(
+        re.sub(r"[^a-z0-9]+", " ", unquote(f"{text_fold} {url_fold}"))
+    )
     evidence: list[str] = []
     score = 0
     for term in BOARD_LINK_TERMS:
@@ -359,6 +388,22 @@ def score_board_link(text: str, url: str) -> tuple[int, list[str]]:
     path_segments = {
         segment for segment in urlparse(url).path.casefold().split("/") if segment
     }
+    normalized_path = _collapse_ws(
+        re.sub(r"[^a-z0-9]+", " ", unquote(urlparse(url).path.casefold()))
+    )
+    path_has_specific_board_evidence = any(
+        phrase in normalized_path
+        for phrase in (
+            "school board",
+            "board meeting",
+            "board agenda",
+            "board minutes",
+            "board packet",
+        )
+    )
+    if path_segments & ADMIN_CANDIDATE_SEGMENTS and not path_has_specific_board_evidence:
+        score -= 20
+        evidence.append("administrative/site-map path penalty")
     if path_segments & EPHEMERAL_CANDIDATE_SEGMENTS:
         # A single article/event is usually evidence, not a durable source, but
         # a strongly labeled archive hub under /events or /news can still earn
@@ -372,6 +417,31 @@ def score_board_link(text: str, url: str) -> tuple[int, list[str]]:
         score -= 5
         evidence.append("opaque numeric path penalty")
     return score, evidence
+
+
+def _https_host_variant(url: str) -> str:
+    """Return the narrowly related HTTPS apex/www variant, if one exists."""
+
+    parsed = urlparse(canonical_url(url))
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    if parsed.scheme.casefold() != "https" or "." not in host:
+        return ""
+    if not re.fullmatch(r"[a-z0-9.-]+", host):
+        return ""
+    if all(part.isdigit() for part in host.split(".")):
+        return ""
+    variant_host = host[4:] if host.startswith("www.") else f"www.{host}"
+    if not variant_host or "." not in variant_host:
+        return ""
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return canonical_url(parsed._replace(netloc=f"{variant_host}{port}").geturl())
+
+
+def _redirect_denied_target(error: BaseException) -> str:
+    """Extract the already validated HTTPS target named by RedirectDenied."""
+
+    match = re.search(r"\s->\s(https://\S+)\s*$", str(error), flags=re.IGNORECASE)
+    return canonical_url(match.group(1)) if match else ""
 
 
 def _anchor_scoring_text(anchor: Any) -> str:
@@ -400,6 +470,46 @@ def _pruned_candidate_url(url: str, known_platform: str = "") -> bool:
         segment.startswith(("board-member-", "member-", "members-", "policy-", "policies-"))
         for segment in segments
     )
+
+
+def _document_resolution_base(
+    soup: BeautifulSoup,
+    page_url: str,
+    district_base_url: str,
+) -> str:
+    """Return a safe HTML ``base`` URL for resolving document links.
+
+    Some district CMSs publish root-relative navigation without a leading
+    slash and rely on ``<base href="https://district.example/">``. Ignoring
+    that standard browser behavior turns links such as ``About-Us/index.html``
+    into malformed descendants of the current board page. Honor only the first
+    public, same-organization base and never allow it to downgrade an HTTPS
+    page or redirect relative links to another organization.
+    """
+
+    node = soup.find("base", href=True)
+    raw_href = str(node.get("href") or "").strip() if node is not None else ""
+    if not raw_href:
+        return page_url
+    try:
+        candidate = urljoin(page_url, raw_href)
+        parsed = urlparse(candidate)
+        page_parsed = urlparse(page_url)
+        # Accessing ``port`` also rejects malformed/non-numeric port values.
+        parsed.port
+    except (TypeError, ValueError):
+        return page_url
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return page_url
+    if page_parsed.scheme.casefold() == "https" and parsed.scheme.casefold() != "https":
+        return page_url
+    if parsed.username is not None or parsed.password is not None:
+        return page_url
+    if not same_organization_url(candidate, page_url):
+        return page_url
+    if not same_organization_url(candidate, district_base_url):
+        return page_url
+    return candidate
 
 
 def _decoded_embedded_text(content: bytes | str) -> str:
@@ -445,6 +555,11 @@ def extract_board_candidates(
     adapters: list[Any] | None = None,
 ) -> list[BoardSourceCandidate]:
     soup = BeautifulSoup(content, "lxml")
+    resolution_base = _document_resolution_base(
+        soup,
+        page_url,
+        district_base_url,
+    )
     found: dict[str, BoardSourceCandidate] = {}
 
     def add_candidate(
@@ -456,7 +571,7 @@ def extract_board_candidates(
     ) -> None:
         if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
             return
-        url = canonical_url(urljoin(page_url, href))
+        url = canonical_url(urljoin(resolution_base, href))
         if not board_url_allowed(url, district_base_url):
             return
         score, evidence = score_board_link(scoring_text, url)
@@ -572,6 +687,115 @@ def _source_validation_candidates(
     return [*known, *other][:bounded]
 
 
+def _search_candidate_identity_verified(
+    district: Mapping[str, Any],
+    candidate: BoardSourceCandidate,
+    outcome: DiscoveryOutcome,
+    identity_catalog: BoardBookDirectoryCatalog | None,
+) -> tuple[bool, str]:
+    """Require provider-page identity evidence before search can activate it.
+
+    A search result is useful independent evidence, but a title match alone is
+    not enough to bind a provider tenant to an NCES district. BoardBook pages
+    expose organization and meeting-location evidence, so those can be safely
+    auto-verified. Other known providers remain visible for manual review until
+    their adapters expose equivalent state/organization corroboration.
+    """
+
+    if SEARCH_FALLBACK_EVIDENCE not in candidate.evidence:
+        return True, "district-site evidence"
+    if outcome.platform != "boardbook":
+        return False, (
+            "Search found a known provider, but this adapter does not expose "
+            "enough district identity evidence for automatic activation."
+        )
+
+    detection = outcome.raw.get("detection")
+    metadata = (
+        detection.get("metadata", {})
+        if isinstance(detection, Mapping)
+        else {}
+    )
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    organization_name = str(metadata.get("organization_name") or "").strip()
+    expected_name = str(
+        district.get("agency_name") or district.get("name") or ""
+    ).strip()
+    expected_state = normalize_state(district.get("state"))
+    observed_states = {
+        normalize_state(value)
+        for value in metadata.get("states", [])
+        if normalize_state(value)
+    }
+    name_score = organization_name_score(expected_name, organization_name)
+    if not organization_name or name_score < 0.84:
+        return False, (
+            "The BoardBook organization name did not match the selected "
+            f"district strongly enough (score {name_score:.2f})."
+        )
+    if not expected_state or expected_state not in observed_states:
+        return False, (
+            "The BoardBook page did not expose matching state evidence for "
+            f"{expected_state or 'the selected district'}."
+        )
+
+    expected_tokens = normalized_organization_name(expected_name).split()
+    observed_tokens = set(normalized_organization_name(organization_name).split())
+    expected_identifiers = {
+        token for token in expected_tokens if any(char.isdigit() for char in token)
+    }
+    identifier_match = bool(
+        expected_identifiers and expected_identifiers.issubset(observed_tokens)
+    )
+
+    expected_host = (
+        urlparse(
+            str(
+                district.get("website_normalized")
+                or district.get("website")
+                or ""
+            )
+        ).hostname
+        or ""
+    ).casefold().removeprefix("www.")
+    homepage_match = any(
+        (urlparse(str(url)).hostname or "").casefold().removeprefix("www.")
+        == expected_host
+        for url in metadata.get("homepage_urls", [])
+        if expected_host
+    )
+
+    reciprocal_match = bool(
+        identity_catalog
+        and identity_catalog.reciprocal_identity_match(
+            district,
+            organization_name=organization_name,
+            states=list(observed_states),
+            cities=list(metadata.get("cities", [])),
+            minimum_score=0.84,
+        )
+    )
+
+    if not (identifier_match or homepage_match or reciprocal_match):
+        return False, (
+            "The search result matched name and state, but lacked a unique "
+            "district identifier, matching district homepage, or reciprocal "
+            "NCES city/name match. Manual confirmation is required."
+        )
+    identity_signal = (
+        "district identifier"
+        if identifier_match
+        else "district homepage"
+        if homepage_match
+        else "unique reciprocal NCES city/name match"
+    )
+    return True, (
+        f"BoardBook organization, {expected_state} meeting-location evidence, "
+        f"and {identity_signal} matched the district (name score {name_score:.2f})."
+    )
+
+
 def _provider_directory_diagnostics(
     catalog: BoardBookDirectoryCatalog,
     match: BoardBookDirectoryMatch,
@@ -616,6 +840,8 @@ def discover_board_source(
     *,
     client: BoardHTTPClient | None = None,
     provider_directory: BoardBookDirectoryCatalog | None = None,
+    search_fallback: bool = False,
+    identity_catalog: BoardBookDirectoryCatalog | None = None,
     max_pages: int = DISCOVERY_MAX_PAGES,
     allow_browser_fallback: bool = True,
     cancel_requested: Callable[[], bool] | None = None,
@@ -633,7 +859,7 @@ def discover_board_source(
             error_message="District has no local identifier.",
             raw={"district_id": district_id},
         )
-    if not base_url and provider_directory is None:
+    if not base_url and provider_directory is None and not search_fallback:
         return DiscoveryOutcome(
             status="error",
             platform="unknown",
@@ -647,6 +873,10 @@ def discover_board_source(
     try:
         adapters = build_adapters(client, allow_browser_fallback=allow_browser_fallback)
         provider_directory_raw: dict[str, Any] = {}
+        search_fallback_raw: dict[str, Any] = {
+            "requested": bool(search_fallback),
+            "status": "not_needed" if search_fallback else "disabled",
+        }
         if cancel_requested and cancel_requested():
             return DiscoveryOutcome(
                 status="cancelled",
@@ -728,7 +958,7 @@ def discover_board_source(
                     "errors": [str(exc)],
                 }
 
-        if not base_url:
+        if not base_url and not search_fallback:
             candidates = provider_directory_raw.get("candidates", [])
             first = candidates[0] if candidates else {}
             return DiscoveryOutcome(
@@ -749,20 +979,30 @@ def discover_board_source(
         crawl_base_url = configured_website_url
         configured_website_key = _crawl_url_key(configured_website_url)
         website_migration: dict[str, Any] = {}
-        pending: list[tuple[int, int, str]] = [(-100, 0, configured_website_url)]
-        queued = {configured_website_url}
+        pending: list[tuple[int, int, str]] = (
+            [(-100, 0, configured_website_url)] if configured_website_url else []
+        )
+        queued = {configured_website_url} if configured_website_url else set()
         visited: set[str] = set()
         candidates: dict[str, BoardSourceCandidate] = {}
         candidate_content: dict[tuple[str, str, str, str], bytes] = {}
+        failed_candidate_statuses: dict[tuple[str, str, str, str], int] = {}
         browser_attempted_urls: set[tuple[str, str, str, str]] = set()
         challenges: list[dict[str, Any]] = []
         challenge_recoveries: list[dict[str, Any]] = []
         transport_recoveries: list[dict[str, Any]] = []
+        initial_render_recoveries: list[dict[str, Any]] = []
+        website_recovery_attempts: list[dict[str, Any]] = []
+        provider_wrapper_redirects: list[dict[str, Any]] = []
         fetch_errors: list[dict[str, Any]] = []
         browser_errors: list[dict[str, Any]] = []
         robots_denials: list[dict[str, Any]] = []
         successful_page_fetches = 0
         transport_browser_fallback_count = 0
+        initial_empty_homepage_browser_attempted = False
+        initial_host_variant_url = ""
+        moved_origin_retry_url = ""
+        provider_wrapper_redirect_count = 0
 
         def record_website_migration(
             *,
@@ -770,6 +1010,8 @@ def discover_board_source(
             redirect_chain: list[str] | tuple[str, ...],
             transport: str,
             accepted: bool,
+            evidence: str = "initial_configured_website_https_redirect",
+            browser_navigation_evidence: str = "",
         ) -> bool:
             """Validate and retain one initial configured-site migration."""
 
@@ -794,18 +1036,33 @@ def discover_board_source(
                 canonical_item = canonical_url(item)
                 if callable(validator):
                     canonical_item = canonical_url(validator(canonical_item))
-                chain.append(canonical_item)
+                if not chain or chain[-1] != canonical_item:
+                    chain.append(canonical_item)
             if not chain or chain[-1] != final_canonical:
                 chain.append(final_canonical)
+            if website_migration:
+                existing_final = canonical_url(
+                    website_migration.get("final_url") or ""
+                )
+                # Re-observing the same accepted destination is idempotent;
+                # never let a later transport/browser phase turn A -> B into
+                # a second, unrelated B -> C website migration.
+                return _crawl_url_key(existing_final) == _crawl_url_key(
+                    final_canonical
+                )
             website_migration = {
                 "status": "accepted",
-                "evidence": "initial_configured_website_https_redirect",
+                "evidence": evidence,
                 "original_url": configured_website_url,
                 "redirect_chain": chain,
                 "final_url": final_canonical,
                 "canonical_website_url": final_canonical,
                 "transport": transport,
             }
+            if browser_navigation_evidence:
+                website_migration["browser_navigation_evidence"] = (
+                    browser_navigation_evidence
+                )
             crawl_base_url = final_canonical
             debug_log(
                 debug_logger,
@@ -818,15 +1075,252 @@ def discover_board_source(
                 final_url=final_canonical,
                 canonical_website_url=final_canonical,
                 transport=transport,
+                browser_navigation_evidence=browser_navigation_evidence,
             )
             return True
 
         def migration_diagnostics() -> dict[str, Any]:
-            return (
-                {"website_migration": dict(website_migration)}
-                if website_migration
-                else {}
+            diagnostics: dict[str, Any] = {}
+            if website_migration:
+                diagnostics["website_migration"] = dict(website_migration)
+            if initial_render_recoveries:
+                diagnostics["initial_render_recoveries"] = list(
+                    initial_render_recoveries
+                )
+            if website_recovery_attempts:
+                diagnostics["website_recovery_attempts"] = list(
+                    website_recovery_attempts
+                )
+            if provider_wrapper_redirects:
+                diagnostics["provider_wrapper_redirects"] = list(
+                    provider_wrapper_redirects
+                )
+            diagnostics["search_fallback"] = dict(search_fallback_raw)
+            return diagnostics
+
+        def schedule_initial_host_variant(reason: str) -> bool:
+            """Queue one public apex/www sibling for the configured homepage."""
+
+            nonlocal initial_host_variant_url
+            if initial_host_variant_url:
+                return False
+            variant = _https_host_variant(configured_website_url)
+            if not variant or _crawl_url_key(variant) == configured_website_key:
+                return False
+            connection_validator = getattr(
+                client, "validated_connection_target", None
             )
+            if not callable(connection_validator):
+                return False
+            try:
+                variant, _addresses = connection_validator(variant)
+                variant = canonical_url(variant)
+            except Exception as exc:
+                website_recovery_attempts.append(
+                    {
+                        "kind": "initial_host_variant",
+                        "url": variant,
+                        "status": "unavailable",
+                        "reason": reason,
+                        "error": str(exc),
+                    }
+                )
+                return False
+            if variant in queued or any(
+                _crawl_url_key(variant) == _crawl_url_key(item) for item in visited
+            ):
+                return False
+            initial_host_variant_url = variant
+            queued.add(variant)
+            heapq.heappush(pending, (-99, 0, variant))
+            website_recovery_attempts.append(
+                {
+                    "kind": "initial_host_variant",
+                    "url": variant,
+                    "status": "queued",
+                    "reason": reason,
+                }
+            )
+            debug_log(
+                debug_logger,
+                "board_initial_host_variant_queued",
+                district=district.get("agency_name"),
+                original_url=configured_website_url,
+                url=variant,
+                reason=reason,
+            )
+            return True
+
+        def recover_known_provider_wrapper(
+            wrapper_url: str,
+            error: RedirectDenied,
+        ) -> bool:
+            """Convert one denied wrapper hop into a validated provider candidate."""
+
+            nonlocal provider_wrapper_redirect_count
+            if provider_wrapper_redirect_count >= 1:
+                return False
+            target = _redirect_denied_target(error)
+            if not target or not is_known_board_host(target):
+                return False
+            validator = getattr(client, "validate_target_url", None)
+            if not callable(validator):
+                return False
+            try:
+                target = canonical_url(validator(target))
+            except Exception:
+                return False
+            detection = detect_platform(target, adapters=adapters)
+            platform = (
+                _platform_name(getattr(detection, "platform", ""))
+                if getattr(detection, "matched", False)
+                else ""
+            )
+            if platform in {"", "generic", "unknown"}:
+                return False
+            score, evidence = score_board_link("board meetings", target)
+            candidates[target] = BoardSourceCandidate(
+                url=target,
+                text="Board meeting provider redirect",
+                discovered_from_url=wrapper_url,
+                score=max(75, score),
+                known_platform=platform,
+                evidence=[*evidence, "validated provider wrapper redirect"],
+            )
+            provider_wrapper_redirect_count += 1
+            provider_wrapper_redirects.append(
+                {
+                    "wrapper_url": wrapper_url,
+                    "target_url": target,
+                    "platform": platform,
+                    "status": "accepted_for_validation",
+                }
+            )
+            debug_log(
+                debug_logger,
+                "board_provider_wrapper_redirect_accepted",
+                district=district.get("agency_name"),
+                wrapper_url=wrapper_url,
+                target_url=target,
+                platform=platform,
+            )
+            return True
+
+        def schedule_moved_origin_after_404(
+            failed_url: str,
+            *,
+            trigger: str,
+        ) -> bool:
+            """Queue one moved-host origin after an accepted stale path returns 404."""
+
+            nonlocal moved_origin_retry_url
+            if not website_migration or moved_origin_retry_url:
+                return False
+            parsed_failed = urlparse(canonical_url(failed_url))
+            moved_origin = canonical_url(
+                parsed_failed._replace(
+                    path="/", params="", query="", fragment=""
+                ).geturl()
+            )
+            if _crawl_url_key(moved_origin) == _crawl_url_key(failed_url):
+                return False
+            validator = getattr(client, "validate_target_url", None)
+            if not callable(validator):
+                return False
+            try:
+                moved_origin = canonical_url(validator(moved_origin))
+            except Exception as exc:
+                website_recovery_attempts.append(
+                    {
+                        "kind": "moved_origin_after_404",
+                        "url": moved_origin,
+                        "status": "unavailable",
+                        "trigger": trigger,
+                        "error": str(exc),
+                    }
+                )
+                return False
+            if moved_origin in queued or any(
+                _crawl_url_key(moved_origin) == _crawl_url_key(item)
+                for item in visited
+            ):
+                return False
+            moved_origin_retry_url = moved_origin
+            queued.add(moved_origin)
+            heapq.heappush(pending, (-98, 0, moved_origin))
+            website_recovery_attempts.append(
+                {
+                    "kind": "moved_origin_after_404",
+                    "url": moved_origin,
+                    "status": "queued",
+                    "trigger": trigger,
+                    "failed_url": canonical_url(failed_url),
+                }
+            )
+            debug_log(
+                debug_logger,
+                "board_moved_origin_retry_queued",
+                district=district.get("agency_name"),
+                failed_url=canonical_url(failed_url),
+                url=moved_origin,
+                trigger=trigger,
+            )
+            return True
+
+        def retain_rejected_browser_404_move(
+            recovery: _BrowserRenderAttempt,
+            *,
+            trigger: str,
+            accepted: bool,
+        ) -> bool:
+            """Retain an accepted browser move even when its stale path is 404."""
+
+            page = recovery.page
+            if (
+                page is None
+                or page.status_code != 404
+                or not page.website_migration_accepted
+                or not accepted
+            ):
+                return False
+            evidence = {
+                "transport": (
+                    "initial_configured_website_browser_transport_recovery"
+                ),
+                "challenge": (
+                    "initial_configured_website_browser_challenge_recovery"
+                ),
+                "empty_homepage": (
+                    "initial_configured_website_browser_empty_homepage_render"
+                ),
+            }.get(trigger)
+            if evidence is None:
+                return False
+            if not record_website_migration(
+                final_url=page.final_url,
+                redirect_chain=page.redirect_chain,
+                transport="browser",
+                accepted=True,
+                evidence=evidence,
+                browser_navigation_evidence=str(
+                    getattr(page, "website_migration_evidence", "") or ""
+                ),
+            ):
+                return False
+            failed_url = canonical_url(page.final_url)
+            failed_candidate_statuses[_crawl_url_key(failed_url)] = 404
+            record_fetch_error(
+                failed_url,
+                status_code=404,
+                kind="http_status",
+                browser_rejected=True,
+                trigger=trigger,
+            )
+            schedule_moved_origin_after_404(
+                failed_url,
+                trigger=f"browser_{trigger}",
+            )
+            return True
 
         def record_fetch_error(error_url: str, **details: Any) -> dict[str, Any]:
             record = {"url": error_url, **details}
@@ -885,16 +1379,28 @@ def discover_board_source(
             if url in visited:
                 continue
             visited.add(url)
-            is_initial_district_navigation = bool(
+            is_configured_homepage_navigation = bool(
                 depth == 0 and _crawl_url_key(url) == configured_website_key
             )
+            is_initial_host_variant_navigation = bool(
+                initial_host_variant_url
+                and depth == 0
+                and _crawl_url_key(url) == _crawl_url_key(initial_host_variant_url)
+            )
+            is_initial_district_navigation = bool(
+                is_configured_homepage_navigation
+                or is_initial_host_variant_navigation
+            )
+            page_was_browser_rendered = False
             debug_log(debug_logger, "board_source_candidate", district=district.get("agency_name"), url=url, depth=depth)
             try:
                 response = client.get(
                     url,
                     check_robots=True,
                     raise_for_status=False,
-                    allow_district_website_move=is_initial_district_navigation,
+                    allow_district_website_move=bool(
+                        is_initial_district_navigation and not website_migration
+                    ),
                 )
                 response_content = response.content
                 effective_status_code = response.status_code
@@ -902,11 +1408,19 @@ def discover_board_source(
                 if is_initial_district_navigation and bool(
                     getattr(response, "website_migration_accepted", False)
                 ):
+                    redirect_chain = list(getattr(response, "redirect_chain", ()))
+                    if is_initial_host_variant_navigation:
+                        redirect_chain.insert(0, url)
                     record_website_migration(
                         final_url=effective_final_url,
-                        redirect_chain=getattr(response, "redirect_chain", ()),
+                        redirect_chain=redirect_chain,
                         transport="http",
                         accepted=True,
+                        evidence=(
+                            "initial_configured_website_host_variant"
+                            if is_initial_host_variant_navigation
+                            else "initial_configured_website_https_redirect"
+                        ),
                     )
             except RobotsDenied as exc:
                 robots_denials.append({"url": url, "error": str(exc)})
@@ -931,6 +1445,15 @@ def discover_board_source(
                     kind=("redirect" if isinstance(exc, RedirectDenied) else "transport"),
                     browser_fallback_attempted=False,
                 )
+                if isinstance(exc, RedirectDenied) and not is_initial_district_navigation:
+                    if recover_known_provider_wrapper(url, exc):
+                        fetch_error["provider_wrapper_recovered"] = True
+                        continue
+                host_variant_queued = bool(
+                    is_configured_homepage_navigation
+                    and not isinstance(exc, RedirectDenied)
+                    and schedule_initial_host_variant(type(exc).__name__)
+                )
                 exception_status = getattr(
                     getattr(exc, "response", None), "status_code", None
                 )
@@ -940,6 +1463,7 @@ def discover_board_source(
                     browser_attempted_urls,
                     enabled=(
                         allow_browser_fallback
+                        and not host_variant_queued
                         and exception_status != 429
                         and transport_browser_fallback_count
                         < TRANSPORT_BROWSER_FALLBACK_LIMIT
@@ -952,7 +1476,9 @@ def discover_board_source(
                         "Transport recovery browser remained challenged"
                     ),
                     http_error_prefix="Transport recovery browser returned HTTP",
-                    allow_district_website_move=is_initial_district_navigation,
+                    allow_district_website_move=bool(
+                        is_initial_district_navigation and not website_migration
+                    ),
                 )
                 if recovery.attempted:
                     transport_browser_fallback_count += 1
@@ -986,6 +1512,13 @@ def discover_board_source(
                             browser_fallback_error=recovery.error,
                         )
                     )
+                retain_rejected_browser_404_move(
+                    recovery,
+                    trigger="transport",
+                    accepted=bool(
+                        is_initial_district_navigation and not website_migration
+                    ),
+                )
                 if not recovery.recovered:
                     continue
 
@@ -994,7 +1527,20 @@ def discover_board_source(
                     final_url=recovery.page.final_url,
                     redirect_chain=recovery.page.redirect_chain,
                     transport="browser",
-                    accepted=is_initial_district_navigation,
+                    accepted=bool(
+                        is_initial_district_navigation and not website_migration
+                    ),
+                    evidence=(
+                        "initial_configured_website_browser_transport_recovery"
+                    ),
+                    browser_navigation_evidence=str(
+                        getattr(
+                            recovery.page,
+                            "website_migration_evidence",
+                            "",
+                        )
+                        or ""
+                    ),
                 ):
                     record_browser_error(
                         url,
@@ -1007,6 +1553,7 @@ def discover_board_source(
                 response_content = recovery.page.content
                 effective_status_code = recovery.page.status_code
                 effective_final_url = recovery.page.final_url
+                page_was_browser_rendered = True
                 browser_attempted_urls.add(_crawl_url_key(recovery.page.final_url))
                 transport_recovery = {
                     "url": url,
@@ -1039,6 +1586,8 @@ def discover_board_source(
                     error_type=type(exc).__name__,
                     kind="fetch",
                 )
+                if is_configured_homepage_navigation:
+                    schedule_initial_host_variant(type(exc).__name__)
                 continue
             challenge_status_code = effective_status_code
             challenge_url = effective_final_url
@@ -1065,13 +1614,22 @@ def discover_board_source(
                         allow_browser_fallback and challenge.browser_retry_allowed
                     ),
                     challenge_error_prefix="Rendered page remained challenged",
-                    allow_district_website_move=is_initial_district_navigation,
+                    allow_district_website_move=bool(
+                        is_initial_district_navigation and not website_migration
+                    ),
                 )
                 browser_attempted = recovery.attempted
                 browser_error = recovery.error
                 browser_robots_denied = recovery.robots_denied
                 recovered_content = (
                     recovery.page.content if recovery.recovered else None
+                )
+                retain_rejected_browser_404_move(
+                    recovery,
+                    trigger="challenge",
+                    accepted=bool(
+                        is_initial_district_navigation and not website_migration
+                    ),
                 )
                 if browser_robots_denied:
                     robots_denials.append({"url": url, "error": browser_error})
@@ -1083,7 +1641,21 @@ def discover_board_source(
                             final_url=recovery.page.final_url,
                             redirect_chain=recovery.page.redirect_chain,
                             transport="browser",
-                            accepted=is_initial_district_navigation,
+                            accepted=bool(
+                                is_initial_district_navigation
+                                and not website_migration
+                            ),
+                            evidence=(
+                                "initial_configured_website_browser_challenge_recovery"
+                            ),
+                            browser_navigation_evidence=str(
+                                getattr(
+                                    recovery.page,
+                                    "website_migration_evidence",
+                                    "",
+                                )
+                                or ""
+                            ),
                         )
                     ):
                         record_browser_error(
@@ -1134,6 +1706,7 @@ def discover_board_source(
                 record["recovered"] = True
                 challenge_recoveries.append(record)
                 response_content = recovered_content
+                page_was_browser_rendered = True
                 debug_log(
                     debug_logger,
                     "challenge_recovered_with_browser",
@@ -1143,17 +1716,222 @@ def discover_board_source(
                     rendered_status_code=effective_status_code,
                 )
             if effective_status_code >= 400:
+                failed_url = canonical_url(effective_final_url or url)
+                failed_candidate_statuses[_crawl_url_key(url)] = int(
+                    effective_status_code
+                )
+                failed_candidate_statuses[_crawl_url_key(failed_url)] = int(
+                    effective_status_code
+                )
                 record_fetch_error(
                     url,
                     status_code=effective_status_code,
                     kind="http_status",
+                    **(
+                        {"final_url": failed_url}
+                        if _crawl_url_key(failed_url) != _crawl_url_key(url)
+                        else {}
+                    ),
                 )
+                if is_initial_host_variant_navigation:
+                    website_recovery_attempts.append(
+                        {
+                            "kind": "initial_host_variant",
+                            "url": url,
+                            "status": "failed",
+                            "status_code": effective_status_code,
+                        }
+                    )
+                if (
+                    effective_status_code == 404
+                    and is_configured_homepage_navigation
+                    and not website_migration
+                ):
+                    schedule_initial_host_variant("HTTP 404")
+                if (
+                    effective_status_code == 404
+                    and website_migration
+                    and not moved_origin_retry_url
+                    and is_initial_district_navigation
+                ):
+                    schedule_moved_origin_after_404(
+                        failed_url,
+                        trigger="http_redirect",
+                    )
                 continue
 
-            successful_page_fetches += 1
             final_url = canonical_url(effective_final_url)
-            candidate_content[_crawl_url_key(final_url)] = response_content
+            if is_initial_host_variant_navigation and not website_migration:
+                record_website_migration(
+                    final_url=final_url,
+                    redirect_chain=[url, final_url],
+                    transport="http",
+                    accepted=True,
+                    evidence="initial_configured_website_host_variant",
+                )
+            if is_initial_host_variant_navigation:
+                website_recovery_attempts.append(
+                    {
+                        "kind": "initial_host_variant",
+                        "url": url,
+                        "final_url": final_url,
+                        "status": "recovered",
+                    }
+                )
+            if (
+                moved_origin_retry_url
+                and _crawl_url_key(url) == _crawl_url_key(moved_origin_retry_url)
+            ):
+                crawl_base_url = final_url
+                if website_migration:
+                    stale_path_url = str(website_migration.get("final_url") or "")
+                    if stale_path_url and stale_path_url != final_url:
+                        website_migration["stale_path_url"] = stale_path_url
+                    website_migration["final_url"] = final_url
+                    website_migration["canonical_website_url"] = final_url
+                    website_migration["moved_origin_recovery"] = True
+                    chain = list(website_migration.get("redirect_chain") or [])
+                    if not chain or chain[-1] != final_url:
+                        chain.append(final_url)
+                    website_migration["redirect_chain"] = chain
+                website_recovery_attempts.append(
+                    {
+                        "kind": "moved_origin_after_404",
+                        "url": url,
+                        "final_url": final_url,
+                        "status": "recovered",
+                    }
+                )
+
             detection = detect_platform(final_url, response_content, adapters=adapters)
+            page_candidates = extract_board_candidates(
+                response_content,
+                final_url,
+                crawl_base_url,
+                adapters=adapters,
+            )
+            non_generic_detection = bool(
+                getattr(detection, "matched", False)
+                and _platform_name(getattr(detection, "platform", ""))
+                not in {"", "generic", "unknown"}
+            )
+            if (
+                is_initial_district_navigation
+                and not page_was_browser_rendered
+                and not initial_empty_homepage_browser_attempted
+                and not page_candidates
+                and not non_generic_detection
+                and allow_browser_fallback
+            ):
+                initial_empty_homepage_browser_attempted = True
+                render_target = final_url
+                recovery = _attempt_browser_render(
+                    render_target,
+                    adapters,
+                    browser_attempted_urls,
+                    enabled=True,
+                    challenge_error_prefix=(
+                        "Initial empty-homepage browser remained challenged"
+                    ),
+                    http_error_prefix=(
+                        "Initial empty-homepage browser returned HTTP"
+                    ),
+                    allow_district_website_move=bool(
+                        is_configured_homepage_navigation and not website_migration
+                    ),
+                )
+                recovery_record: dict[str, Any] = {
+                    "url": render_target,
+                    "attempted": recovery.attempted,
+                    "status": "recovered" if recovery.recovered else "failed",
+                }
+                retain_rejected_browser_404_move(
+                    recovery,
+                    trigger="empty_homepage",
+                    accepted=bool(
+                        is_initial_district_navigation and not website_migration
+                    ),
+                )
+                if recovery.error:
+                    recovery_record["error"] = recovery.error
+                    recovery_record["error_type"] = recovery.error_type
+                    record_browser_error(
+                        render_target,
+                        recovery.error,
+                        trigger="empty_homepage",
+                        error_type=recovery.error_type,
+                    )
+                if recovery.robots_denied:
+                    robots_denials.append(
+                        {"url": render_target, "error": recovery.error}
+                    )
+                if recovery.challenge and recovery.challenge.is_challenge:
+                    assert recovery.page is not None
+                    challenges.append(
+                        _challenge_record(
+                            recovery.challenge,
+                            url=recovery.page.final_url,
+                            status_code=recovery.page.status_code,
+                            browser_fallback_attempted=True,
+                            browser_fallback_error=recovery.error,
+                        )
+                    )
+                if recovery.recovered:
+                    assert recovery.page is not None
+                    if recovery.page.website_migration_accepted:
+                        record_website_migration(
+                            final_url=recovery.page.final_url,
+                            redirect_chain=recovery.page.redirect_chain,
+                            transport="browser",
+                            accepted=bool(
+                                is_configured_homepage_navigation
+                                and not website_migration
+                            ),
+                            evidence=(
+                                "initial_configured_website_browser_empty_homepage_render"
+                            ),
+                            browser_navigation_evidence=str(
+                                getattr(
+                                    recovery.page,
+                                    "website_migration_evidence",
+                                    "",
+                                )
+                                or ""
+                            ),
+                        )
+                    response_content = recovery.page.content
+                    effective_status_code = recovery.page.status_code
+                    final_url = canonical_url(recovery.page.final_url)
+                    page_was_browser_rendered = True
+                    browser_attempted_urls.add(_crawl_url_key(final_url))
+                    detection = detect_platform(
+                        final_url, response_content, adapters=adapters
+                    )
+                    page_candidates = extract_board_candidates(
+                        response_content,
+                        final_url,
+                        crawl_base_url,
+                        adapters=adapters,
+                    )
+                    recovery_record.update(
+                        {
+                            "final_url": final_url,
+                            "status_code": effective_status_code,
+                            "candidate_count": len(page_candidates),
+                        }
+                    )
+                    debug_log(
+                        debug_logger,
+                        "board_empty_homepage_recovered_with_browser",
+                        district=district.get("agency_name"),
+                        url=render_target,
+                        final_url=final_url,
+                        candidate_count=len(page_candidates),
+                    )
+                initial_render_recoveries.append(recovery_record)
+
+            successful_page_fetches += 1
+            candidate_content[_crawl_url_key(final_url)] = response_content
             if getattr(detection, "matched", False) and _platform_name(getattr(detection, "platform", "")) != "generic":
                 score, evidence = score_board_link("", final_url)
                 candidates[final_url] = BoardSourceCandidate(
@@ -1168,12 +1946,7 @@ def discover_board_source(
                     evidence=[*evidence, *list(getattr(detection, "evidence", []) or [])],
                 )
 
-            for candidate in extract_board_candidates(
-                response_content,
-                final_url,
-                crawl_base_url,
-                adapters=adapters,
-            ):
+            for candidate in page_candidates:
                 existing = candidates.get(candidate.url)
                 if existing is None or candidate.score > existing.score:
                     candidates[candidate.url] = candidate
@@ -1190,7 +1963,69 @@ def discover_board_source(
                     queued.add(candidate.url)
                     heapq.heappush(pending, (-candidate.score, depth + 1, candidate.url))
 
-        ordered = sorted(candidates.values(), key=lambda item: (-item.score, item.url))
+        search_fallback_needed = bool(search_fallback)
+        if search_fallback_needed and not (
+            cancel_requested and cancel_requested()
+        ):
+            search_results, search_fallback_raw = search_known_board_sources(
+                district,
+                client,
+                adapters,
+            )
+            for result in search_results:
+                candidate_url = canonical_url(result.canonical_source_url)
+                score = max(80, 101 - int(result.rank))
+                candidate = BoardSourceCandidate(
+                    url=candidate_url,
+                    text=_collapse_ws(f"{result.title} {result.snippet}")[:2000],
+                    discovered_from_url=BRAVE_BOARD_SEARCH_ENDPOINT,
+                    score=score,
+                    known_platform=_platform_name(result.platform),
+                    evidence=[
+                        SEARCH_FALLBACK_EVIDENCE,
+                        f"Brave result rank {result.rank}",
+                        (
+                            "district-name token overlap "
+                            f"{result.identity_overlap:.2f}"
+                        ),
+                    ],
+                )
+                existing = candidates.get(candidate_url)
+                if existing is None or candidate.score > existing.score:
+                    candidates[candidate_url] = candidate
+            debug_log(
+                debug_logger,
+                "board_search_fallback_finished",
+                district=district.get("agency_name"),
+                status=search_fallback_raw.get("status"),
+                results_returned=search_fallback_raw.get("results_returned", 0),
+                known_provider_candidates=search_fallback_raw.get(
+                    "known_provider_candidates", 0
+                ),
+                error=search_fallback_raw.get("error"),
+            )
+
+        ordered_all = sorted(
+            candidates.values(),
+            key=lambda item: (
+                -item.score,
+                0 if _crawl_url_key(item.url) in candidate_content else 1,
+                item.url,
+            ),
+        )
+        skipped_http_candidates = [
+            {
+                "url": item.url,
+                "status_code": failed_candidate_statuses[_crawl_url_key(item.url)],
+            }
+            for item in ordered_all
+            if _crawl_url_key(item.url) in failed_candidate_statuses
+        ]
+        ordered = [
+            item
+            for item in ordered_all
+            if _crawl_url_key(item.url) not in failed_candidate_statuses
+        ]
         validation_candidates = _source_validation_candidates(ordered)
         candidate_validations: list[dict[str, Any]] = []
         review_outcomes: list[tuple[BoardSourceCandidate, DiscoveryOutcome]] = []
@@ -1200,7 +2035,9 @@ def discover_board_source(
             outcome.raw.update(
                 {
                     "visited_urls": sorted(visited),
-                    "candidate_count": len(ordered),
+                    "candidate_count": len(ordered_all),
+                    "actionable_candidate_count": len(ordered),
+                    "skipped_http_candidates": skipped_http_candidates,
                     "candidate_validation_limit": SOURCE_VALIDATION_LIMIT,
                     "candidate_validation_count": len(candidate_validations),
                     "candidate_validations": candidate_validations,
@@ -1280,6 +2117,23 @@ def discover_board_source(
                     html=candidate_content.get(candidate_key),
                 )
                 outcome = _outcome_from_adapter_result(result, candidate)
+                if outcome.status == "working":
+                    identity_verified, identity_reason = (
+                        _search_candidate_identity_verified(
+                            district,
+                            candidate,
+                            outcome,
+                            identity_catalog,
+                        )
+                    )
+                    if SEARCH_FALLBACK_EVIDENCE in candidate.evidence:
+                        outcome.raw["search_identity_verification"] = {
+                            "verified": identity_verified,
+                            "reason": identity_reason,
+                        }
+                    if not identity_verified:
+                        outcome.status = "manual_review"
+                        outcome.error_message = identity_reason
                 validation_record.update(
                     {
                         "status": outcome.status,
@@ -1397,7 +2251,9 @@ def discover_board_source(
             return selected_outcome
 
         validation_diagnostics = {
-            "candidate_count": len(ordered),
+            "candidate_count": len(ordered_all),
+            "actionable_candidate_count": len(ordered),
+            "skipped_http_candidates": skipped_http_candidates,
             "candidate_validation_limit": SOURCE_VALIDATION_LIMIT,
             "candidate_validation_count": len(candidate_validations),
             "candidate_validations": candidate_validations,

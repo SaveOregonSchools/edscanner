@@ -287,7 +287,8 @@ workflow for public school-board records:
    the choice between unchecked districts and rediscovering districts with
    saved sources explicit. Rediscovery starts again from the district website;
    it does not directly health-check the previously saved source URL. A likely
-   challenge can receive one bounded Chromium render;
+   challenge can receive one bounded system-Chrome render, with Playwright's
+   regular bundled Chromium as the availability fallback;
    connection or certificate-chain failures can use a separately bounded browser
    recovery. Rate limits, robots denials, and a remaining CAPTCHA stop without
    browser rotation or challenge bypass. A district is reported as `not_found`
@@ -614,9 +615,15 @@ an unusable IPv6 route cannot mask the IPv4 result; IPv6 can be explicitly
 re-enabled for an environment that has verified connectivity. Each ordinary
 connection is pinned to its validated DNS answer while retaining the public
 hostname for HTTP Host, TLS SNI, and certificate verification.
-Playwright fallback uses a loopback SOCKS proxy that
-applies the same address validation/pinning to every browser tunnel; unnecessary
-WebSockets and non-HTTP network schemes are blocked. `EDSCANNER_BOARD_ALLOW_PRIVATE_NETWORKS=true`
+Playwright fallback prefers an installed system Chrome build and otherwise uses
+the regular bundled Chromium executable through a
+loopback SOCKS proxy that applies the same address validation/pinning to every
+browser tunnel; unnecessary WebSockets and non-HTTP network schemes are
+blocked. Its desktop user agent is derived from the installed Chromium major
+version, while Playwright remains detectable automation: EdScanner does not use
+stealth patches, rotate identities, solve CAPTCHAs, or promise to defeat WAFs.
+One render can recover an initial JavaScript shell, and a committed useful page
+can survive a bounded DOM-load timeout. `EDSCANNER_BOARD_ALLOW_PRIVATE_NETWORKS=true`
 is intended only for deterministic local-server tests. Insecure TLS fallback
 also requires both an explicit opt-in and a comma-separated exact/domain-suffix
 host allowlist in `EDSCANNER_BOARD_INSECURE_SSL_HOSTS`; affected responses are
@@ -627,7 +634,36 @@ Board discovery debug logs include the complete submitted run configuration,
 provider-directory load state, candidate validation start/result timing, one
 terminal outcome per district, accepted website-move evidence, and final run
 counters. A mixed run is marked `completed_with_errors`; `completed` now means
-that no district work item failed.
+that no district work item failed. The stored summary's `Review / blocked`
+count groups manual, JavaScript, challenge, and robots outcomes for compact run
+lists; the run-detail cards split those categories apart.
+
+Discovery normalizes punctuation in board/agenda/minutes paths, deprioritizes
+administrative and one-off pages, reserves validation slots for known vendors,
+and does not retry candidates already observed returning an HTTP error. Generic
+sources require repeated dated meeting/document evidence. Supported evidence
+includes repeated schedule rows and links on a narrow set of public document
+hosts; one-off news or calendar occurrences stay in manual review. An initial
+static HTML shell with no usable links gets one bounded browser render.
+
+When a Brave Search API key is configured, the Discover Sources form offers an
+explicit, default-off **Use Brave Search as additional source evidence** option.
+It makes at most one official API query for each selected district alongside
+the normal crawl, so the maximum possible API usage is visible before the run.
+Results are leads rather than trust: EdScanner still requires a
+canonical provider URL, adapter validation, matching state/name evidence, and a
+district identifier, homepage match, or unique reciprocal NCES city/name match.
+Ambiguous results remain in manual review.
+
+Website recovery remains intentionally narrow and auditable. A configured
+homepage can accept one validated public HTTPS move, including the browser's
+observed top-level destination during its bounded initial load. The ledger
+records whether that browser move had source attribution. A broken apex can
+try its public `www` sibling once; and a
+moved URL returning 404 can try the new HTTPS origin once. A district-hosted
+wrapper that redirects to a canonical known board provider contributes a
+candidate for full adapter validation. None of these paths relax private-IP,
+TLS, robots, HTTPS-downgrade, provider-identity, or later redirect checks.
 
 Use `EDSCANNER_DISABLE_WORKER=1` only for tests or diagnostics when the
 background worker should not start automatically.
@@ -692,9 +728,10 @@ project's trademark and branding notice.
 - Scanned image-only agreements are flagged by their missing extracted text;
   OCR is not yet built in.
 - Scanned image-only board documents are retained but are not OCR'd.
-- Legacy BoardDocs and some Simbli sites may require Playwright or manual review
-  because their public pages are JavaScript-driven or protected by bot
-  challenges. Challenges and authenticated portals are never bypassed.
+- Legacy BoardDocs, some Simbli sites, and WAF-protected district sites may
+  require Playwright or manual review. A real browser render can handle ordinary
+  JavaScript and some interstitials, but challenges, CAPTCHAs, and authenticated
+  portals are never bypassed.
 - `robots.txt` is enforced when `EDSCANNER_RESPECT_ROBOTS=true`; the default is
   disabled consistently across existing and board collectors.
 - The crawler is intentionally conservative and uses per-run district and page

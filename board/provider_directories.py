@@ -115,6 +115,12 @@ def _name_score(left: Any, right: Any) -> float:
     return round(min(1.0, score * number_penalty), 6)
 
 
+def organization_name_score(left: Any, right: Any) -> float:
+    """Public wrapper for the provider/district identity score."""
+
+    return _name_score(left, right)
+
+
 def _clean_location_value(value: Any) -> str:
     text = collapse_ws(value)
     return "" if text.casefold() in _MISSING_VALUES else text
@@ -346,15 +352,57 @@ class BoardBookDirectoryCatalog:
         in the full local NCES dataset, not merely one district in the run.
         """
 
-        self._district_universe = tuple(dict(district) for district in districts)
         by_state_city: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
-        for district in self._district_universe:
+        for district in districts:
             state, cities = district_location_values(district)
+            compact = {
+                "id": district.get("id"),
+                "agency_name": district.get("agency_name"),
+                "name": district.get("name"),
+            }
             for city in cities:
-                by_state_city.setdefault((state, city), []).append(district)
+                by_state_city.setdefault((state, city), []).append(compact)
         self._district_by_state_city = {
             key: tuple(rows) for key, rows in by_state_city.items()
         }
+
+    def reciprocal_identity_match(
+        self,
+        district: Mapping[str, Any],
+        *,
+        organization_name: str,
+        states: Sequence[str],
+        cities: Sequence[str],
+        minimum_score: float = 0.84,
+    ) -> bool:
+        """Return whether provider evidence maps uniquely back to a district.
+
+        The configured index stores only compact district IDs/names grouped by
+        normalized state/city, so a search fallback does not repeatedly parse
+        every district's raw NCES JSON or retain that raw payload per worker.
+        """
+
+        entry = BoardBookDirectoryEntry(
+            external_id="identity-check",
+            organization_name=organization_name,
+            public_url="https://meetings.boardbook.org/Public/Organization/identity-check",
+        )
+        evidence = BoardBookOrganizationEvidence(
+            entry=entry,
+            organization_name=organization_name,
+            states=frozenset(normalize_state(value) for value in states if normalize_state(value)),
+            cities=frozenset(
+                " ".join(_ascii_words(value))
+                for value in cities
+                if " ".join(_ascii_words(value))
+            ),
+            meeting_count=0,
+        )
+        return self._reciprocal_district_match(
+            district,
+            evidence,
+            minimum_score=minimum_score,
+        )
 
     @staticmethod
     def _district_key(district: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -628,6 +676,7 @@ __all__ = [
     "district_location_values",
     "load_enabled_boardbook_directory",
     "normalized_organization_name",
+    "organization_name_score",
     "parse_boardbook_directory",
     "parse_boardbook_organization_evidence",
     "provider_directory_enabled",

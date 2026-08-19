@@ -681,6 +681,7 @@ def init_db(db_path: Path | str | None = None) -> None:
                 max_workers INTEGER NOT NULL,
                 force INTEGER NOT NULL DEFAULT 0,
                 provider_directory_requested INTEGER,
+                search_fallback_requested INTEGER,
                 provider_directory_loaded INTEGER,
                 provider_directory_organizations INTEGER,
                 network_ipv4_only INTEGER,
@@ -1105,6 +1106,7 @@ def init_db(db_path: Path | str | None = None) -> None:
         }
         board_discovery_run_migrations = {
             "provider_directory_requested": "INTEGER",
+            "search_fallback_requested": "INTEGER",
             "provider_directory_loaded": "INTEGER",
             "provider_directory_organizations": "INTEGER",
             "network_ipv4_only": "INTEGER",

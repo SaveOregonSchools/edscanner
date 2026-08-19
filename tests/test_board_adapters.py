@@ -561,7 +561,7 @@ class BoardDiscoveryFixtureTests(unittest.TestCase):
             outcome.raw["website_migration"],
             {
                 "status": "accepted",
-                "evidence": "initial_configured_website_https_redirect",
+                "evidence": "initial_configured_website_browser_transport_recovery",
                 "original_url": old_url,
                 "redirect_chain": [moved_url],
                 "final_url": moved_url,
@@ -1443,12 +1443,13 @@ class OtherPlatformFixtureTests(unittest.TestCase):
         self.assertTrue(detection.metadata["durable_meeting_hub"])
         self.assertEqual(adapter.parse_source(content, url).status, "working")
         meetings = adapter.parse_meeting_list(content, url)
-        self.assertEqual(len(meetings), 3)
-        self.assertTrue(all(meeting.meeting_date == "2026-08-10" for meeting in meetings))
-        self.assertTrue(all(meeting.meeting_start_time == "18:30:00" for meeting in meetings))
-        self.assertEqual(sum(meeting.agenda_url is not None for meeting in meetings), 1)
-        self.assertEqual(sum(meeting.minutes_url is not None for meeting in meetings), 1)
-        self.assertEqual(sum(meeting.packet_url is not None for meeting in meetings), 1)
+        self.assertEqual(len(meetings), 1)
+        self.assertEqual(meetings[0].meeting_date, "2026-08-10")
+        self.assertEqual(meetings[0].meeting_start_time, "18:30:00")
+        self.assertIsNotNone(meetings[0].agenda_url)
+        self.assertIsNotNone(meetings[0].minutes_url)
+        self.assertIsNotNone(meetings[0].packet_url)
+        self.assertEqual(meetings[0].metadata["vetted_document_link_count"], 3)
 
         detail = adapter.parse_meeting_detail(content, url)
         self.assertEqual(
