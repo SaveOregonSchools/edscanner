@@ -3,80 +3,145 @@
 {% block title %}EdScanner{% endblock %}
 
 {% block content %}
-  <section class="page-heading">
-    <h2>Dashboard</h2>
-    <div class="action-row">
-      <a class="button-link" href="{{ url_for('import_page') }}">Import districts</a>
-      <a class="button-link primary" href="{{ url_for('search_page') }}">Search websites</a>
+  <section class="home-title-row">
+    <div>
+      <p class="eyebrow">Research workspace</p>
+      <h2>EdScanner Home</h2>
+    </div>
+    <p class="status-note">Choose a module below. New users can begin with <a href="{{ url_for('help_topic_page', slug='getting-started') }}">Getting Started</a>.</p>
+  </section>
+
+  <section class="module-columns" aria-label="EdScanner modules">
+    <div class="module-column">
+      <section class="module-group module-group-search">
+        <div class="module-group-heading">
+          <div><p class="module-kicker">District websites</p><h3>Search and Discovery</h3></div>
+          <a class="module-help-link" href="{{ url_for('help_topic_page', slug='search') }}">Guide</a>
+        </div>
+        <p class="module-intro">Prepare district-native search endpoints, then search public site content with profile, API, or crawler methods.</p>
+        <div class="module-list">
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('search_profiles_page') }}">Search Profiles</a>
+            <div class="description">Discover and test how each target district's website search works. Do this first for district-site searches.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('search_page') }}">Search Websites</a>
+            <div class="description">Run simple or advanced queries across selected district websites and review persistent results.</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="module-group module-group-data">
+        <div class="module-group-heading">
+          <div><p class="module-kicker">Foundation</p><h3>District Data and Setup</h3></div>
+          <a class="module-help-link" href="{{ url_for('help_topic_page', slug='import-districts') }}">Guide</a>
+        </div>
+        <div class="module-list">
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('import_page') }}">Import Districts</a>
+            <div class="description">Load the current NCES district directory from a CSV or workbook in the imports folder.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('districts_page') }}">Browse Districts</a>
+            <div class="description">Review imported agency types, enrollment, websites, and state coverage.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('settings_page') }}">Settings</a>
+            <div class="description">Configure optional Brave Search and local Ollama services.</div>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="module-column">
+      <section class="module-group module-group-board">
+        <div class="module-group-heading">
+          <div><p class="module-kicker">Public meetings</p><h3>School Board Monitoring</h3></div>
+          <a class="module-help-link" href="{{ url_for('help_topic_page', slug='school-boards') }}">Guide</a>
+        </div>
+        <p class="module-intro">Discover a board source first, sync its public records, then browse, search, or schedule ongoing monitoring.</p>
+        <div class="module-list">
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('boards.discovery') }}">Discover Sources</a>
+            <div class="description">Find and identify each district's public board portal and platform.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('boards.sync') }}">Sync Meetings</a>
+            <div class="description">Collect agendas, minutes, packets, attachments, and content revisions.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('boards.meetings') }}">Explore Meetings</a>
+            <div class="description">Filter structured meetings and open their agenda hierarchy and document history.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('boards.search') }}">Search Board Content</a>
+            <div class="description">Search indexed meeting, agenda-item, minutes, packet, and attachment text.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('boards.sources') }}">Sources and Status</a>
+            <div class="description">Review active portals, platform health, coverage, and last successful sync.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('boards.schedules') }}">Monitoring Schedules</a>
+            <div class="description">Run selected working board sources automatically every day, week, or month.</div>
+          </div>
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('boards.runs') }}">Board Run History</a>
+            <div class="description">Review discovery and sync progress, isolated failures, cancellations, and logs.</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="module-group module-group-contracts">
+        <div class="module-group-heading">
+          <div><p class="module-kicker">Collective bargaining</p><h3>Labor Agreements</h3></div>
+          <a class="module-help-link" href="{{ url_for('help_topic_page', slug='contracts') }}">Guide</a>
+        </div>
+        <div class="module-list">
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('contracts_page') }}">Discover Contracts</a>
+            <div class="description">Find, archive, classify, and review agreements and salary schedules by bargaining unit.</div>
+          </div>
+        </div>
+      </section>
     </div>
   </section>
 
-  <section class="stat-grid" aria-label="Database status">
-    <div class="stat">
-      <span class="stat-label">Districts</span>
-      <strong>{{ stats.district_count|fmt_int }}</strong>
-    </div>
-    <div class="stat">
-      <span class="stat-label">Searchable websites</span>
-      <strong>{{ stats.searchable_count|fmt_int }}</strong>
-    </div>
-    <div class="stat">
-      <span class="stat-label">State coverage</span>
-      <strong>{{ stats.state_display }}</strong>
-    </div>
-    <div class="stat">
-      <span class="stat-label">Agency types</span>
-      <strong>{{ stats.agency_type_count|fmt_int }}</strong>
+  <section class="content-section home-status-section">
+    <div class="section-heading-row"><h2>At a Glance</h2><span class="status-note">Current local database</span></div>
+    <div class="stat-grid" aria-label="Database status">
+      <div class="stat"><span class="stat-label">Districts</span><strong>{{ stats.district_count|fmt_int }}</strong></div>
+      <div class="stat"><span class="stat-label">Searchable websites</span><strong>{{ stats.searchable_count|fmt_int }}</strong></div>
+      <div class="stat"><span class="stat-label">Working board sources</span><strong>{{ stats.board_working_sources|fmt_int }}</strong></div>
+      <div class="stat"><span class="stat-label">Board meetings</span><strong>{{ stats.board_meetings|fmt_int }}</strong></div>
+      <div class="stat"><span class="stat-label">Board documents</span><strong>{{ stats.board_documents|fmt_int }}</strong></div>
+      <div class="stat"><span class="stat-label">Last board sync</span><strong>{{ stats.board_last_sync|fmt_dt or 'Not yet' }}</strong></div>
     </div>
   </section>
 
   <section class="content-section">
-    <h2>Database</h2>
-    <table class="key-table">
-      <tbody>
-        <tr>
-          <th>Status</th>
-          <td>{% if stats.db_exists %}<span class="status good">Ready</span>{% else %}<span class="status warn">Not created</span>{% endif %}</td>
-        </tr>
-        <tr>
-          <th>Path</th>
-          <td><code>{{ stats.db_path }}</code></td>
-        </tr>
-      </tbody>
-    </table>
-  </section>
-
-  <section class="content-section">
-    <h2>Recent Runs</h2>
+    <div class="section-heading-row"><h2>Recent District Searches</h2><a class="text-link" href="{{ url_for('search_page') }}">All search runs</a></div>
     {% if recent_runs %}
-      <table>
-        <thead>
-          <tr>
-            <th>Run</th>
-            <th>Query</th>
-            <th>Status</th>
-            <th>Matched</th>
-            <th>Searched</th>
-            <th>Failed</th>
-            <th>Started</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for run in recent_runs %}
-            <tr>
-              <td><a href="{{ url_for('run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
-              <td>{{ run.query_text }}</td>
-              <td><span class="status {{ run.status }}">{{ run.status }}</span></td>
-              <td>{{ run.districts_matched|fmt_int }}</td>
-              <td>{{ run.districts_searched|fmt_int }}</td>
-              <td>{{ run.districts_failed|fmt_int }}</td>
-              <td>{{ run.started_at|fmt_dt }}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Run</th><th>Query</th><th>Status</th><th>Matched</th><th>Searched</th><th>Failed</th><th>Started</th></tr></thead>
+          <tbody>
+            {% for run in recent_runs %}
+              <tr>
+                <td><a href="{{ url_for('run_detail', run_id=run.id) }}">#{{ run.id }}</a></td>
+                <td>{{ run.query_text }}</td>
+                <td><span class="status {{ run.status }}">{{ run.status }}</span></td>
+                <td>{{ run.districts_matched|fmt_int }}</td>
+                <td>{{ run.districts_searched|fmt_int }}</td>
+                <td>{{ run.districts_failed|fmt_int }}</td>
+                <td>{{ run.started_at|fmt_dt }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
     {% else %}
-      <p class="empty">No search runs yet.</p>
+      <p class="empty">No district search runs yet.</p>
     {% endif %}
   </section>
 {% endblock %}

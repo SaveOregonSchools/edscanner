@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block title %}Board Sources - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Board Sources</h2>
+    <div class="action-row">
+      <div class="metric-inline"><span>Matching districts</span><strong>{{ total|fmt_int }}</strong></div>
+      <a class="button-link" href="{{ export_url }}">Export filtered CSV</a>
+    </div>
+  </section>
+  {% include "_board_nav.html" %}
+  <p class="status-note">If discovery misses a district or finds the wrong link, use <strong>Add or correct source</strong> in that district's row to validate and save the public board site manually.</p>
+
+  <section class="tool-surface">
+    <form method="get" class="search-form">
+      <div>
+        <label for="state">State</label>
+        <select id="state" name="state"><option value="">All states</option>{% for value in options.states %}<option value="{{ value }}" {% if state == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select>
+      </div>
+      <div>
+        <label for="agency_type">Agency type</label>
+        <select id="agency_type" name="agency_type"><option value="">All agency types</option>{% for value in options.agency_types %}<option value="{{ value }}" {% if agency_type == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select>
+      </div>
+      <div>
+        <label for="platform">Platform</label>
+        <select id="platform" name="platform"><option value="">All platforms</option>{% for value in platforms %}<option value="{{ value }}" {% if platform == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select>
+      </div>
+      <div>
+        <label for="source_status">Source status</label>
+        <select id="source_status" name="source_status"><option value="">Any status</option><option value="__unchecked__" {% if source_status == '__unchecked__' %}selected{% endif %}>Not yet checked</option>{% for value in source_statuses %}<option value="{{ value }}" {% if source_status == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select>
+      </div>
+      <div><label for="min_enrollment">Min enrollment</label><input id="min_enrollment" name="min_enrollment" type="number" value="{{ min_enrollment or '' }}"></div>
+      <div><label for="max_enrollment">Max enrollment</label><input id="max_enrollment" name="max_enrollment" type="number" value="{{ max_enrollment or '' }}"></div>
+      <div class="form-actions full"><button type="submit">Apply filters</button><a class="button-link" href="{{ url_for('boards.sources') }}">Clear</a></div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>District</th><th>State</th><th>Platform</th><th>Status</th><th>Confidence</th><th>Public source</th><th>Last checked</th><th>Last sync</th><th>Monitoring</th><th>Manual correction</th></tr></thead>
+        <tbody>
+          {% for row in rows %}
+            <tr>
+              <td><strong>{{ row.agency_name }}</strong><div class="status-note">{{ row.agency_type }} · {{ row.total_enrollment_excludes_ae|fmt_int }}</div></td>
+              <td>{{ row.state }}</td>
+              <td>{{ row.platform or "" }}</td>
+              <td>
+                {% if row.source_status %}<span class="status {{ row.source_status }}">{{ row.source_status }}</span>{% else %}<span class="status">not checked</span>{% endif %}
+                {% if row.error_message %}<div class="status-note">{{ row.error_message }}</div>{% endif %}
+              </td>
+              <td>{{ "%.0f"|format(row.confidence or 0) }}</td>
+              <td>{% if row.source_url %}<a href="{{ row.source_url }}" target="_blank" rel="noopener">Open original</a><div class="source-url">{{ row.source_url }}</div>{% endif %}</td>
+              <td>{{ row.last_checked_at|fmt_dt }}</td>
+              <td>{{ row.last_successful_sync_at|fmt_dt }}</td>
+              <td>{% if row.schedule_id %}<a class="button-link" href="{{ url_for('boards.schedule_edit', schedule_id=row.schedule_id) }}">Edit schedule</a>{% elif row.board_source_id and row.is_active and row.source_status == 'working' %}<a class="button-link" href="{{ url_for('boards.schedule_new', board_source_id=row.board_source_id) }}">Add schedule</a>{% else %}<span class="status-note">Working source required</span>{% endif %}</td>
+              <td><a class="button-link" href="{{ url_for('boards.manual_source', district_id=row.id) }}">{{ 'Correct source' if row.board_source_id else 'Add source' }}</a></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="10" class="empty">No districts match these filters.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if pages > 1 %}
+      <nav class="pagination" aria-label="Source pages">
+        {% if page > 1 %}<a class="button-link" href="{{ page_url(page - 1) }}">Previous</a>{% endif %}
+        <span>Page {{ page }} of {{ pages }}</span>
+        {% if page < pages %}<a class="button-link" href="{{ page_url(page + 1) }}">Next</a>{% endif %}
+      </nav>
+    {% endif %}
+  </section>
+{% endblock %}

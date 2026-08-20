@@ -11,16 +11,21 @@ from typing import Any
 from urllib.parse import urlparse, urlunparse
 
 
+LOGGER = logging.getLogger(__name__)
 APP_ROOT = Path(__file__).resolve().parent
 DATA_DIR = APP_ROOT / "data"
 IMPORTS_DIR = APP_ROOT / "imports"
 EXPORTS_DIR = APP_ROOT / "exports"
 DOWNLOADS_DIR = APP_ROOT / "downloads"
 CONTRACT_ARCHIVE_DIR = DOWNLOADS_DIR / "contracts"
+BOARD_DOCUMENTS_DIR = DATA_DIR / "board_documents"
+BOARD_SNAPSHOTS_DIR = DATA_DIR / "board_snapshots"
 LOGS_DIR = APP_ROOT / "logs"
 SEARCH_RUN_LOGS_DIR = LOGS_DIR / "search_runs"
 PROFILE_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "profile_discovery_runs"
 CONTRACT_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "contract_discovery_runs"
+BOARD_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "board_discovery_runs"
+BOARD_SYNC_RUN_LOGS_DIR = LOGS_DIR / "board_sync_runs"
 ENV_PATH = APP_ROOT / ".env"
 
 
@@ -116,6 +121,34 @@ CONTRACT_DISCOVERY_WORKERS = _env_int("EDSCANNER_CONTRACT_DISCOVERY_WORKERS", 3,
 CONTRACT_RESCAN_DAYS = _env_int("EDSCANNER_CONTRACT_RESCAN_DAYS", 180, minimum=0)
 CONTRACT_DISTRICT_DIR_NAME_MAX = _env_int("EDSCANNER_CONTRACT_DISTRICT_DIR_NAME_MAX", 50, minimum=20)
 SEARCH_RUN_WORKERS = _env_int("EDSCANNER_SEARCH_RUN_WORKERS", 4, minimum=1)
+BOARD_WORKERS = _env_int("EDSCANNER_BOARD_WORKERS", 4, minimum=1)
+BOARD_PER_HOST_WORKERS = _env_int("EDSCANNER_BOARD_PER_HOST_WORKERS", 2, minimum=1)
+BOARD_MAX_DOCUMENT_SIZE_BYTES = _env_int("EDSCANNER_BOARD_MAX_DOCUMENT_MB", 25, minimum=1) * 1024 * 1024
+BOARD_MAX_DOCUMENTS_PER_MEETING = _env_int("EDSCANNER_BOARD_MAX_DOCUMENTS_PER_MEETING", 100, minimum=1)
+BOARD_MAX_MEETINGS_PER_SOURCE = _env_int("EDSCANNER_BOARD_MAX_MEETINGS_PER_SOURCE", 250, minimum=1)
+BOARD_REQUEST_DELAY_SECONDS = _env_float("EDSCANNER_BOARD_REQUEST_DELAY", 0.75, minimum=0.0)
+BOARD_HTTP_MAX_REDIRECTS = _env_int("EDSCANNER_BOARD_HTTP_MAX_REDIRECTS", 5, minimum=0)
+BOARD_HTTP_CACHE_MAX_ENTRIES = _env_int(
+    "EDSCANNER_BOARD_HTTP_CACHE_MAX_ENTRIES", 128, minimum=0
+)
+BOARD_HTTP_CACHE_MAX_BYTES = (
+    _env_int("EDSCANNER_BOARD_HTTP_CACHE_MAX_MB", 32, minimum=0) * 1024 * 1024
+)
+BOARD_ALLOW_PRIVATE_NETWORKS = _env_bool(
+    "EDSCANNER_BOARD_ALLOW_PRIVATE_NETWORKS", False
+)
+BOARD_IPV4_ONLY = _env_bool("EDSCANNER_BOARD_IPV4_ONLY", True)
+BOARD_ALLOW_INSECURE_SSL_FALLBACK = _env_bool(
+    "EDSCANNER_BOARD_ALLOW_INSECURE_SSL_FALLBACK", False
+)
+BOARD_INSECURE_SSL_FALLBACK_HOSTS = tuple(
+    host.strip().casefold()
+    for host in os.getenv("EDSCANNER_BOARD_INSECURE_SSL_HOSTS", "").split(",")
+    if host.strip()
+)
+BOARD_RECENT_RECHECK_DAYS = _env_int("EDSCANNER_BOARD_RECENT_RECHECK_DAYS", 60, minimum=1)
+BOARD_INCOMPLETE_RECHECK_DAYS = _env_int("EDSCANNER_BOARD_INCOMPLETE_RECHECK_DAYS", 14, minimum=1)
+BOARD_OLD_RECHECK_DAYS = _env_int("EDSCANNER_BOARD_OLD_RECHECK_DAYS", 90, minimum=1)
 VERIFY_SSL = _env_bool("EDSCANNER_VERIFY_SSL", True)
 RESPECT_ROBOTS = _env_bool("EDSCANNER_RESPECT_ROBOTS", False)
 BRAVE_SEARCH_API_KEY_ENV = "BRAVE_SEARCH_API_KEY"
@@ -249,12 +282,16 @@ def ensure_directories() -> None:
         DATA_DIR,
         DOWNLOADS_DIR,
         CONTRACT_ARCHIVE_DIR,
+        BOARD_DOCUMENTS_DIR,
+        BOARD_SNAPSHOTS_DIR,
         IMPORTS_DIR,
         EXPORTS_DIR,
         LOGS_DIR,
         SEARCH_RUN_LOGS_DIR,
         PROFILE_DISCOVERY_RUN_LOGS_DIR,
         CONTRACT_DISCOVERY_RUN_LOGS_DIR,
+        BOARD_DISCOVERY_RUN_LOGS_DIR,
+        BOARD_SYNC_RUN_LOGS_DIR,
     ):
         path.mkdir(parents=True, exist_ok=True)
 
@@ -602,6 +639,381 @@ def init_db(db_path: Path | str | None = None) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_contract_scan_status_success
                 ON district_contract_scan_status(last_successful_scan_at);
+
+            CREATE TABLE IF NOT EXISTS board_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                platform TEXT NOT NULL,
+                source_status TEXT NOT NULL,
+                source_url TEXT NOT NULL COLLATE NOCASE,
+                organization_external_id TEXT,
+                platform_tenant TEXT,
+                discovered_from_url TEXT,
+                confidence REAL NOT NULL DEFAULT 0,
+                requires_javascript INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                superseded_at TEXT,
+                last_discovered_at TEXT,
+                last_successful_sync_at TEXT,
+                last_checked_at TEXT,
+                error_message TEXT,
+                raw_discovery_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(district_id, platform, source_url)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_sources_district
+                ON board_sources(district_id);
+            CREATE INDEX IF NOT EXISTS idx_board_sources_platform_status
+                ON board_sources(platform, source_status);
+            CREATE INDEX IF NOT EXISTS idx_board_sources_last_sync
+                ON board_sources(last_successful_sync_at);
+            CREATE TABLE IF NOT EXISTS board_discovery_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                states_json TEXT,
+                agency_types_json TEXT,
+                min_enrollment INTEGER,
+                max_enrollment INTEGER,
+                platform_filter TEXT,
+                status_filter TEXT,
+                max_districts INTEGER NOT NULL,
+                max_workers INTEGER NOT NULL,
+                force INTEGER NOT NULL DEFAULT 0,
+                provider_directory_requested INTEGER,
+                search_fallback_requested INTEGER,
+                provider_directory_loaded INTEGER,
+                provider_directory_organizations INTEGER,
+                network_ipv4_only INTEGER,
+                network_https_only INTEGER,
+                website_moves_accepted INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                debug_logging INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL,
+                districts_matched INTEGER NOT NULL DEFAULT 0,
+                districts_planned INTEGER NOT NULL DEFAULT 0,
+                districts_processed INTEGER NOT NULL DEFAULT 0,
+                sources_working INTEGER NOT NULL DEFAULT 0,
+                sources_not_found INTEGER NOT NULL DEFAULT 0,
+                sources_manual_review INTEGER NOT NULL DEFAULT 0,
+                sources_failed INTEGER NOT NULL DEFAULT 0,
+                queued_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                error_message TEXT,
+                debug_log_path TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS board_discovery_run_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES board_discovery_runs(id) ON DELETE CASCADE,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                board_source_id INTEGER REFERENCES board_sources(id) ON DELETE SET NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                error_message TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                website_original_url TEXT,
+                website_final_url TEXT,
+                UNIQUE(run_id, district_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_discovery_items_run_status
+                ON board_discovery_run_items(run_id, status);
+
+            CREATE TABLE IF NOT EXISTS board_sync_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                states_json TEXT,
+                agency_types_json TEXT,
+                min_enrollment INTEGER,
+                max_enrollment INTEGER,
+                platforms_json TEXT,
+                source_status TEXT,
+                last_sync_before TEXT,
+                date_from TEXT,
+                date_to TEXT,
+                sync_mode TEXT NOT NULL,
+                force INTEGER NOT NULL DEFAULT 0,
+                max_districts INTEGER NOT NULL,
+                max_workers INTEGER NOT NULL,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                debug_logging INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL,
+                districts_matched INTEGER NOT NULL DEFAULT 0,
+                districts_planned INTEGER NOT NULL DEFAULT 0,
+                districts_processed INTEGER NOT NULL DEFAULT 0,
+                meetings_discovered INTEGER NOT NULL DEFAULT 0,
+                meetings_added INTEGER NOT NULL DEFAULT 0,
+                meetings_updated INTEGER NOT NULL DEFAULT 0,
+                documents_added INTEGER NOT NULL DEFAULT 0,
+                documents_updated INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                queued_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                error_message TEXT,
+                debug_log_path TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS board_sync_run_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES board_sync_runs(id) ON DELETE CASCADE,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                board_source_id INTEGER NOT NULL REFERENCES board_sources(id) ON DELETE CASCADE,
+                status TEXT NOT NULL DEFAULT 'queued',
+                meetings_discovered INTEGER NOT NULL DEFAULT 0,
+                meetings_added INTEGER NOT NULL DEFAULT 0,
+                meetings_updated INTEGER NOT NULL DEFAULT 0,
+                documents_added INTEGER NOT NULL DEFAULT 0,
+                documents_updated INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                UNIQUE(run_id, board_source_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_sync_items_run_status
+                ON board_sync_run_items(run_id, status);
+
+            CREATE TABLE IF NOT EXISTS board_sync_schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                board_source_id INTEGER NOT NULL UNIQUE
+                    REFERENCES board_sources(id) ON DELETE CASCADE,
+                frequency TEXT NOT NULL,
+                weekday INTEGER,
+                day_of_month INTEGER,
+                hour_24 INTEGER NOT NULL,
+                minute INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                next_run_at TEXT NOT NULL,
+                last_scheduled_for TEXT,
+                last_run_at TEXT,
+                last_sync_run_id INTEGER
+                    REFERENCES board_sync_runs(id) ON DELETE SET NULL,
+                last_error TEXT,
+                claim_token TEXT,
+                claim_expires_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                CHECK (frequency IN ('daily', 'weekly', 'monthly')),
+                CHECK (weekday IS NULL OR weekday BETWEEN 0 AND 6),
+                CHECK (day_of_month IS NULL OR day_of_month BETWEEN 1 AND 31),
+                CHECK (hour_24 BETWEEN 0 AND 23),
+                CHECK (minute BETWEEN 0 AND 59)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_sync_schedules_due
+                ON board_sync_schedules(enabled, next_run_at, claim_expires_at);
+
+            CREATE TABLE IF NOT EXISTS board_sync_schedule_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_id INTEGER NOT NULL
+                    REFERENCES board_sync_schedules(id) ON DELETE CASCADE,
+                scheduled_for TEXT NOT NULL,
+                board_sync_run_id INTEGER
+                    REFERENCES board_sync_runs(id) ON DELETE SET NULL,
+                status TEXT NOT NULL,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(schedule_id, scheduled_for)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_sync_schedule_events_run
+                ON board_sync_schedule_events(board_sync_run_id);
+
+            CREATE TABLE IF NOT EXISTS board_meetings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                board_source_id INTEGER NOT NULL REFERENCES board_sources(id) ON DELETE CASCADE,
+                platform TEXT NOT NULL,
+                external_meeting_id TEXT NOT NULL,
+                meeting_date TEXT,
+                meeting_start_time TEXT,
+                meeting_end_time TEXT,
+                meeting_datetime_text TEXT,
+                title TEXT,
+                meeting_type TEXT,
+                location_name TEXT,
+                location_address TEXT,
+                description TEXT,
+                agenda_url TEXT,
+                minutes_url TEXT,
+                packet_url TEXT,
+                public_notice_url TEXT,
+                video_url TEXT,
+                livestream_url TEXT,
+                source_url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'published',
+                revision_detected INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                last_checked_at TEXT,
+                content_hash TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(board_source_id, external_meeting_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_meetings_district_date
+                ON board_meetings(district_id, meeting_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_board_meetings_date
+                ON board_meetings(meeting_date DESC);
+            CREATE INDEX IF NOT EXISTS idx_board_meetings_platform
+                ON board_meetings(platform);
+            CREATE INDEX IF NOT EXISTS idx_board_meetings_source_external
+                ON board_meetings(board_source_id, external_meeting_id);
+
+            CREATE TABLE IF NOT EXISTS board_meeting_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                board_meeting_id INTEGER NOT NULL REFERENCES board_meetings(id) ON DELETE CASCADE,
+                version_number INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                raw_snapshot_path TEXT,
+                normalized_json TEXT NOT NULL,
+                http_status INTEGER,
+                retrieved_at TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(board_meeting_id, version_number),
+                UNIQUE(board_meeting_id, content_hash)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_meeting_versions_meeting
+                ON board_meeting_versions(board_meeting_id, version_number DESC);
+
+            CREATE TABLE IF NOT EXISTS board_agenda_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                board_meeting_id INTEGER NOT NULL REFERENCES board_meetings(id) ON DELETE CASCADE,
+                parent_item_id INTEGER REFERENCES board_agenda_items(id) ON DELETE CASCADE,
+                external_item_id TEXT NOT NULL,
+                sequence_number INTEGER NOT NULL DEFAULT 0,
+                display_number TEXT,
+                depth INTEGER NOT NULL DEFAULT 0,
+                item_type TEXT,
+                title TEXT,
+                description TEXT,
+                presenter TEXT,
+                department TEXT,
+                action_requested TEXT,
+                motion_text TEXT,
+                vote_text TEXT,
+                result_text TEXT,
+                source_url TEXT,
+                normalized_text TEXT,
+                content_hash TEXT NOT NULL,
+                raw_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(board_meeting_id, external_item_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_agenda_items_meeting_sequence
+                ON board_agenda_items(board_meeting_id, sequence_number);
+            CREATE INDEX IF NOT EXISTS idx_board_agenda_items_parent
+                ON board_agenda_items(parent_item_id);
+
+            CREATE TABLE IF NOT EXISTS board_documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                board_meeting_id INTEGER NOT NULL REFERENCES board_meetings(id) ON DELETE CASCADE,
+                agenda_item_id INTEGER REFERENCES board_agenda_items(id) ON DELETE SET NULL,
+                identity_key TEXT NOT NULL,
+                document_type TEXT NOT NULL DEFAULT 'other',
+                title TEXT,
+                source_url TEXT NOT NULL,
+                resolved_url TEXT,
+                mime_type TEXT,
+                filename TEXT,
+                local_path TEXT,
+                external_document_id TEXT,
+                size_bytes INTEGER,
+                sha256 TEXT,
+                http_status INTEGER,
+                http_etag TEXT,
+                http_last_modified TEXT,
+                retrieval_metadata_json TEXT,
+                text_extraction_status TEXT NOT NULL DEFAULT 'pending',
+                extracted_text TEXT,
+                error_message TEXT,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                retrieved_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(board_meeting_id, identity_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_documents_district
+                ON board_documents(district_id);
+            CREATE INDEX IF NOT EXISTS idx_board_documents_meeting
+                ON board_documents(board_meeting_id);
+            CREATE INDEX IF NOT EXISTS idx_board_documents_agenda_item
+                ON board_documents(agenda_item_id);
+            CREATE INDEX IF NOT EXISTS idx_board_documents_sha256
+                ON board_documents(sha256);
+
+            CREATE TABLE IF NOT EXISTS board_document_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                board_document_id INTEGER NOT NULL REFERENCES board_documents(id) ON DELETE CASCADE,
+                version_number INTEGER NOT NULL,
+                sha256 TEXT NOT NULL,
+                size_bytes INTEGER,
+                local_path TEXT,
+                extracted_text TEXT,
+                text_extraction_status TEXT,
+                http_etag TEXT,
+                http_last_modified TEXT,
+                retrieval_metadata_json TEXT,
+                first_seen_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(board_document_id, version_number),
+                UNIQUE(board_document_id, sha256)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_document_versions_document
+                ON board_document_versions(board_document_id, version_number DESC);
+
+            CREATE TABLE IF NOT EXISTS board_analysis (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                analysis_type TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                prompt_version TEXT,
+                input_hash TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                confidence REAL,
+                created_at TEXT NOT NULL,
+                UNIQUE(entity_type, entity_id, analysis_type, provider, model, prompt_version, input_hash)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_analysis_entity
+                ON board_analysis(entity_type, entity_id);
+
+            CREATE TABLE IF NOT EXISTS board_search_content (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                meeting_id INTEGER NOT NULL REFERENCES board_meetings(id) ON DELETE CASCADE,
+                agenda_item_id INTEGER REFERENCES board_agenda_items(id) ON DELETE CASCADE,
+                document_id INTEGER REFERENCES board_documents(id) ON DELETE CASCADE,
+                state TEXT,
+                platform TEXT,
+                meeting_date TEXT,
+                document_type TEXT,
+                title TEXT,
+                body TEXT,
+                source_url TEXT NOT NULL,
+                retrieved_at TEXT,
+                changed INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(entity_type, entity_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_board_search_content_filters
+                ON board_search_content(state, meeting_date, district_id, platform, document_type);
             """
         )
         existing_columns = {
@@ -676,6 +1088,101 @@ def init_db(db_path: Path | str | None = None) -> None:
         for column, declaration in contract_document_migrations.items():
             if column not in existing_contract_document_columns:
                 conn.execute(f"ALTER TABLE district_contract_documents ADD COLUMN {column} {declaration};")
+        existing_board_source_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_sources)")
+        }
+        if "is_active" not in existing_board_source_columns:
+            conn.execute("ALTER TABLE board_sources ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1;")
+        if "superseded_at" not in existing_board_source_columns:
+            conn.execute("ALTER TABLE board_sources ADD COLUMN superseded_at TEXT;")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_board_sources_district_active "
+            "ON board_sources(district_id, is_active, updated_at DESC)"
+        )
+        existing_board_discovery_run_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_discovery_runs)")
+        }
+        board_discovery_run_migrations = {
+            "provider_directory_requested": "INTEGER",
+            "search_fallback_requested": "INTEGER",
+            "provider_directory_loaded": "INTEGER",
+            "provider_directory_organizations": "INTEGER",
+            "network_ipv4_only": "INTEGER",
+            "network_https_only": "INTEGER",
+            "website_moves_accepted": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, declaration in board_discovery_run_migrations.items():
+            if column not in existing_board_discovery_run_columns:
+                conn.execute(
+                    f"ALTER TABLE board_discovery_runs ADD COLUMN {column} {declaration};"
+                )
+        existing_board_discovery_item_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_discovery_run_items)")
+        }
+        for column in ("website_original_url", "website_final_url"):
+            if column not in existing_board_discovery_item_columns:
+                conn.execute(
+                    f"ALTER TABLE board_discovery_run_items ADD COLUMN {column} TEXT;"
+                )
+        existing_board_document_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_documents)")
+        }
+        if "retrieval_metadata_json" not in existing_board_document_columns:
+            conn.execute(
+                "ALTER TABLE board_documents ADD COLUMN retrieval_metadata_json TEXT;"
+            )
+        existing_board_document_version_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(board_document_versions)")
+        }
+        if "retrieval_metadata_json" not in existing_board_document_version_columns:
+            conn.execute(
+                "ALTER TABLE board_document_versions "
+                "ADD COLUMN retrieval_metadata_json TEXT;"
+            )
+        fts_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'board_search_fts'"
+        ).fetchone()
+        try:
+            conn.executescript(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS board_search_fts USING fts5(
+                    title,
+                    body,
+                    content='board_search_content',
+                    content_rowid='id',
+                    tokenize='unicode61 remove_diacritics 2'
+                );
+
+                CREATE TRIGGER IF NOT EXISTS board_search_content_ai
+                AFTER INSERT ON board_search_content BEGIN
+                    INSERT INTO board_search_fts(rowid, title, body)
+                    VALUES (new.id, new.title, new.body);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS board_search_content_ad
+                AFTER DELETE ON board_search_content BEGIN
+                    INSERT INTO board_search_fts(board_search_fts, rowid, title, body)
+                    VALUES ('delete', old.id, old.title, old.body);
+                END;
+
+                CREATE TRIGGER IF NOT EXISTS board_search_content_au
+                AFTER UPDATE ON board_search_content BEGIN
+                    INSERT INTO board_search_fts(board_search_fts, rowid, title, body)
+                    VALUES ('delete', old.id, old.title, old.body);
+                    INSERT INTO board_search_fts(rowid, title, body)
+                    VALUES (new.id, new.title, new.body);
+                END;
+                """
+            )
+            if not fts_exists:
+                conn.execute("INSERT INTO board_search_fts(board_search_fts) VALUES ('rebuild')")
+        except sqlite3.OperationalError as exc:
+            LOGGER.warning("SQLite FTS5 is unavailable; board search will use a LIKE fallback: %s", exc)
         conn.commit()
 
 
@@ -797,6 +1304,16 @@ def collect_db_stats(db_path: Path | str | None = None) -> dict[str, Any]:
             LIMIT 1
             """
         ).fetchone()
+        board_row = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(DISTINCT district_id) FROM board_sources WHERE source_status = 'working') AS source_districts,
+                (SELECT COUNT(*) FROM board_sources WHERE source_status = 'working') AS working_sources,
+                (SELECT COUNT(*) FROM board_meetings) AS meetings,
+                (SELECT COUNT(*) FROM board_documents) AS documents,
+                (SELECT MAX(last_successful_sync_at) FROM board_sources) AS last_sync
+            """
+        ).fetchone()
         states = [
             row["state"]
             for row in conn.execute(
@@ -814,6 +1331,11 @@ def collect_db_stats(db_path: Path | str | None = None) -> dict[str, Any]:
         "state_display": state_display,
         "agency_type_count": int(row["agency_type_count"] or 0),
         "latest_run": dict(latest_run) if latest_run else None,
+        "board_source_districts": int(board_row["source_districts"] or 0),
+        "board_working_sources": int(board_row["working_sources"] or 0),
+        "board_meetings": int(board_row["meetings"] or 0),
+        "board_documents": int(board_row["documents"] or 0),
+        "board_last_sync": board_row["last_sync"],
     }
 
 

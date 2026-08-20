@@ -1,7 +1,9 @@
 Flask>=3.0,<4
 requests>=2.31,<3
+truststore>=0.10,<1
+urllib3>=2.0,<3
 beautifulsoup4>=4.12,<5
 lxml>=5.0,<7
 openpyxl>=3.1,<4
 pypdf>=5.0,<7
-playwright>=1.45,<2
+playwright>=1.48,<2

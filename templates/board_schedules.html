@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block title %}Board Monitoring Schedules - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <h2>Board Monitoring Schedules</h2>
+      <p class="status-note">Automatically check selected board sources for new meetings, agenda changes, minutes, and documents.</p>
+    </div>
+    <a class="button-link primary" href="{{ url_for('boards.schedule_new') }}">Add schedule</a>
+  </section>
+  {% include "_board_nav.html" %}
+
+  <section class="tool-surface">
+    <h2>How scheduling works</h2>
+    <p>Each enabled schedule creates a normal monitoring sync for one board source at the selected local time. Weekly schedules run on the selected weekday. Monthly schedules use the selected day, or the month's final day when that date does not exist—for example, day 31 runs on April 30 and February 28 or 29.</p>
+    <p class="status-note">Times shown here use the computer running EdScanner's local clock. Pausing a schedule does not delete its prior runs or collected records.</p>
+  </section>
+
+  <section class="content-section">
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>District / source</th><th>Schedule</th><th>Status</th><th>Next run (local)</th><th>Last run</th><th>Actions</th></tr></thead>
+        <tbody>
+          {% for row in schedules %}
+            <tr>
+              <td><strong>{{ row.agency_name }}</strong><div class="status-note">{{ row.state }} · {{ row.platform }}</div><a href="{{ row.source_url }}" target="_blank" rel="noopener">Open source</a></td>
+              <td>{{ row.frequency_label }}<div class="status-note">{{ row.time_label }}</div></td>
+              <td>
+                <span class="status {{ 'working' if row.enabled else 'pending' }}">{{ 'enabled' if row.enabled else 'paused' }}</span>
+                {% if row.last_error %}<div class="status-note">{{ row.last_error }}</div>{% endif %}
+              </td>
+              <td>{{ row.next_run_at|fmt_dt if row.enabled else 'Paused' }}</td>
+              <td>
+                {% if row.last_sync_run_id %}<a href="{{ url_for('boards.sync_run_detail', run_id=row.last_sync_run_id) }}">Sync #{{ row.last_sync_run_id }}</a> <span class="status {{ row.last_run_status }}">{{ row.last_run_status }}</span><div class="status-note">{{ row.last_run_at|fmt_dt }}</div>{% else %}<span class="status-note">Not run yet</span>{% endif %}
+              </td>
+              <td>
+                <a class="button-link" href="{{ url_for('boards.schedule_edit', schedule_id=row.id) }}">Edit</a>
+                <form method="post" action="{{ url_for('boards.schedule_toggle', schedule_id=row.id) }}" class="inline-action">
+                  <input type="hidden" name="enabled" value="{{ 0 if row.enabled else 1 }}">
+                  <button type="submit">{{ 'Pause' if row.enabled else 'Enable' }}</button>
+                </form>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="empty">No board monitoring schedules yet. Add one after discovering a working board source.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

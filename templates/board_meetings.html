@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}Board Meetings - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading"><h2>Board Meetings</h2><div class="action-row"><div class="metric-inline"><span>Results</span><strong>{{ total|fmt_int }}</strong></div><a class="button-link" href="{{ export_url }}">Export filtered CSV</a></div></section>
+  {% include "_board_nav.html" %}
+  <section class="tool-surface"><form method="get" class="search-form">
+    <div><label for="q">Text</label><input id="q" name="q" value="{{ filters.q }}" placeholder="Meeting title or agenda text"></div>
+    <div><label for="district">District</label><input id="district" name="district" value="{{ filters.district }}"></div>
+    <div><label for="state">State</label><select id="state" name="state"><option value="">All</option>{% for value in options.states %}<option value="{{ value }}" {% if filters.state == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div><label for="platform">Platform</label><select id="platform" name="platform"><option value="">All</option>{% for value in platforms %}<option value="{{ value }}" {% if filters.platform == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div><label for="meeting_type">Meeting type</label><select id="meeting_type" name="meeting_type"><option value="">All</option>{% for value in meeting_types %}<option value="{{ value }}" {% if filters.meeting_type == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+    <div><label for="date_from">From</label><input id="date_from" name="date_from" type="date" value="{{ filters.date_from }}"></div><div><label for="date_to">To</label><input id="date_to" name="date_to" type="date" value="{{ filters.date_to }}"></div>
+    {% for key, label in [('has_agenda','Has agenda'),('has_minutes','Has minutes'),('has_attachments','Has attachments'),('has_video','Has video'),('changed','Changed/revised')] %}<div><label for="{{ key }}">{{ label }}</label><select id="{{ key }}" name="{{ key }}"><option value="">Either</option><option value="1" {% if filters[key] == '1' %}selected{% endif %}>Yes</option><option value="0" {% if filters[key] == '0' %}selected{% endif %}>No</option></select></div>{% endfor %}
+    <div class="form-actions full"><button type="submit">Apply filters</button><a class="button-link" href="{{ url_for('boards.meetings') }}">Clear</a></div>
+  </form></section>
+
+  <section class="content-section meeting-list">
+    {% for row in rows %}
+      <article class="meeting-card">
+        <div class="meeting-card-heading"><div><h3><a href="{{ url_for('boards.meeting_detail', meeting_id=row.id) }}">{{ row.title or 'Board meeting' }}</a></h3><p>{{ row.agency_name }} · {{ row.state }} · {{ row.meeting_date or row.meeting_datetime_text }}</p></div><span class="status">{{ row.platform }}</span></div>
+        <dl class="meeting-facts"><div><dt>Agenda</dt><dd>{{ 'Yes' if row.agenda_url else 'No' }}</dd></div><div><dt>Minutes</dt><dd>{{ 'Yes' if row.minutes_url else 'Pending' }}</dd></div><div><dt>Documents</dt><dd>{{ row.document_count|fmt_int }}</dd></div><div><dt>Agenda items</dt><dd>{{ row.agenda_item_count|fmt_int }}</dd></div><div><dt>Video</dt><dd>{{ 'Yes' if row.video_url or row.livestream_url else 'No' }}</dd></div><div><dt>Revision</dt><dd>{{ 'Detected' if row.revision_detected else 'No' }}</dd></div></dl>
+      </article>
+    {% else %}<p class="empty">No meetings match these filters.</p>{% endfor %}
+    {% if pages > 1 %}<nav class="pagination" aria-label="Meeting pages">{% if page > 1 %}<a class="button-link" href="{{ page_url(page - 1) }}">Previous</a>{% endif %}<span>Page {{ page }} of {{ pages }}</span>{% if page < pages %}<a class="button-link" href="{{ page_url(page + 1) }}">Next</a>{% endif %}</nav>{% endif %}
+  </section>
+{% endblock %}

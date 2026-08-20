@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+
+{% block title %}Board Discovery #{{ run.id }} - EdScanner{% endblock %}
+{% block head_extra %}{% if run.status in ['queued', 'running'] %}<meta http-equiv="refresh" content="15">{% endif %}{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <h2>Board Source Discovery #{{ run.id }}</h2>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('boards.discovery') }}">Discover Sources</a>
+      <a class="button-link" href="{{ url_for('boards.discovery_run_detail', run_id=run.id) }}">Refresh</a>
+      <a class="button-link" href="{{ url_for('boards.export_discovery_run', run_id=run.id) }}">Export item ledger CSV</a>
+      {% if run.debug_log_path %}<a class="button-link" href="{{ url_for('boards.discovery_run_log', run_id=run.id) }}" target="_blank" rel="noopener">Debug log</a>{% endif %}
+      {% if run.status in ['queued', 'running'] and not run.cancel_requested %}<form method="post" action="{{ url_for('boards.cancel_discovery_run', run_id=run.id) }}" class="inline-action"><button type="submit" class="danger">Cancel</button></form>{% endif %}
+    </div>
+  </section>
+  {% include "_board_nav.html" %}
+  {% if run.status in ['queued', 'running'] %}<p class="status-note">This page refreshes every 15 seconds. Cancellation keeps all sources already collected.</p>{% endif %}
+
+  <section class="stat-grid compact">
+    <div class="stat"><span class="stat-label">Status</span><strong>{{ run.status }}</strong></div>
+    <div class="stat"><span class="stat-label">Matched</span><strong>{{ run.districts_matched|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Planned</span><strong>{{ run.districts_planned|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Processed</span><strong>{{ run.districts_processed|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Working</span><strong>{{ run.sources_working|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Not found</span><strong>{{ run.sources_not_found|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Manual review</span><strong>{{ status_counts.get('manual_review', 0)|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Challenge / JavaScript</span><strong>{{ (status_counts.get('blocked_by_challenge', 0) + status_counts.get('requires_javascript', 0))|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Blocked by robots</span><strong>{{ status_counts.get('blocked_by_robots', 0)|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Failed</span><strong>{{ run.sources_failed|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Website moves accepted</span><strong>{{ run.website_moves_accepted|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Elapsed</span><strong>{{ elapsed }}</strong></div>
+  </section>
+
+  <section class="content-section"><h2>Run Settings</h2><table class="key-table"><tbody>
+    <tr><th>States</th><td>{{ states|join(', ') if states else 'All' }}</td></tr><tr><th>Agency types</th><td>{{ agency_types|join(', ') if agency_types else 'All' }}</td></tr>
+    <tr><th>Enrollment</th><td>{{ run.min_enrollment|fmt_int or 'Any' }} to {{ run.max_enrollment|fmt_int or 'Any' }}</td></tr><tr><th>Platform/status</th><td>{{ run.platform_filter or 'Any' }} / {{ run.status_filter or 'Any' }}</td></tr>
+    <tr><th>Workers</th><td>{{ run.max_workers }}</td></tr>
+    <tr><th>Network policy</th><td>{% if run.network_ipv4_only is none or run.network_https_only is none %}Not recorded for this legacy run{% else %}{{ 'IPv4 only' if run.network_ipv4_only else 'IPv4 and IPv6' }}; {{ 'HTTPS only' if run.network_https_only else 'HTTP and HTTPS' }}{% endif %}</td></tr>
+    <tr><th>BoardBook directory</th><td>{% if run.provider_directory_requested is none %}Not recorded for this legacy run{% elif run.provider_directory_requested %}Requested; {% if run.provider_directory_loaded %}loaded {{ run.provider_directory_organizations|fmt_int }} organizations{% elif run.status in ['queued', 'running'] %}pending{% else %}not loaded{% endif %}{% else %}Disabled for this run{% endif %}</td></tr>
+    <tr><th>Additional search evidence</th><td>{% if run.search_fallback_requested is none %}Not recorded for this legacy run{% elif run.search_fallback_requested %}Enabled; one Brave Search API query was allowed for each selected district{% else %}Disabled for this run{% endif %}</td></tr>
+    <tr><th>Discovery scope</th><td>{{ 'Rediscover district sites, including districts with saved sources' if run.force else 'Districts not yet checked by default (or an explicitly selected saved-source status)' }}</td></tr><tr><th>Started</th><td>{{ run.started_at|fmt_dt }}</td></tr><tr><th>Finished</th><td>{{ run.finished_at|fmt_dt }}</td></tr>
+    {% if run.error_message %}<tr><th>Message</th><td>{{ run.error_message }}</td></tr>{% endif %}
+  </tbody></table></section>
+
+  <section class="content-section"><h2>District Work</h2><div class="table-scroll"><table>
+    <thead><tr><th>District</th><th>State</th><th>Status</th><th>Platform</th><th>Board source</th><th>Accepted website move</th><th>Message</th><th>Finished</th><th>Manual correction</th></tr></thead>
+    <tbody>{% for item in items %}<tr><td><strong>{{ item.agency_name }}</strong></td><td>{{ item.state }}</td><td><span class="status {{ item.status }}">{{ item.status }}</span></td><td>{{ item.platform or '' }}</td><td>{% if item.source_url %}<a href="{{ item.source_url }}" target="_blank" rel="noopener">Open source</a>{% endif %}</td><td>{% if item.website_final_url %}<a href="{{ item.website_original_url }}" target="_blank" rel="noopener">Imported site</a> → <a href="{{ item.website_final_url }}" target="_blank" rel="noopener">Current site</a>{% else %}—{% endif %}</td><td>{{ item.error_message or item.source_error or '' }}</td><td>{{ item.finished_at|fmt_dt }}</td><td><a class="button-link" href="{{ url_for('boards.manual_source', district_id=item.district_id) }}">Add or correct source</a></td></tr>{% else %}<tr><td colspan="9" class="empty">No work items.</td></tr>{% endfor %}</tbody>
+  </table></div></section>
+{% endblock %}

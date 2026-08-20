@@ -1,0 +1,45 @@
+{
+  "@odata.context": "https://usbe.api.civicclerk.com/v1/$metadata#Events",
+  "value": [
+    {
+      "id": 496,
+      "eventName": "Utah State Board of Education Board Meeting",
+      "startDateTime": "2026-01-07T09:00:00Z",
+      "isPublished": "Published",
+      "agendaId": 343,
+      "agendaName": "January 7, 2026 USBE Board Meeting",
+      "categoryId": 26,
+      "categoryName": "Utah State Board of Education",
+      "hasAgenda": true,
+      "hasMedia": true,
+      "externalMediaUrl": "https://video.example.test/usbe/496",
+      "defaultPublicPortalPage": 0,
+      "eventLocation": {
+        "id": 210,
+        "address1": "250 East 500 South",
+        "city": "Salt Lake City",
+        "state": "UT",
+        "zipCode": "84111"
+      },
+      "publishedFiles": [
+        {
+          "fileId": 2048,
+          "type": "Agenda",
+          "name": "Agenda",
+          "fileType": 1,
+          "publishOn": "2026-01-05T15:55:28.86Z",
+          "streamUrl": "https://usbe.api.civicclerk.com/v1/Meetings/GetMeetingFileStream(fileId=2048,plainText=false)"
+        },
+        {
+          "fileId": 2049,
+          "type": "Agenda Packet",
+          "name": "Public Packet",
+          "fileType": 2,
+          "publishOn": "2026-01-05T15:55:28.86Z",
+          "streamUrl": "https://usbe.api.civicclerk.com/v1/Meetings/GetMeetingFileStream(fileId=2049,plainText=false)"
+        }
+      ]
+    }
+  ],
+  "@odata.nextLink": "https://usbe.api.civicclerk.com/v1/Events?$skiptoken=startDateTime-2026-01-07T09%3A00%3A00Z,id-496"
+}

@@ -5,12 +5,14 @@ import gzip
 import io
 import json
 import logging
+import re
 import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 from urllib import robotparser
@@ -58,6 +60,283 @@ SEARCH_METHODS = {
 MAX_API_RESULTS_PER_DISTRICT = 20
 MAX_FOLLOW_DEPTH = 2
 MAX_SEARCH_WORKERS = 8
+MAX_QUERY_LENGTH = 500
+MAX_QUERY_TOKENS = 100
+MAX_WILDCARDS_PER_TERM = 8
+MAX_OUTBOUND_QUERY_VARIANTS = 8
+SEARCH_FIELD_SEPARATOR = "\n\0\n"
+
+
+class SearchQuerySyntaxError(ValueError):
+    """Raised when a district-search expression is not valid."""
+
+
+@dataclass(frozen=True)
+class QueryTerm:
+    text: str
+    phrase: bool = False
+    wildcard: bool = False
+
+
+@dataclass(frozen=True)
+class QueryNot:
+    operand: "QueryNode"
+
+
+@dataclass(frozen=True)
+class QueryAnd:
+    operands: tuple["QueryNode", ...]
+
+
+@dataclass(frozen=True)
+class QueryOr:
+    operands: tuple["QueryNode", ...]
+
+
+QueryNode = QueryTerm | QueryNot | QueryAnd | QueryOr
+
+
+@dataclass(frozen=True)
+class ParsedSearchQuery:
+    raw: str
+    root: QueryNode
+    positive_terms: tuple[QueryTerm, ...]
+    legacy_simple: bool = False
+
+
+@dataclass(frozen=True)
+class SearchQueryCapabilities:
+    boolean_operators: bool = False
+    parentheses: bool = False
+    quoted_phrases: bool = False
+    wildcards: bool = False
+    negation: bool = False
+    wildcards_in_phrases: bool = False
+
+
+FULL_QUERY_CAPABILITIES = SearchQueryCapabilities(True, True, True, True, True)
+PLAIN_QUERY_CAPABILITIES = SearchQueryCapabilities()
+PROVIDER_QUERY_CAPABILITIES: dict[str, SearchQueryCapabilities] = {
+    "brave": SearchQueryCapabilities(True, True, True, False, True),
+    "google programmable search": SearchQueryCapabilities(True, True, True, False, True),
+    "bing": SearchQueryCapabilities(True, True, True, False, True),
+    "searchstax / solr": FULL_QUERY_CAPABILITIES,
+    "sharepoint": SearchQueryCapabilities(True, True, True, False, True),
+    "algolia": PLAIN_QUERY_CAPABILITIES,
+    "finalsite": PLAIN_QUERY_CAPABILITIES,
+    "edlio": PLAIN_QUERY_CAPABILITIES,
+    "blackboard / schoolwires": PLAIN_QUERY_CAPABILITIES,
+    "apptegy": PLAIN_QUERY_CAPABILITIES,
+    "parentsquare": PLAIN_QUERY_CAPABILITIES,
+    "campus suite": PLAIN_QUERY_CAPABILITIES,
+    "schoolmessenger": PLAIN_QUERY_CAPABILITIES,
+    "wordpress": PLAIN_QUERY_CAPABILITIES,
+    "drupal": PLAIN_QUERY_CAPABILITIES,
+    "custom": PLAIN_QUERY_CAPABILITIES,
+}
+
+
+@dataclass(frozen=True)
+class _QueryToken:
+    kind: str
+    value: str
+    position: int
+
+
+def _query_error(message: str, position: int | None = None) -> SearchQuerySyntaxError:
+    suffix = f" at character {position + 1}" if position is not None else ""
+    return SearchQuerySyntaxError(f"Invalid search query: {message}{suffix}.")
+
+
+def _legacy_simple_query(text: str) -> bool:
+    if any(character in text for character in '"()*?'):
+        return False
+    return not any(part in {"AND", "OR", "NOT"} for part in text.split())
+
+
+def _tokenize_search_query(text: str) -> list[_QueryToken]:
+    tokens: list[_QueryToken] = []
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character.isspace():
+            index += 1
+            continue
+        if character == "(":
+            tokens.append(_QueryToken("LPAREN", character, index))
+            index += 1
+            continue
+        if character == ")":
+            tokens.append(_QueryToken("RPAREN", character, index))
+            index += 1
+            continue
+        if character == '"':
+            start = index
+            index += 1
+            value: list[str] = []
+            while index < len(text) and text[index] != '"':
+                if text[index] == "\\":
+                    index += 1
+                    if index >= len(text):
+                        raise _query_error("unfinished escape sequence", index - 1)
+                value.append(text[index])
+                index += 1
+            if index >= len(text):
+                raise _query_error("unterminated quoted phrase", start)
+            index += 1
+            phrase = " ".join("".join(value).split())
+            if not phrase:
+                raise _query_error("quoted phrases cannot be empty", start)
+            tokens.append(_QueryToken("PHRASE", phrase, start))
+            continue
+
+        start = index
+        value = []
+        while index < len(text) and not text[index].isspace() and text[index] not in "()\"":
+            if text[index] == "\\":
+                index += 1
+                if index >= len(text):
+                    raise _query_error("unfinished escape sequence", index - 1)
+            value.append(text[index])
+            index += 1
+        if index < len(text) and text[index] == '"':
+            raise _query_error("a quote must begin a term", index)
+        word = "".join(value)
+        if not word:
+            raise _query_error("expected a search term", start)
+        kind = word if word in {"AND", "OR", "NOT"} else "TERM"
+        tokens.append(_QueryToken(kind, word, start))
+        if len(tokens) > MAX_QUERY_TOKENS:
+            raise _query_error(f"queries may contain at most {MAX_QUERY_TOKENS} terms and operators")
+    if len(tokens) > MAX_QUERY_TOKENS:
+        raise _query_error(f"queries may contain at most {MAX_QUERY_TOKENS} terms and operators")
+    return tokens
+
+
+def _make_query_term(token: _QueryToken) -> QueryTerm:
+    wildcard_count = token.value.count("*") + token.value.count("?")
+    if wildcard_count > MAX_WILDCARDS_PER_TERM:
+        raise _query_error(
+            f"a term may contain at most {MAX_WILDCARDS_PER_TERM} wildcard characters",
+            token.position,
+        )
+    if wildcard_count and not any(character not in "*?" for character in token.value):
+        raise _query_error("a wildcard term must contain at least one letter or number", token.position)
+    return QueryTerm(
+        token.value,
+        phrase=token.kind == "PHRASE",
+        wildcard=bool(wildcard_count),
+    )
+
+
+class _SearchQueryParser:
+    def __init__(self, tokens: list[_QueryToken]):
+        self.tokens = tokens
+        self.index = 0
+
+    def current(self) -> _QueryToken | None:
+        return self.tokens[self.index] if self.index < len(self.tokens) else None
+
+    def take(self, kind: str) -> _QueryToken | None:
+        token = self.current()
+        if token is None or token.kind != kind:
+            return None
+        self.index += 1
+        return token
+
+    def parse(self) -> QueryNode:
+        root = self.parse_or()
+        token = self.current()
+        if token is not None:
+            if token.kind == "RPAREN":
+                raise _query_error("unexpected closing parenthesis", token.position)
+            raise _query_error(f"unexpected {token.value!r}", token.position)
+        return root
+
+    def parse_or(self) -> QueryNode:
+        operands = [self.parse_and()]
+        while self.take("OR") is not None:
+            if self.current() is None:
+                raise _query_error("OR must be followed by a term")
+            operands.append(self.parse_and())
+        return operands[0] if len(operands) == 1 else QueryOr(tuple(operands))
+
+    def parse_and(self) -> QueryNode:
+        operands = [self.parse_not()]
+        while True:
+            if self.take("AND") is not None:
+                if self.current() is None:
+                    raise _query_error("AND must be followed by a term")
+                operands.append(self.parse_not())
+                continue
+            token = self.current()
+            if token is not None and token.kind in {"TERM", "PHRASE", "LPAREN", "NOT"}:
+                operands.append(self.parse_not())
+                continue
+            break
+        return operands[0] if len(operands) == 1 else QueryAnd(tuple(operands))
+
+    def parse_not(self) -> QueryNode:
+        token = self.take("NOT")
+        if token is not None:
+            if self.current() is None:
+                raise _query_error("NOT must be followed by a term", token.position)
+            return QueryNot(self.parse_not())
+        return self.parse_primary()
+
+    def parse_primary(self) -> QueryNode:
+        token = self.current()
+        if token is None:
+            raise _query_error("expected a search term")
+        if token.kind in {"TERM", "PHRASE"}:
+            self.index += 1
+            return _make_query_term(token)
+        if token.kind == "LPAREN":
+            self.index += 1
+            if self.take("RPAREN") is not None:
+                raise _query_error("parentheses cannot be empty", token.position)
+            expression = self.parse_or()
+            if self.take("RPAREN") is None:
+                raise _query_error("missing closing parenthesis", token.position)
+            return expression
+        if token.kind in {"AND", "OR"}:
+            raise _query_error(f"{token.value} must follow a term", token.position)
+        if token.kind == "RPAREN":
+            raise _query_error("expected a search term before the closing parenthesis", token.position)
+        raise _query_error("expected a search term", token.position)
+
+
+def _positive_query_terms(node: QueryNode, *, negated: bool = False) -> list[QueryTerm]:
+    if isinstance(node, QueryTerm):
+        return [] if negated else [node]
+    if isinstance(node, QueryNot):
+        return _positive_query_terms(node.operand, negated=not negated)
+    terms: list[QueryTerm] = []
+    for operand in node.operands:
+        terms.extend(_positive_query_terms(operand, negated=negated))
+    return terms
+
+
+@lru_cache(maxsize=256)
+def parse_search_query(query_text: str) -> ParsedSearchQuery:
+    raw = str(query_text or "").strip()
+    if not raw:
+        raise SearchQuerySyntaxError("Search text is required.")
+    if len(raw) > MAX_QUERY_LENGTH:
+        raise _query_error(f"queries may contain at most {MAX_QUERY_LENGTH} characters")
+    if _legacy_simple_query(raw):
+        normalized = " ".join(raw.split())
+        root: QueryNode = QueryTerm(normalized, phrase=True)
+        return ParsedSearchQuery(raw, root, (root,), legacy_simple=True)
+
+    tokens = _tokenize_search_query(raw)
+    if not tokens:
+        raise SearchQuerySyntaxError("Search text is required.")
+    root = _SearchQueryParser(tokens).parse()
+    positive_terms = tuple(_positive_query_terms(root))
+    if not positive_terms:
+        raise _query_error("include at least one term that is not excluded by NOT")
+    return ParsedSearchQuery(raw, root, positive_terms)
 
 
 @dataclass(frozen=True)
@@ -421,13 +700,310 @@ def collapse_ws(text: str) -> str:
     return " ".join(str(text or "").split())
 
 
+@lru_cache(maxsize=512)
+def _term_regex(text: str, wildcard: bool) -> re.Pattern[str]:
+    pattern: list[str] = [r"(?<![\w'\N{RIGHT SINGLE QUOTATION MARK}])"] if wildcard else []
+    whitespace = False
+    for character in text:
+        if character.isspace():
+            if not whitespace:
+                pattern.append(r"\s+")
+            whitespace = True
+            continue
+        whitespace = False
+        if wildcard and character == "*":
+            pattern.append(r"[\w'\N{RIGHT SINGLE QUOTATION MARK}.\-]*")
+        elif wildcard and character == "?":
+            pattern.append(r"[\w'\N{RIGHT SINGLE QUOTATION MARK}.\-]")
+        else:
+            pattern.append(re.escape(character))
+    if wildcard:
+        pattern.append(r"(?![\w'\N{RIGHT SINGLE QUOTATION MARK}])")
+    return re.compile("".join(pattern), re.IGNORECASE)
+
+
+def _term_match(term: QueryTerm, text: str) -> re.Match[str] | None:
+    return _term_regex(term.text, term.wildcard).search(text or "")
+
+
+def _term_occurrences(term: QueryTerm, text: str, *, maximum: int = 10) -> int:
+    count = 0
+    for match in _term_regex(term.text, term.wildcard).finditer(text or ""):
+        if match.end() == match.start():
+            continue
+        count += 1
+        if count >= maximum:
+            break
+    return count
+
+
+def _evaluate_query(node: QueryNode, text: str) -> bool:
+    if isinstance(node, QueryTerm):
+        return _term_match(node, text) is not None
+    if isinstance(node, QueryNot):
+        return not _evaluate_query(node.operand, text)
+    if isinstance(node, QueryAnd):
+        return all(_evaluate_query(operand, text) for operand in node.operands)
+    return any(_evaluate_query(operand, text) for operand in node.operands)
+
+
+def query_matches(query: str | ParsedSearchQuery, text: str) -> bool:
+    parsed = query if isinstance(query, ParsedSearchQuery) else parse_search_query(query)
+    return _evaluate_query(parsed.root, text or "")
+
+
+def matched_query_terms(query: str | ParsedSearchQuery, text: str) -> list[QueryTerm]:
+    parsed = query if isinstance(query, ParsedSearchQuery) else parse_search_query(query)
+    matched: list[QueryTerm] = []
+    seen: set[tuple[str, bool, bool]] = set()
+    for term in parsed.positive_terms:
+        key = (term.text.casefold(), term.phrase, term.wildcard)
+        if key not in seen and _term_match(term, text) is not None:
+            seen.add(key)
+            matched.append(term)
+    return matched
+
+
+def _wildcard_seed(text: str) -> str:
+    seeds: list[str] = []
+    for word in text.split():
+        fragments = [fragment for fragment in re.split(r"[*?]+", word) if fragment]
+        seed = max(fragments, key=len, default="")
+        if seed:
+            seeds.append(seed)
+    return " ".join(seeds)
+
+
+def _query_precedence(node: QueryNode) -> int:
+    if isinstance(node, QueryOr):
+        return 1
+    if isinstance(node, QueryAnd):
+        return 2
+    if isinstance(node, QueryNot):
+        return 3
+    return 4
+
+
+def _serialize_query_node(
+    node: QueryNode,
+    capabilities: SearchQueryCapabilities,
+    *,
+    parent_precedence: int = 0,
+) -> str:
+    if isinstance(node, QueryTerm):
+        text = node.text if capabilities.wildcards or not node.wildcard else _wildcard_seed(node.text)
+        text = collapse_ws(text)
+        if node.phrase and capabilities.quoted_phrases and (not node.wildcard or capabilities.wildcards_in_phrases):
+            return f'"{text.replace(chr(34), r"\"")}"'
+        return text
+    if isinstance(node, QueryNot):
+        if not capabilities.negation:
+            return ""
+        child = _serialize_query_node(node.operand, capabilities, parent_precedence=3)
+        if not child:
+            return ""
+        rendered = f"NOT {child}"
+        if _query_precedence(node) < parent_precedence and capabilities.parentheses:
+            return f"({rendered})"
+        return rendered
+
+    separator = " AND " if isinstance(node, QueryAnd) else " OR "
+    parts = [
+        rendered
+        for operand in node.operands
+        if (rendered := _serialize_query_node(
+            operand,
+            capabilities,
+            parent_precedence=_query_precedence(node),
+        ))
+    ]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    rendered = separator.join(parts)
+    if _query_precedence(node) < parent_precedence and capabilities.parentheses:
+        return f"({rendered})"
+    return rendered
+
+
+def query_capabilities_for_provider(provider: str | None) -> SearchQueryCapabilities:
+    normalized = collapse_ws(provider or "Custom").casefold()
+    if normalized in PROVIDER_QUERY_CAPABILITIES:
+        return PROVIDER_QUERY_CAPABILITIES[normalized]
+    for name, capabilities in PROVIDER_QUERY_CAPABILITIES.items():
+        if name != "custom" and name in normalized:
+            return capabilities
+    return PLAIN_QUERY_CAPABILITIES
+
+
+def _explicit_profile_capabilities(profile: dict[str, Any]) -> SearchQueryCapabilities | None:
+    raw_capabilities: Any = profile.get("query_capabilities")
+    if raw_capabilities is None:
+        raw = profile.get("raw_discovery_json") or profile.get("raw")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                raw = None
+        if isinstance(raw, dict):
+            raw_capabilities = raw.get("query_capabilities")
+    if not isinstance(raw_capabilities, dict):
+        return None
+    return SearchQueryCapabilities(
+        boolean_operators=bool(raw_capabilities.get("boolean_operators")),
+        parentheses=bool(raw_capabilities.get("parentheses")),
+        quoted_phrases=bool(raw_capabilities.get("quoted_phrases")),
+        wildcards=bool(raw_capabilities.get("wildcards")),
+        negation=bool(raw_capabilities.get("negation")),
+        wildcards_in_phrases=bool(raw_capabilities.get("wildcards_in_phrases")),
+    )
+
+
+def query_capabilities_for_profile(profile: dict[str, Any]) -> SearchQueryCapabilities:
+    explicit = _explicit_profile_capabilities(profile)
+    if explicit is not None:
+        return explicit
+    return query_capabilities_for_provider(profile.get("provider_guess"))
+
+
+def translate_search_query(
+    query: str | ParsedSearchQuery,
+    *,
+    provider: str | None = None,
+    capabilities: SearchQueryCapabilities | None = None,
+) -> str:
+    parsed = query if isinstance(query, ParsedSearchQuery) else parse_search_query(query)
+    capabilities = capabilities or query_capabilities_for_provider(provider)
+    if capabilities.boolean_operators:
+        translated = _serialize_query_node(parsed.root, capabilities)
+        if translated:
+            return translated
+
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in parsed.positive_terms:
+        text = term.text if capabilities.wildcards or not term.wildcard else _wildcard_seed(term.text)
+        text = collapse_ws(text)
+        if not text:
+            continue
+        rendered = (
+            f'"{text}"'
+            if term.phrase and capabilities.quoted_phrases and (not term.wildcard or capabilities.wildcards_in_phrases)
+            else text
+        )
+        if rendered.casefold() not in seen:
+            seen.add(rendered.casefold())
+            terms.append(rendered)
+    return " ".join(terms)
+
+
+def _limited_query_groups(
+    node: QueryNode,
+    *,
+    negated: bool = False,
+) -> list[tuple[QueryTerm, ...]]:
+    if isinstance(node, QueryTerm):
+        return [()] if negated else [(node,)]
+    if isinstance(node, QueryNot):
+        return _limited_query_groups(node.operand, negated=not negated)
+
+    is_and = isinstance(node, QueryAnd)
+    combine_as_and = is_and != negated
+    child_groups = [
+        _limited_query_groups(operand, negated=negated)
+        for operand in node.operands
+    ]
+    if not combine_as_and:
+        variants: list[tuple[QueryTerm, ...]] = []
+        for groups in child_groups:
+            variants.extend(groups)
+            if len(variants) >= MAX_OUTBOUND_QUERY_VARIANTS:
+                break
+        return variants[:MAX_OUTBOUND_QUERY_VARIANTS]
+
+    variants = [()]
+    for groups in child_groups:
+        combined: list[tuple[QueryTerm, ...]] = []
+        for existing in variants:
+            for group in groups:
+                combined.append((*existing, *group))
+                if len(combined) >= MAX_OUTBOUND_QUERY_VARIANTS:
+                    break
+            if len(combined) >= MAX_OUTBOUND_QUERY_VARIANTS:
+                break
+        variants = combined
+    return variants
+
+
+def outbound_query_variants(
+    query: str | ParsedSearchQuery,
+    *,
+    provider: str | None = None,
+    capabilities: SearchQueryCapabilities | None = None,
+) -> tuple[str, ...]:
+    parsed = query if isinstance(query, ParsedSearchQuery) else parse_search_query(query)
+    capabilities = capabilities or query_capabilities_for_provider(provider)
+    if capabilities.boolean_operators:
+        return (translate_search_query(parsed, provider=provider, capabilities=capabilities),)
+
+    variants: list[str] = []
+    seen: set[str] = set()
+    for group in _limited_query_groups(parsed.root):
+        rendered_terms: list[str] = []
+        term_seen: set[str] = set()
+        for term in group:
+            text = term.text if capabilities.wildcards or not term.wildcard else _wildcard_seed(term.text)
+            text = collapse_ws(text)
+            if not text:
+                continue
+            rendered = (
+                f'"{text}"'
+                if term.phrase and capabilities.quoted_phrases and (not term.wildcard or capabilities.wildcards_in_phrases)
+                else text
+            )
+            if rendered.casefold() not in term_seen:
+                term_seen.add(rendered.casefold())
+                rendered_terms.append(rendered)
+        rendered_query = " ".join(rendered_terms)
+        if rendered_query and rendered_query.casefold() not in seen:
+            seen.add(rendered_query.casefold())
+            variants.append(rendered_query)
+    if not variants:
+        variants.append(translate_search_query(parsed, provider=provider, capabilities=capabilities))
+    return tuple(variants[:MAX_OUTBOUND_QUERY_VARIANTS])
+
+
+def translate_query_for_profile(query: str | ParsedSearchQuery, profile: dict[str, Any]) -> str:
+    return translate_search_query(
+        query,
+        provider=profile.get("provider_guess"),
+        capabilities=query_capabilities_for_profile(profile),
+    )
+
+
+def query_variants_for_profile(query: str | ParsedSearchQuery, profile: dict[str, Any]) -> tuple[str, ...]:
+    return outbound_query_variants(
+        query,
+        provider=profile.get("provider_guess"),
+        capabilities=query_capabilities_for_profile(profile),
+    )
+
+
 def make_snippet(text: str, query_text: str, radius: int = 200) -> str:
     haystack = text or ""
-    index = haystack.casefold().find(query_text.casefold())
-    if index < 0:
+    parsed = parse_search_query(query_text)
+    matches = [
+        match
+        for term in parsed.positive_terms
+        if (match := _term_match(term, haystack)) is not None
+    ]
+    if not matches:
         return collapse_ws(haystack[: radius * 2])
+    first_match = min(matches, key=lambda match: match.start())
+    index = first_match.start()
     start = max(index - radius, 0)
-    end = min(index + len(query_text) + radius, len(haystack))
+    end = min(first_match.end() + radius, len(haystack))
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(haystack) else ""
     return collapse_ws(f"{prefix}{haystack[start:end]}{suffix}")
@@ -441,23 +1017,36 @@ def score_match(
     url: str,
     content_type: str,
 ) -> dict[str, Any] | None:
-    query_fold = query_text.casefold()
-    title_fold = title.casefold()
+    parsed_query = parse_search_query(query_text)
     heading_text = " ".join(headings)
-    heading_fold = heading_text.casefold()
-    body_fold = body_text.casefold()
-    occurrences = body_fold.count(query_fold)
-    title_match = query_fold in title_fold
-    heading_match = query_fold in heading_fold
-    if not occurrences and not title_match and not heading_match:
+    searchable_text = SEARCH_FIELD_SEPARATOR.join([title, heading_text, body_text])
+    if not query_matches(parsed_query, searchable_text):
+        return None
+
+    matched_terms = matched_query_terms(parsed_query, searchable_text)
+    if not matched_terms:
         return None
 
     score = 0.0
-    if title_match:
-        score += 50
-    if heading_match:
-        score += 25
-    score += 10 * min(occurrences, 10)
+    if parsed_query.legacy_simple:
+        term = parsed_query.positive_terms[0]
+        occurrences = _term_occurrences(term, body_text)
+        if _term_match(term, title):
+            score += 50
+        if _term_match(term, heading_text):
+            score += 25
+        score += 10 * occurrences
+    else:
+        for term in matched_terms:
+            if _term_match(term, title):
+                score += 30
+            if _term_match(term, heading_text):
+                score += 15
+            score += 7 * _term_occurrences(term, body_text)
+        if query_matches(parsed_query, title):
+            score += 20
+        elif query_matches(parsed_query, SEARCH_FIELD_SEPARATOR.join([title, heading_text])):
+            score += 10
     parsed = urlparse(url)
     path_parts = [part for part in parsed.path.split("/") if part]
     if len(path_parts) <= 1:
@@ -473,7 +1062,7 @@ def score_match(
         "content_type": content_type,
         "score": score,
         "snippet": make_snippet(body_text, query_text),
-        "matched_terms": [query_text],
+        "matched_terms": [term.text for term in matched_terms],
     }
 
 
@@ -727,9 +1316,7 @@ def strip_search_markup(value: str | None) -> str:
 
 def site_search_query(query_text: str, base_url: str) -> str:
     host = _core_host(_host(base_url))
-    query = str(query_text or "").strip()
-    if not query.startswith('"') and not query.endswith('"'):
-        query = f'"{query}"'
+    query = translate_search_query(query_text, provider="Brave")
     return f"{query} site:{host}"
 
 
@@ -819,7 +1406,18 @@ def _search_district_brave(
         return []
 
     api_results = brave_api_search(query_text, base_url, settings, debug_logger)
-    result_map: dict[str, dict[str, Any]] = {result["url"]: result for result in api_results}
+    result_map: dict[str, dict[str, Any]] = {}
+    for result in api_results:
+        api_match = score_match(
+            query_text,
+            str(result.get("title") or ""),
+            [],
+            str(result.get("snippet") or ""),
+            str(result.get("url") or ""),
+            "search/api",
+        )
+        if api_match:
+            result_map[result["url"]] = {**result, "matched_terms": api_match["matched_terms"]}
     session = make_session(settings)
     robots, _robots_sitemaps = load_robots(session, base_url, settings)
     queue: OrderedDict[str, int] = OrderedDict()
@@ -953,6 +1551,7 @@ def search_district(
     db_path: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     settings = settings or SearchSettings()
+    parse_search_query(query_text)
     method = normalize_search_method(settings.search_method)
     if method == "crawler":
         return _search_district_crawler(
@@ -1034,8 +1633,7 @@ def create_search_run(
     status: str = "queued",
 ) -> int:
     query_text = str(query_text or "").strip()
-    if not query_text:
-        raise ValueError("Search text is required.")
+    parse_search_query(query_text)
     init_db(db_path)
     settings = settings or SearchSettings()
     cap = max_districts or settings.max_total_districts_per_run

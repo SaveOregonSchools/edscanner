@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+
+{% block title %}Manual Board Source - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">School Board Monitoring</p>
+      <h2>Add or Correct a Board Source</h2>
+      <p class="page-description">{{ district.agency_name }} · {{ district.state }}</p>
+    </div>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('boards.sources', state=district.state) }}">Back to Board Sources</a>
+    </div>
+  </section>
+  {% include "_board_nav.html" %}
+
+  <section class="guidance-card">
+    <h3>How manual sources are handled</h3>
+    <p>Paste the public organization or meeting-list URL, not an administrator login. EdScanner safely retrieves the page and checks it with the selected platform adapter.</p>
+    <p>After the adapter verifies the endpoint and you confirm the district identity below, the match becomes the district's active <strong>working</strong> source. A safely retrieved link that cannot be verified is kept as <strong>manual_review</strong> evidence and cannot be scheduled or synced as a working source. Replacing a source preserves the earlier source below as history and carries its enabled monitoring schedule to the correction when possible.</p>
+  </section>
+
+  {% if validation_error %}
+    <div class="message error" role="alert"><strong>The source was not saved.</strong> {{ validation_error }}</div>
+  {% endif %}
+
+  <section class="tool-surface">
+    <form method="post" class="search-form">
+      <input type="hidden" name="district_id" value="{{ district.id }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <div class="full">
+        <label for="source_url">Public board source URL</label>
+        <input id="source_url" name="source_url" type="url" maxlength="2048" required autocomplete="url" placeholder="https://meetings.boardbook.org/Public/Organization/2413" value="{{ submitted_url }}">
+        <div class="field-note">Use the vendor's public organization, portal, or meeting-list page.</div>
+      </div>
+      <div>
+        <label for="platform">Board platform</label>
+        <select id="platform" name="platform" required>
+          <option value="auto" {% if submitted_platform == 'auto' %}selected{% endif %}>Auto-detect (recommended)</option>
+          {% for value in platforms %}
+            <option value="{{ value }}" {% if submitted_platform == value %}selected{% endif %}>{{ value|replace('_', ' ')|title }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="full checkbox-field">
+        <input id="confirm_district_identity" type="checkbox" name="confirm_district_identity" value="1" required>
+        <label for="confirm_district_identity">
+          I opened this public page and confirm that it belongs to
+          <strong>{{ district.agency_name }} ({{ district.state }})</strong>.
+        </label>
+      </div>
+      <div class="full field-note">Platform detection verifies the software and endpoint, but this confirmation prevents a valid page for another district from being activated here.</div>
+      <div class="form-actions full">
+        <button type="submit">Validate and Save Source</button>
+        <a class="button-link" href="{{ url_for('boards.sources', state=district.state) }}">Cancel</a>
+      </div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <h2>Source History</h2>
+    <p class="status-note">The active source is used for syncing. Earlier and unverified links remain here for auditing and correction.</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Use</th><th>Platform</th><th>Status</th><th>Confidence</th><th>Public source</th><th>Last checked</th><th>Message</th></tr></thead>
+        <tbody>
+          {% for row in history %}
+            <tr>
+              <td>{% if row.is_active %}<span class="status working">active</span>{% else %}<span class="status">history</span>{% endif %}</td>
+              <td>{{ row.platform|replace('_', ' ')|title }}</td>
+              <td><span class="status {{ row.source_status }}">{{ row.source_status }}</span></td>
+              <td>{{ "%.0f"|format(row.confidence or 0) }}%</td>
+              <td><a href="{{ row.source_url }}" target="_blank" rel="noopener">Open source</a><div class="source-url">{{ row.source_url }}</div></td>
+              <td>{{ row.last_checked_at|fmt_dt }}</td>
+              <td>{{ row.error_message or '' }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="7" class="empty">No board source has been saved for this district yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+{% endblock %}

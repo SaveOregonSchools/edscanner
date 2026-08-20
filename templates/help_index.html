@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{% block title %}Help - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading help-heading">
+    <div>
+      <p class="eyebrow">EdScanner guide</p>
+      <h2>Help Center</h2>
+      <p class="status-note">Choose a workflow or reference page. Start with Getting Started if this is your first district import.</p>
+    </div>
+  </section>
+
+  <section class="help-topic-grid" aria-label="Help topics">
+    {% for topic in topics %}
+      <article class="help-topic-card">
+        <h3><a href="{{ url_for('help_topic_page', slug=topic.slug) }}">{{ topic.title }}</a></h3>
+        <p>{{ topic.summary }}</p>
+        <a class="text-link" href="{{ url_for('help_topic_page', slug=topic.slug) }}">Read guide <span aria-hidden="true">&rarr;</span></a>
+      </article>
+    {% endfor %}
+  </section>
+{% endblock %}

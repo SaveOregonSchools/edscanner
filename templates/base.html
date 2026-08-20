@@ -13,17 +13,26 @@
         <a class="home-mark" href="{{ url_for('index') }}" aria-label="Home">E</a>
         <div>
           <h1>EdScanner</h1>
-          <p class="subtitle">Public school district website search</p>
+          <p class="subtitle">Public school district research and monitoring</p>
         </div>
       </div>
       <div class="header-actions">
         <nav class="nav-links" aria-label="Main navigation">
           <a href="{{ url_for('index') }}">Home</a>
-          <a href="{{ url_for('import_page') }}">Import</a>
-          <a href="{{ url_for('search_page') }}">Search</a>
-          <a href="{{ url_for('search_profiles_page') }}">Search Profiles</a>
-          <a href="{{ url_for('contracts_page') }}">Contracts</a>
-          <a href="{{ url_for('districts_page') }}">Districts</a>
+          <details class="nav-menu">
+            <summary>Help</summary>
+            <div class="nav-menu-panel">
+              <a href="{{ url_for('help_index') }}">Help Center</a>
+              <a href="{{ url_for('help_topic_page', slug='getting-started') }}">Getting Started</a>
+              <a href="{{ url_for('help_topic_page', slug='import-districts') }}">Importing Districts</a>
+              <a href="{{ url_for('help_topic_page', slug='search-profiles') }}">Search Profiles</a>
+              <a href="{{ url_for('help_topic_page', slug='search') }}">District Search</a>
+              <a href="{{ url_for('help_topic_page', slug='contracts') }}">Labor Agreements</a>
+              <a href="{{ url_for('help_topic_page', slug='school-boards') }}">School Boards</a>
+              <a href="{{ url_for('help_topic_page', slug='glossary') }}">Glossary</a>
+              <a href="{{ url_for('help_topic_page', slug='settings') }}">Settings</a>
+            </div>
+          </details>
           <a href="{{ url_for('settings_page') }}">Settings</a>
         </nav>
         <a class="brand-link" href="https://www.saveoregonschools.com/" target="_blank" rel="noopener" aria-label="Save Oregon Schools website">

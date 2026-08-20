@@ -25,8 +25,10 @@ from search_engine import (
     filename_title,
     load_robots,
     make_session,
+    parse_search_query,
     parse_html,
     parse_pdf,
+    query_variants_for_profile,
     score_match,
     same_organization_url,
 )
@@ -1696,6 +1698,7 @@ def search_with_district_profile(
     db_path: Path | str | None = None,
     use_browser_for_javascript: bool = False,
 ) -> list[dict[str, Any]]:
+    parsed_query = parse_search_query(query_text)
     district_id = int(district.get("id") or 0)
     base_url = prefer_https_url(district.get("website_normalized") or normalize_website(district.get("website"))[0])
     if not district_id or not base_url:
@@ -1707,90 +1710,121 @@ def search_with_district_profile(
         debug_log(debug_logger, "district_search_profile_loaded", district=district.get("agency_name"), status="missing")
         return []
 
-    search_url = build_search_url(profile["search_url_template"], query_text)
+    outbound_queries = query_variants_for_profile(parsed_query, profile)
     session = make_session(settings)
     robots, _sitemaps = load_robots(session, base_url, settings)
-    if not can_fetch(robots, settings, search_url):
-        debug_log(debug_logger, "district_search_request", district=district.get("agency_name"), url=search_url, allowed=False)
-        return []
     debug_log(
         debug_logger,
         "district_search_profile_loaded",
         district=district.get("agency_name"),
         profile_id=profile.get("id"),
         confidence=profile.get("confidence"),
+        provider=profile.get("provider_guess"),
+        original_query=query_text,
+        outbound_queries=outbound_queries,
     )
-    try:
-        debug_log(debug_logger, "district_search_request", district=district.get("agency_name"), url=search_url, allowed=True)
-        if profile.get("profile_status") == "requires_javascript":
-            if not use_browser_for_javascript and not settings.browser_for_javascript:
-                debug_log(debug_logger, "district_search_profile_failed", district=district.get("agency_name"), error="requires_javascript")
-                return []
-            final_url, html = browser_render_search_results_page(search_url, settings)
-            status_code = 200
-            debug_log(debug_logger, "district_search_browser_rendered", district=district.get("agency_name"), url=search_url, final_url=final_url)
-        else:
-            response, html = fetch_limited(session, search_url, settings)
-            final_url = response.url
-            status_code = response.status_code
-            if _looks_like_challenge_page(response.status_code, html, response.url):
-                debug_log(debug_logger, "district_search_profile_failed", district=district.get("agency_name"), error="blocked_by_challenge")
-                return []
-        if status_code >= 400:
+    if profile.get("profile_status") == "requires_javascript":
+        if not use_browser_for_javascript and not settings.browser_for_javascript:
+            debug_log(debug_logger, "district_search_profile_failed", district=district.get("agency_name"), error="requires_javascript")
+            return []
+
+    max_links = max(settings.max_results_per_district * 3, 10)
+    per_variant_links = max(3, max_links // max(1, len(outbound_queries)))
+    result_links_by_url: OrderedDict[str, dict[str, Any]] = OrderedDict()
+    for outbound_query in outbound_queries:
+        if cancel_requested and cancel_requested():
+            break
+        search_url = build_search_url(profile["search_url_template"], outbound_query)
+        if not can_fetch(robots, settings, search_url):
+            debug_log(debug_logger, "district_search_request", district=district.get("agency_name"), url=search_url, allowed=False)
+            continue
+        try:
+            debug_log(
+                debug_logger,
+                "district_search_request",
+                district=district.get("agency_name"),
+                url=search_url,
+                allowed=True,
+                outbound_query=outbound_query,
+            )
+            if profile.get("profile_status") == "requires_javascript":
+                final_url, html = browser_render_search_results_page(search_url, settings)
+                status_code = 200
+                debug_log(debug_logger, "district_search_browser_rendered", district=district.get("agency_name"), url=search_url, final_url=final_url)
+            else:
+                response, html = fetch_limited(session, search_url, settings)
+                final_url = response.url
+                status_code = response.status_code
+                if _looks_like_challenge_page(response.status_code, html, response.url):
+                    debug_log(debug_logger, "district_search_profile_failed", district=district.get("agency_name"), error="blocked_by_challenge")
+                    continue
+            if status_code >= 400:
+                debug_log(
+                    debug_logger,
+                    "district_search_result_page_fetched",
+                    district=district.get("agency_name"),
+                    url=search_url,
+                    status_code=status_code,
+                    matched=False,
+                )
+                continue
+            if _is_edlio_profile(profile):
+                variant_links = parse_edlio_search_results(
+                    html,
+                    base_url,
+                    search_url,
+                    max_links=per_variant_links,
+                )
+            else:
+                variant_links = parse_search_results_page(
+                    html,
+                    final_url,
+                    base_url,
+                    outbound_query,
+                    profile,
+                    max_links=per_variant_links,
+                )
+                if not variant_links:
+                    variant_links = parse_finalsite_algolia_search_results(
+                        html,
+                        base_url,
+                        outbound_query,
+                        session,
+                        settings,
+                        max_links=per_variant_links,
+                    )
+                    if variant_links:
+                        debug_log(
+                            debug_logger,
+                            "district_search_finalsite_algolia_results",
+                            district=district.get("agency_name"),
+                            result_links=len(variant_links),
+                        )
+            for item in variant_links:
+                result_links_by_url.setdefault(item["url"], item)
             debug_log(
                 debug_logger,
                 "district_search_result_page_fetched",
                 district=district.get("agency_name"),
-                url=search_url,
+                url=final_url,
                 status_code=status_code,
-                matched=False,
+                result_links=len(variant_links),
+                outbound_query=outbound_query,
             )
-            return []
-        max_links = max(settings.max_results_per_district * 3, 10)
-        if _is_edlio_profile(profile):
-            result_links = parse_edlio_search_results(
-                html,
-                base_url,
-                search_url,
-                max_links=max_links,
+        except Exception as exc:
+            LOGGER.info("District search profile request failed for %s: %s", district.get("agency_name"), exc)
+            debug_log(
+                debug_logger,
+                "district_search_profile_failed",
+                district=district.get("agency_name"),
+                outbound_query=outbound_query,
+                error=str(exc),
             )
-        else:
-            result_links = parse_search_results_page(
-                html,
-                final_url,
-                base_url,
-                query_text,
-                profile,
-                max_links=max_links,
-            )
-            if not result_links:
-                result_links = parse_finalsite_algolia_search_results(
-                    html,
-                    base_url,
-                    query_text,
-                    session,
-                    settings,
-                    max_links=max_links,
-                )
-                if result_links:
-                    debug_log(
-                        debug_logger,
-                        "district_search_finalsite_algolia_results",
-                        district=district.get("agency_name"),
-                        result_links=len(result_links),
-                    )
-        debug_log(
-            debug_logger,
-            "district_search_result_page_fetched",
-            district=district.get("agency_name"),
-            url=final_url,
-            status_code=status_code,
-            result_links=len(result_links),
-        )
-    except Exception as exc:
-        LOGGER.info("District search profile request failed for %s: %s", district.get("agency_name"), exc)
-        debug_log(debug_logger, "district_search_profile_failed", district=district.get("agency_name"), error=str(exc))
-        return []
+            continue
+
+    result_links = list(result_links_by_url.values())[:max_links]
+    for rank, item in enumerate(result_links, start=1):
+        item["rank"] = rank
 
     result_map: dict[str, dict[str, Any]] = {}
     for item in result_links:

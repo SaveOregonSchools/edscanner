@@ -1,0 +1,30 @@
+[
+  {
+    "CleanName": "Board of Directors - August 25, 2026",
+    "ExternalCalendar": false,
+    "FormattedMeetingDate": "25 Aug 2026",
+    "Id": 128,
+    "MeetingDate": "2026-08-25",
+    "MeetingDateTime": "2026-08-25 18:00",
+    "MeetingLocation": "Educational Service Center - Board Room",
+    "MeetingTime": "06:00 PM",
+    "MeetingTypeId": 10,
+    "MeetingTypeName": "Board of Directors",
+    "Name": "Board of Directors - August 25, 2026",
+    "Published": true,
+    "TypeId": 10,
+    "VideoIcon": "video"
+  },
+  {
+    "CleanName": "Work Session - September 08, 2026",
+    "Id": 129,
+    "MeetingDate": "2026-09-08",
+    "MeetingDateTime": "2026-09-08 17:00",
+    "MeetingLocation": "Conference Room",
+    "MeetingTime": "05:00 PM",
+    "MeetingTypeName": "Work Session",
+    "Name": "Work Session - September 08, 2026",
+    "Published": false,
+    "VideoIcon": ""
+  }
+]

@@ -1,0 +1,59 @@
+{
+  "@odata.context": "https://usbe.api.civicclerk.com/v1/$metadata#Meetings/$entity",
+  "id": 343,
+  "agendaPacketIsPublish": true,
+  "agendaIsPublish": true,
+  "items": [
+    {
+      "id": 11843,
+      "agendaObjectItemOutlineNumber": "1.",
+      "agendaObjectItemName": "Opening Business",
+      "agendaObjectItemDescription": "",
+      "parentId": -1,
+      "level": 0,
+      "sortOrder": 1,
+      "isSection": 1,
+      "childItems": [
+        {
+          "id": 11858,
+          "agendaObjectItemOutlineNumber": "1.1",
+          "agendaObjectItemName": "Pledge of Allegiance",
+          "agendaObjectItemDescription": "Student leaders will lead the pledge.",
+          "parentId": 11843,
+          "level": 1,
+          "sortOrder": 2,
+          "isSection": 0,
+          "childItems": [],
+          "attachmentsList": [
+            {
+              "id": 25442,
+              "agendaObjectItemId": 11858,
+              "fileName": "January 2026 Student Recognition",
+              "contentType": "application/pdf",
+              "fileSize": 295550,
+              "isPublished": true,
+              "isLink": false,
+              "mediaFileName": "January 2026 Student Recognition.pdf",
+              "sortOrder": 1
+            }
+          ]
+        }
+      ],
+      "attachmentsList": []
+    }
+  ],
+  "publishedFiles": [
+    {
+      "fileId": 2048,
+      "type": "Agenda",
+      "name": "Agenda",
+      "url": "https://usbe.api.civicclerk.com/v1/Meetings/GetMeetingFile(fileId=2048,plainText=false)"
+    },
+    {
+      "fileId": 2049,
+      "type": "Agenda Packet",
+      "name": "Public Packet",
+      "url": "https://usbe.api.civicclerk.com/v1/Meetings/GetMeetingFile(fileId=2049,plainText=false)"
+    }
+  ]
+}

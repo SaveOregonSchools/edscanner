@@ -18,6 +18,8 @@ db/backup/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/board_documents/
+data/board_snapshots/
 
 # Database schema dumps
 db/*.db.sql

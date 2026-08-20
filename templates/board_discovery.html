@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block title %}Discover Board Sources - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div><h2>Discover Board Sources</h2><p class="status-note">Follow district governance links and allowlisted public board-platform hosts.</p></div>
+    <div class="metric-inline"><span>Matching districts</span><strong>{{ matching_count|fmt_int }}</strong></div>
+  </section>
+  {% include "_board_nav.html" %}
+
+  <section class="guidance-card">
+    <h3>How discovery handles blocked or unreachable pages</h3>
+    <p>If an ordinary public request returns a likely access challenge, EdScanner can make one bounded retry with system Chrome when available, falling back to Playwright's regular bundled Chromium, and feed the rendered page back into normal link detection. The desktop browser identity stays aligned with the browser's installed major version, but this is not a stealth browser: a remaining Cloudflare/WAF page or CAPTCHA is recorded instead of being circumvented. Connection failures have a separate two-page browser budget, and an initial JavaScript shell with no usable links gets one render. Rate limits and robots denials never trigger these retries. If recovery still fails, use <a href="{{ url_for('boards.sources') }}">Board Sources</a> to add or correct the public source manually.</p>
+    <p>Discovery uses HTTPS only and IPv4 by default. An imported HTTP address is upgraded before it is requested. One validated initial website move—a server redirect or the browser's observed top-level destination during its bounded homepage load—is accepted as the new crawl base and recorded in the run ledger, including whether the browser exposed source attribution. A broken apex may try its public <code>www</code> sibling once, and a moved URL that ends at a stale 404 path may try the new HTTPS origin once. Later arbitrary cross-site redirects remain blocked; a district wrapper may contribute one canonical known-provider target for adapter validation, never automatic trust. Known platforms must yield a canonical vendor URL and organization/tenant/site ID; one-off news, event, policy, media, and resource-manager pages cannot become working sources.</p>
+    <p>If you explicitly enable the Brave fallback below, each selected district gets one query through Brave's official Search API as independent evidence alongside the normal crawl. Search results never activate on ranking alone: EdScanner still validates the canonical provider and requires district identity evidence. This can resolve a public source even when an overzealous WAF blocks the district homepage or the site still links an obsolete provider, while avoiding proxy or fingerprint rotation.</p>
+    <p><strong>Provider-directory matching is {{ 'enabled' if provider_directory_enabled else 'disabled' }}.</strong> {{ provider_directory_warning }} {% if not provider_directory_enabled %}After confirming permission, set <code>EDSCANNER_BOARD_PROVIDER_DIRECTORY_ENABLED=true</code> and restart EdScanner to enable it.{% endif %} When authorized and enabled, BoardBook names are only candidate leads; EdScanner requires state evidence plus a unique reciprocal NCES name-and-city match (or district-homepage evidence) and rejects ambiguous matches. See the <a href="https://www.boardbook.org/boardbook-terms-and-conditions-of-use" target="_blank" rel="noopener">current BoardBook terms</a> before enabling it.</p>
+  </section>
+
+  <section class="tool-surface">
+    <form method="post" class="search-form">
+      <div><label for="states">States</label><select id="states" name="states" multiple size="8">{% for value in options.states %}<option value="{{ value }}" {% if value in selected_states %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+      <div><label for="agency_types">Agency types</label><select id="agency_types" name="agency_types" multiple size="8">{% for value in options.agency_types %}<option value="{{ value }}" {% if value in selected_agency_types %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+      <div><label for="status_filter">Current source status</label><select id="status_filter" name="status_filter"><option value="">Any status</option><option value="__unchecked__" {% if status_filter == '__unchecked__' %}selected{% endif %}>Not yet checked</option>{% for value in source_statuses %}<option value="{{ value }}" {% if status_filter == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+      <div><label for="platform_filter">Current platform</label><select id="platform_filter" name="platform_filter"><option value="">Any platform</option>{% for value in platforms %}<option value="{{ value }}" {% if platform_filter == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select></div>
+      <div><label for="min_enrollment">Min enrollment</label><input id="min_enrollment" name="min_enrollment" type="number" value="{{ min_enrollment or '' }}"></div>
+      <div><label for="max_enrollment">Max enrollment</label><input id="max_enrollment" name="max_enrollment" type="number" value="{{ max_enrollment or '' }}"></div>
+      <div><label for="max_districts">Maximum districts</label><input id="max_districts" name="max_districts" type="number" min="1" max="1000" value="{{ max_districts }}"></div>
+      <div><label for="max_workers">District workers</label><input id="max_workers" name="max_workers" type="number" min="1" max="8" value="{{ max_workers }}"><p class="field-note">Vendor requests are also limited per host.</p></div>
+      <div>
+        <label for="force">Discovery scope</label>
+        <select id="force" name="force">
+          <option value="0" {% if not force %}selected{% endif %}>Default — districts not yet checked</option>
+          <option value="1" {% if force %}selected{% endif %}>Rediscover — include districts with saved sources</option>
+        </select>
+        <p class="field-note">Default scope selects districts with no saved source. Choosing a specific source status instead selects districts with that saved status. Rediscover treats “Not yet checked” as “Any status” and reruns discovery from each selected district's public website; a specific status or platform narrows that rediscovery. A platform filter requires saved-source records, so combine it with Rediscover or a specific status.</p>
+      </div>
+      <div class="checkbox-field"><input id="debug_logging" name="debug_logging" type="checkbox" value="1" {% if debug_logging %}checked{% endif %}><label for="debug_logging">Capture debug log</label></div>
+      <div class="checkbox-field"><input id="search_fallback" name="search_fallback" type="checkbox" value="1" {% if search_fallback %}checked{% endif %} {% if not brave_search_available %}disabled{% endif %}><label for="search_fallback">Use Brave Search as additional source evidence</label><p class="field-note">{% if brave_search_available %}Makes at most one official API query for each selected district—up to the Maximum districts value. The choice is saved with the run.{% else %}Save a Brave Search API key in Settings to enable this option.{% endif %}</p></div>
+      <div class="form-actions full"><button type="submit">Queue source discovery</button></div>
+    </form>
+  </section>
+
+  <section class="content-section">
+    <h2>Recent Discovery Runs</h2>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Run</th><th>Status</th><th>Matched</th><th>Planned</th><th>Processed</th><th>Working</th><th>Not found</th><th>Review / blocked</th><th>Failed</th><th>Queued</th></tr></thead>
+      <tbody>{% for run in recent_runs %}<tr><td><a href="{{ url_for('boards.discovery_run_detail', run_id=run.id) }}">#{{ run.id }}</a></td><td><span class="status {{ run.status }}">{{ run.status }}</span></td><td>{{ run.districts_matched|fmt_int }}</td><td>{{ run.districts_planned|fmt_int }}</td><td>{{ run.districts_processed|fmt_int }}</td><td>{{ run.sources_working|fmt_int }}</td><td>{{ run.sources_not_found|fmt_int }}</td><td>{{ run.sources_manual_review|fmt_int }}</td><td>{{ run.sources_failed|fmt_int }}</td><td>{{ run.queued_at|fmt_dt }}</td></tr>{% else %}<tr><td colspan="10" class="empty">No discovery runs yet.</td></tr>{% endfor %}</tbody>
+    </table></div>
+  </section>
+{% endblock %}
