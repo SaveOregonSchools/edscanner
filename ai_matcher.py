@@ -85,10 +85,12 @@ def test_ollama_endpoints(
     """Query each configured server without sending document content."""
 
     results: list[dict[str, Any]] = []
+    api_key = get_local_setting(LLM_API_KEY_ENV).strip()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     for base_url in endpoints if endpoints is not None else get_ollama_endpoints():
         endpoint = f"{base_url.rstrip('/')}/api/tags"
         try:
-            response = requests.get(endpoint, timeout=timeout_seconds)
+            response = requests.get(endpoint, headers=headers, timeout=timeout_seconds)
             response.raise_for_status()
             body = response.json()
             models = [

@@ -8,7 +8,11 @@ The current version imports NCES/ELSI district exports into SQLite, provides
 dashboard and district-browsing views, queues website searches in a background
 worker, and supports both conservative same-domain crawling and optional Brave
 Search API-assisted discovery. It can also discover and reuse district website
-built-in search profiles to reduce dependence on third-party search APIs. A
+built-in search profiles to reduce dependence on third-party search APIs. An
+additional Guided District Search workflow turns a plain-language goal into a
+reviewable, bounded plan using the configured local Ollama model, then coordinates
+ordinary profile-discovery and website-search runs without replacing their manual
+interfaces. A
 labor-agreement discovery workflow finds and keeps separate contract packages
 for each district bargaining unit. A School Boards module discovers public
 meeting portals, incrementally collects structured agendas and documents,
@@ -88,6 +92,8 @@ HTTP.
 - Import Districts: retrieve and load district source files from `imports\`.
 - Search Profiles: discover and inspect district built-in search profiles.
 - Search Websites: configure filters and run simple or advanced website queries.
+- Guided District Search: describe a research goal, review a schema-validated
+  local-AI plan, and monitor its bounded child profile/search runs and evidence.
 - Labor Agreements: discover licensed, classified, substitute, administrator,
   transportation, service, and other bargaining-unit agreement packages.
 - School Boards: discover public meeting sources, run incremental or historical
@@ -115,6 +121,59 @@ key is saved and a short masked value. The `.env` file is ignored by Git and is
 loaded at app startup.
 
 Brave-backed search modes require a saved key. Crawler-only mode does not.
+
+The same page configures ordered native Ollama server roots, an optional bearer
+token, and the model name used by AI-assisted workflows. For a fresh Guided Search
+setup, `qwen3.5:9b` is the recommended starting model. This is a display hint only:
+EdScanner does not overwrite an existing model, and other configured models such
+as `gemma4:12b` remain supported.
+
+## Guided District Search
+
+Guided District Search is a separate workflow for users who know what evidence
+they want but do not want to choose Boolean syntax, profile policy, retrieval
+method, worker count, or refinement queries themselves. It requires the configured
+local Ollama server; ordinary Search Websites and Search Profiles continue to work
+without it and retain all of their existing controls.
+
+The wizard collects the original goal verbatim, an imported-district scope, an
+optional text example and public example URL, and a Fast/Balanced/Thorough
+preference. Scope options and counts come from the local database. Example URLs
+are restricted to bounded public HTTP(S) content, with DNS and every redirect
+validated against private/local targets. Retrieved text is explicitly treated as
+untrusted evidence, never as instructions.
+
+Ollama returns a strict structured plan. EdScanner validates every field, enum,
+search method, budget, and generated query with its normal parser; malformed output
+gets one repair attempt and then moves to manual review. The review page shows the
+exact district count, profile coverage, proposed queries, method, resource limits,
+round limits, and an approximate Brave-use estimate before substantive search
+begins. Brave remains off for each session unless a configured user explicitly
+allows it, and an estimate is informational rather than a billing guarantee.
+
+After approval, EdScanner freezes one exact district cohort. When the plan calls
+for it, missing or stale search profiles are discovered first for that cohort.
+Every query then runs as an ordinary linked `search_run`, so its raw results,
+debug log, CSV export, and normal detail page remain available. Guided Search
+deduplicates canonical evidence across rounds while preserving every child result
+as provenance. Deterministic limits—not the model—decide whether another round is
+permitted.
+
+Guided runs use a bounded dispatcher and a deterministic adaptive controller.
+CPU and memory telemetry, backlog, errors, timeouts, and rate limits can reduce
+concurrency or add delay; sustained healthy conditions can cautiously add a worker.
+`Retry-After` is honored, adjustments use cooldowns and hard bounds, and optional
+GPU telemetry never becomes a requirement. Manual searches retain their fixed
+worker and delay settings.
+
+Sessions, stages, exact cohorts, child links, model-call metadata, resource events,
+evidence, and provenance are persisted in SQLite. Restart recovery retries only
+unfinished district items and preserves completed results. The Guided detail page
+provides cancellation, a concise activity timeline, AI checkpoints, child-run
+links, retry/continue/manual-query controls, and an evidence-grounded summary.
+Relevance and completeness remain heuristic: failure to find a page does not prove
+that a district lacks the requested material, and there is no automatic cloud-AI
+fallback.
 
 ## Search
 
@@ -464,26 +523,29 @@ threshold (180 days by default). The expired-contract option overrides that age
 rule when a bargaining unit has an expired agreement and no newer current
 agreement. A force-rescan option bypasses all prior-scan checks.
 
-### Optional Local AI Classification
+### Optional Local AI Workflows
 
-Contract discovery works without AI. To add a second classification pass,
-configure one or more native Ollama servers on the Settings page. Servers are
+Contract discovery works without AI. To add a second classification pass, or to
+use Guided District Search, configure one or more native Ollama servers on the
+Settings page. Servers are
 tried in order, so a Tailscale address can be primary with a LAN address as a
 fallback:
 
 ```text
 EDSCANNER_OLLAMA_ENDPOINTS='["http://server-name:11434","http://192.168.1.10:11434"]'
-EDSCANNER_OLLAMA_MODEL="gemma4:12b"
+EDSCANNER_OLLAMA_MODEL="qwen3.5:9b"
 EDSCANNER_LLM_API_KEY="optional"
 ```
 
-Enable `Use local AI classification` for an individual run. EdScanner sends a
+`gemma4:12b` and other configured Ollama models remain supported. Enable `Use
+local AI classification` for an individual contract run. EdScanner sends a
 bounded candidate excerpt, link context, title, and URL and requests structured
 JSON describing the bargaining unit, union, document role, and effective dates.
 EdScanner calls Ollama's native `/api/chat` API. If a server is unavailable or
 returns invalid output, the next configured server is tried. If all servers fail,
-deterministic results are retained. The bounded excerpt is sent only when local AI
-classification is enabled for a run.
+deterministic contract results are retained; a Guided Search session preserves
+completed work and moves to manual review. The bounded excerpt is sent only when
+local AI classification is enabled for a run.
 
 ## Debug Logs
 
@@ -496,6 +558,11 @@ logs\search_runs\
 Debug logs include run settings, Brave API requests and returned results, page
 fetches, skipped URLs, matches, errors, stored result counts, and cancellation
 events. When a debug log exists, the run detail page shows a `Debug log` link.
+
+Guided sessions write orchestration, model-call outcome, resource-adjustment,
+stop-condition, cancellation, and completion events under
+`logs\guided_search_sessions\`. The Guided detail page links its log without
+recording bearer tokens, API keys, full prompts, or hidden model reasoning.
 
 ## Exports
 
@@ -679,7 +746,7 @@ logs\edscanner.log
 Run compile checks:
 
 ```powershell
-.\.venv\Scripts\python -m compileall -q app.py common.py import_districts.py search_engine.py site_search_discovery.py discover_search_profiles.py contract_discovery.py ai_matcher.py board board_probe.py
+.\.venv\Scripts\python -m compileall -q app.py common.py import_districts.py search_engine.py site_search_discovery.py discover_search_profiles.py profile_runs.py run_workers.py contract_discovery.py ai_matcher.py guided_search board board_probe.py
 ```
 
 Run unit tests:
@@ -696,9 +763,24 @@ platform detectors/parsers plus source discovery boundaries, BoardBook
 normalization, persistence, revision history, document extraction, FTS, sync
 idempotency, cancellation, scheduler calculation/claims/concurrency, and Flask
 routes. Advanced-query tests cover parsing, provider translation, local matching,
-and safe syntax errors. Home, Help, and Import route tests cover the module
-launcher and NCES workflow. Live websites are never required by the ordinary
-test suite.
+and safe syntax errors. Guided Search tests cover strict AI schemas and repair,
+SSRF-safe example retrieval, profile-first exact cohorts, bounded orchestration,
+adaptive resources, restart ledgers, cancellation, evidence provenance, and Flask
+routes with fake clients. Home, Help, and Import route tests cover the module
+launcher and NCES workflow. Live websites and live Ollama servers are never
+required by the ordinary test suite.
+
+To compare live configured Ollama models manually, run the checked-in synthetic
+planning harness outside the unit suite:
+
+```powershell
+.\.venv\Scripts\python -m guided_search.eval_harness --model qwen3.5:9b
+.\.venv\Scripts\python -m guided_search.eval_harness --model gemma4:12b
+```
+
+It reports first-response schema validity, repairs, validated queries, controlled
+plan choices, and latency as JSON. It does not search districts or run during
+normal automated tests.
 
 ## License
 
@@ -716,6 +798,8 @@ project's trademark and branding notice.
 ## Current Limitations
 
 - Searches depend on the local Flask worker process staying open.
+- Guided District Search requires a configured reachable local Ollama model; AI
+  outage pauses the persisted session for manual review rather than using cloud AI.
 - Search profile discovery batches launched from the web UI are capped and run
   through the local Flask worker process.
 - Search operators are intentionally uppercase; lowercase words such as `and`
@@ -741,7 +825,6 @@ project's trademark and branding notice.
 
 - persistent district website indexing
 - scheduled re-crawls
-- AI-assisted match classification
 - semantic search
 - richer PDF-first search workflows
 - saved board-record watchlists and change notifications

@@ -7,7 +7,6 @@ import queue
 import re
 import secrets
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 from datetime import date, datetime
 from pathlib import Path
@@ -62,9 +61,7 @@ from ai_matcher import (
 from import_districts import ImportErrorWithContext, import_districts
 from help_content import NCES_TABLE_URL, help_topic as get_help_topic, help_topic_list
 from search_engine import (
-    RunDebugLogger,
     SearchSettings,
-    debug_log,
     count_matching_districts,
     create_search_run,
     execute_search_run,
@@ -73,8 +70,37 @@ from search_engine import (
     parse_optional_int,
     parse_search_query,
 )
+from profile_runs import (
+    PROFILE_DISCOVERY_MAX_DISTRICTS,
+    PROFILE_STATUSES,
+    add_profile_status_filter_sql,
+    create_profile_discovery_run,
+    district_search_coverage,
+    execute_profile_discovery_run,
+    is_profile_discovery_cancel_requested,
+    list_profile_filtered_districts,
+    count_profile_filtered_districts,
+    profile_status_filter_from_value,
+    profile_status_filter_to_json,
+)
+from run_workers import (
+    PROFILE_DISCOVERY_QUEUE,
+    SEARCH_QUEUE,
+    enqueue_profile_discovery_run,
+    enqueue_search_run,
+    profile_discovery_worker,
+    register_search_resource_controller_factory,
+    search_worker,
+    start_profile_discovery_worker,
+    start_search_worker,
+)
 from board.web import bp as board_blueprint, start_board_worker
 from board.storage import audit_legacy_working_board_sources
+from guided_search.web import bp as guided_search_blueprint
+from guided_search.worker import (
+    resource_controller_for_search_run,
+    start_guided_search_worker,
+)
 
 
 configure_logging()
@@ -83,6 +109,8 @@ init_db()
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("EDSCANNER_SECRET_KEY") or secrets.token_hex(32)
 app.register_blueprint(board_blueprint)
+app.register_blueprint(guided_search_blueprint)
+register_search_resource_controller_factory(resource_controller_for_search_run)
 LOGGER = logging.getLogger(__name__)
 try:
     _board_source_audit = audit_legacy_working_board_sources()
@@ -96,26 +124,8 @@ else:
             len(_board_source_audit["repaired_ids"]),
             len(_board_source_audit["review_required"]),
         )
-SEARCH_QUEUE: queue.Queue[int] = queue.Queue()
-PROFILE_DISCOVERY_QUEUE: queue.Queue[int] = queue.Queue()
 CONTRACT_DISCOVERY_QUEUE: queue.Queue[int] = queue.Queue()
-WORKER_STARTED = False
-PROFILE_DISCOVERY_WORKER_STARTED = False
 CONTRACT_DISCOVERY_WORKER_STARTED = False
-
-
-PROFILE_STATUSES = [
-    "working",
-    "no_search_found",
-    "manual_review",
-    "search_found_but_failed",
-    "requires_javascript",
-    "blocked_by_challenge",
-    "blocked_by_robots",
-    "external_search_only",
-    "error",
-]
-PROFILE_DISCOVERY_MAX_DISTRICTS = 1000
 
 
 def selected_values(name: str) -> list[str]:
@@ -133,43 +143,6 @@ def selected_profile_statuses() -> list[str]:
         if value in allowed and value not in out:
             out.append(value)
     return out
-
-
-def profile_status_filter_to_json(statuses: list[str]) -> str:
-    return json.dumps(statuses)
-
-
-def profile_status_filter_from_value(value: str | None) -> list[str]:
-    text = str(value or "").strip()
-    if not text:
-        return []
-    try:
-        parsed = json.loads(text)
-    except Exception:
-        parsed = text
-    if isinstance(parsed, list):
-        values = [str(item) for item in parsed]
-    else:
-        values = [str(parsed)]
-    allowed = {*PROFILE_STATUSES, "__never__"}
-    return [value for value in values if value in allowed]
-
-
-def add_profile_status_filter_sql(
-    clauses: list[str],
-    params: list[Any],
-    profile_statuses: list[str],
-) -> None:
-    statuses = [status for status in profile_statuses if status != "__never__"]
-    include_never = "__never__" in profile_statuses
-    parts: list[str] = []
-    if include_never:
-        parts.append("p.id IS NULL")
-    if statuses:
-        parts.append(f"p.profile_status IN ({','.join('?' for _ in statuses)})")
-        params.extend(statuses)
-    if parts:
-        clauses.append("(" + " OR ".join(parts) + ")")
 
 
 def clamp_int(value: int | None, default: int, minimum: int, maximum: int) -> int:
@@ -278,433 +251,15 @@ def highlight(text: str | None, query_text: str | None) -> Markup:
     return Markup("").join(parts)
 
 
-def district_search_coverage(
-    states: list[str] | None = None,
-    agency_types: list[str] | None = None,
-    min_enrollment: int | None = None,
-    max_enrollment: int | None = None,
-) -> dict[str, int]:
-    clauses: list[str] = ["d.has_searchable_website = 1"]
-    params: list[Any] = []
-    states = [value for value in states or [] if value]
-    agency_types = [value for value in agency_types or [] if value]
-    if states:
-        clauses.append(f"d.state IN ({','.join('?' for _ in states)})")
-        params.extend(states)
-    if agency_types:
-        clauses.append(f"d.agency_type IN ({','.join('?' for _ in agency_types)})")
-        params.extend(agency_types)
-    if min_enrollment is not None:
-        clauses.append("d.total_enrollment_excludes_ae >= ?")
-        params.append(min_enrollment)
-    if max_enrollment is not None:
-        clauses.append("d.total_enrollment_excludes_ae <= ?")
-        params.append(max_enrollment)
-    where_sql = " WHERE " + " AND ".join(clauses)
-    with connect_db() as conn:
-        row = conn.execute(
-            f"""
-            SELECT
-                COUNT(*) AS matching_count,
-                SUM(CASE WHEN p.profile_status = 'working' THEN 1 ELSE 0 END) AS working_count,
-                SUM(CASE WHEN p.profile_status = 'requires_javascript' THEN 1 ELSE 0 END) AS javascript_count,
-                SUM(CASE WHEN p.id IS NULL THEN 1 ELSE 0 END) AS missing_count
-            FROM districts d
-            LEFT JOIN (
-                SELECT p1.*
-                FROM district_search_profiles p1
-                JOIN (
-                    SELECT district_id, MAX(id) AS id
-                    FROM district_search_profiles
-                    GROUP BY district_id
-                ) latest ON latest.id = p1.id
-            ) p ON p.district_id = d.id
-            {where_sql}
-            """,
-            params,
-        ).fetchone()
-    return {
-        "matching_count": int(row["matching_count"] or 0),
-        "working_count": int(row["working_count"] or 0),
-        "javascript_count": int(row["javascript_count"] or 0),
-        "missing_count": int(row["missing_count"] or 0),
-    }
-
-
-def list_profile_filtered_districts(
-    states: list[str],
-    agency_types: list[str],
-    min_enrollment: int | None,
-    max_enrollment: int | None,
-    profile_statuses: list[str],
-    provider_guess: str,
-    limit: int,
-) -> list[dict[str, Any]]:
-    clauses: list[str] = ["d.has_searchable_website = 1"]
-    params: list[Any] = []
-    if states:
-        clauses.append(f"d.state IN ({','.join('?' for _ in states)})")
-        params.extend(states)
-    if agency_types:
-        clauses.append(f"d.agency_type IN ({','.join('?' for _ in agency_types)})")
-        params.extend(agency_types)
-    if min_enrollment is not None:
-        clauses.append("d.total_enrollment_excludes_ae >= ?")
-        params.append(min_enrollment)
-    if max_enrollment is not None:
-        clauses.append("d.total_enrollment_excludes_ae <= ?")
-        params.append(max_enrollment)
-    add_profile_status_filter_sql(clauses, params, profile_statuses)
-    if provider_guess:
-        clauses.append("p.provider_guess = ?")
-        params.append(provider_guess)
-    where_sql = " WHERE " + " AND ".join(clauses)
-    with connect_db() as conn:
-        rows = conn.execute(
-            f"""
-            SELECT d.*
-            FROM districts d
-            LEFT JOIN (
-                SELECT p1.*
-                FROM district_search_profiles p1
-                JOIN (
-                    SELECT district_id, MAX(id) AS id
-                    FROM district_search_profiles
-                    GROUP BY district_id
-                ) latest ON latest.id = p1.id
-            ) p ON p.district_id = d.id
-            {where_sql}
-            ORDER BY d.state, d.agency_name
-            LIMIT ?
-            """,
-            [*params, limit],
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def count_profile_filtered_districts(
-    states: list[str],
-    agency_types: list[str],
-    min_enrollment: int | None,
-    max_enrollment: int | None,
-    profile_statuses: list[str],
-    provider_guess: str,
-) -> int:
-    return len(
-        list_profile_filtered_districts(
-            states,
-            agency_types,
-            min_enrollment,
-            max_enrollment,
-            profile_statuses,
-            provider_guess,
-            MAX_TOTAL_DISTRICTS_PER_RUN * 1000,
-        )
-    )
-
-
-def create_profile_discovery_run(
-    states: list[str],
-    agency_types: list[str],
-    min_enrollment: int | None,
-    max_enrollment: int | None,
-    profile_statuses: list[str],
-    provider_guess: str,
-    max_districts: int,
-    max_workers: int,
-    test_query: str,
-    force: bool,
-) -> int:
-    matched_count = count_profile_filtered_districts(
-        states,
-        agency_types,
-        min_enrollment,
-        max_enrollment,
-        profile_statuses,
-        provider_guess,
-    )
-    planned_count = min(matched_count, max_districts)
-    now = utc_now_iso()
-    with connect_db() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO profile_discovery_runs (
-                states_json, agency_types_json, min_enrollment, max_enrollment,
-                profile_status_filter, provider_guess_filter, max_districts,
-                max_workers, test_query, force, cancel_requested, status, districts_matched,
-                districts_planned, districts_processed, profiles_working,
-                profiles_failed, profiles_manual_review, profiles_requires_javascript, started_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'queued', ?, ?, 0, 0, 0, 0, 0, ?)
-            """,
-            (
-                json.dumps(states),
-                json.dumps(agency_types),
-                min_enrollment,
-                max_enrollment,
-                profile_status_filter_to_json(profile_statuses),
-                provider_guess,
-                max_districts,
-                max_workers,
-                test_query,
-                1 if force else 0,
-                matched_count,
-                planned_count,
-                now,
-            ),
-        )
-        run_id = int(cursor.lastrowid)
-        conn.commit()
-    return run_id
-
-
-def is_profile_discovery_cancel_requested(run_id: int) -> bool:
-    with connect_db() as conn:
-        row = conn.execute(
-            "SELECT cancel_requested FROM profile_discovery_runs WHERE id = ?",
-            (run_id,),
-        ).fetchone()
-    return bool(row and row["cancel_requested"])
-
-
-def execute_profile_discovery_run(run_id: int) -> None:
-    from site_search_discovery import discover_district_search_profile
-
-    with connect_db() as conn:
-        run = conn.execute("SELECT * FROM profile_discovery_runs WHERE id = ?", (run_id,)).fetchone()
-    if run is None:
-        raise ValueError(f"Profile discovery run not found: {run_id}")
-
-    states = json.loads(run["states_json"] or "[]")
-    agency_types = json.loads(run["agency_types_json"] or "[]")
-    max_districts = int(run["max_districts"] or 1)
-    districts = list_profile_filtered_districts(
-        states,
-        agency_types,
-        run["min_enrollment"],
-        run["max_enrollment"],
-        profile_status_filter_from_value(run["profile_status_filter"]),
-        run["provider_guess_filter"] or "",
-        max_districts,
-    )
-
-    processed = 0
-    working = 0
-    failed = 0
-    manual_review = 0
-    requires_javascript = 0
-    cancelled = False
-    settings = SearchSettings(max_pages_per_district=10)
-    max_workers = clamp_int(run["max_workers"], PROFILE_DISCOVERY_WORKERS, 1, 8)
-    debug_path = PROFILE_DISCOVERY_RUN_LOGS_DIR / f"profile-discovery-run-{run_id}.log"
-    debug_logger = RunDebugLogger(debug_path)
-    counter_lock = threading.Lock()
-
-    def update_run_progress() -> None:
-        with connect_db() as conn:
-            conn.execute(
-                """
-                UPDATE profile_discovery_runs
-                SET districts_processed = ?,
-                    profiles_working = ?,
-                    profiles_failed = ?,
-                    profiles_manual_review = ?,
-                    profiles_requires_javascript = ?
-                WHERE id = ?
-                """,
-                (processed, working, failed, manual_review, requires_javascript, run_id),
-            )
-            conn.commit()
-
-    def discover_one(district: dict[str, Any]) -> tuple[str, str]:
-        profile = discover_district_search_profile(
-            district,
-            test_query=run["test_query"] or "calendar",
-            settings=settings,
-            force=bool(run["force"]),
-            debug_logger=debug_logger,
-        )
-        return profile.get("profile_status") or "error", profile.get("provider_guess") or ""
-
-    try:
-        with connect_db() as conn:
-            conn.execute(
-                """
-                UPDATE profile_discovery_runs
-                SET status = 'running',
-                    districts_planned = ?,
-                    max_workers = ?,
-                    debug_log_path = ?,
-                    districts_processed = 0,
-                    profiles_working = 0,
-                    profiles_failed = 0,
-                    profiles_manual_review = 0,
-                    profiles_requires_javascript = 0,
-                    finished_at = NULL,
-                    error_message = NULL
-                WHERE id = ?
-                """,
-                (len(districts), max_workers, str(debug_path), run_id),
-            )
-            conn.commit()
-        debug_log(
-            debug_logger,
-            "profile_discovery_run_start",
-            run_id=run_id,
-            district_count=len(districts),
-            max_workers=max_workers,
-            test_query=run["test_query"] or "calendar",
-            force=bool(run["force"]),
-        )
-
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ProfileDiscovery") as executor:
-            future_to_district = {
-                executor.submit(discover_one, district): district
-                for district in districts
-                if not is_profile_discovery_cancel_requested(run_id)
-            }
-            for future in as_completed(future_to_district):
-                district = future_to_district[future]
-                if is_profile_discovery_cancel_requested(run_id):
-                    cancelled = True
-                    for pending in future_to_district:
-                        pending.cancel()
-                    break
-                try:
-                    status, provider_guess = future.result()
-                    debug_log(
-                        debug_logger,
-                        "profile_discovery_district_finish",
-                        run_id=run_id,
-                        district=district.get("agency_name"),
-                        status=status,
-                        provider_guess=provider_guess,
-                    )
-                except Exception as exc:
-                    status = "error"
-                    LOGGER.exception("Profile discovery failed for %s: %s", district.get("agency_name"), exc)
-                    debug_log(
-                        debug_logger,
-                        "profile_discovery_district_error",
-                        run_id=run_id,
-                        district=district.get("agency_name"),
-                        error=str(exc),
-                    )
-                with counter_lock:
-                    processed += 1
-                    if status == "working":
-                        working += 1
-                    elif status == "manual_review":
-                        manual_review += 1
-                    elif status == "requires_javascript":
-                        requires_javascript += 1
-                    else:
-                        failed += 1
-                    update_run_progress()
-
-        if is_profile_discovery_cancel_requested(run_id):
-            cancelled = True
-
-        final_status = "cancelled" if cancelled else "completed"
-        error_message = "Cancelled by user." if cancelled else None
-        with connect_db() as conn:
-            conn.execute(
-                """
-                UPDATE profile_discovery_runs
-                SET status = ?,
-                    districts_processed = ?,
-                    profiles_working = ?,
-                    profiles_failed = ?,
-                    profiles_manual_review = ?,
-                    profiles_requires_javascript = ?,
-                    finished_at = ?,
-                    error_message = ?
-                WHERE id = ?
-                """,
-                (final_status, processed, working, failed, manual_review, requires_javascript, utc_now_iso(), error_message, run_id),
-            )
-            conn.commit()
-        debug_log(
-            debug_logger,
-            "profile_discovery_run_finish",
-            run_id=run_id,
-            status=final_status,
-            processed=processed,
-            working=working,
-            failed=failed,
-            manual_review=manual_review,
-            requires_javascript=requires_javascript,
-        )
-    except Exception as exc:
-        with connect_db() as conn:
-            conn.execute(
-                """
-                UPDATE profile_discovery_runs
-                SET status = 'failed',
-                    districts_processed = ?,
-                    profiles_working = ?,
-                    profiles_failed = ?,
-                    profiles_manual_review = ?,
-                    profiles_requires_javascript = ?,
-                    finished_at = ?,
-                    error_message = ?
-                WHERE id = ?
-                """,
-                (processed, working, failed, manual_review, requires_javascript, utc_now_iso(), str(exc), run_id),
-            )
-            conn.commit()
-        raise
-
-
 app.jinja_env.filters["fmt_int"] = fmt_int
 app.jinja_env.filters["fmt_dt"] = fmt_dt
 app.jinja_env.filters["fmt_profile_status_filter"] = fmt_profile_status_filter
 app.jinja_env.filters["highlight"] = highlight
 
 
-def enqueue_search_run(run_id: int) -> None:
-    SEARCH_QUEUE.put(run_id)
-    LOGGER.info("Queued search run %s", run_id)
-
-
-def enqueue_profile_discovery_run(run_id: int) -> None:
-    PROFILE_DISCOVERY_QUEUE.put(run_id)
-    LOGGER.info("Queued profile discovery run %s", run_id)
-
-
 def enqueue_contract_discovery_run(run_id: int) -> None:
     CONTRACT_DISCOVERY_QUEUE.put(run_id)
     LOGGER.info("Queued contract discovery run %s", run_id)
-
-
-def search_worker() -> None:
-    while True:
-        run_id = SEARCH_QUEUE.get()
-        try:
-            with connect_db() as conn:
-                run = conn.execute("SELECT status FROM search_runs WHERE id = ?", (run_id,)).fetchone()
-            if run is None or run["status"] not in {"queued", "running"}:
-                continue
-            execute_search_run(run_id)
-        except Exception:
-            LOGGER.exception("Queued search run %s failed", run_id)
-        finally:
-            SEARCH_QUEUE.task_done()
-
-
-def profile_discovery_worker() -> None:
-    while True:
-        run_id = PROFILE_DISCOVERY_QUEUE.get()
-        try:
-            with connect_db() as conn:
-                run = conn.execute("SELECT status FROM profile_discovery_runs WHERE id = ?", (run_id,)).fetchone()
-            if run is None or run["status"] not in {"queued", "running"}:
-                continue
-            execute_profile_discovery_run(run_id)
-        except Exception:
-            LOGGER.exception("Queued profile discovery run %s failed", run_id)
-        finally:
-            PROFILE_DISCOVERY_QUEUE.task_done()
 
 
 def contract_discovery_worker() -> None:
@@ -720,60 +275,6 @@ def contract_discovery_worker() -> None:
             LOGGER.exception("Queued contract discovery run %s failed", run_id)
         finally:
             CONTRACT_DISCOVERY_QUEUE.task_done()
-
-
-def start_search_worker() -> None:
-    global WORKER_STARTED
-    if WORKER_STARTED:
-        return
-    with connect_db() as conn:
-        conn.execute(
-            """
-            UPDATE search_runs
-            SET status = 'queued',
-                error_message = 'Run was queued again after app restart.'
-            WHERE status = 'running'
-            """
-        )
-        queued_ids = [
-            row["id"]
-            for row in conn.execute(
-                "SELECT id FROM search_runs WHERE status = 'queued' ORDER BY id"
-            )
-        ]
-        conn.commit()
-    thread = threading.Thread(target=search_worker, name="EdScannerSearchWorker", daemon=True)
-    thread.start()
-    WORKER_STARTED = True
-    for run_id in queued_ids:
-        enqueue_search_run(run_id)
-
-
-def start_profile_discovery_worker() -> None:
-    global PROFILE_DISCOVERY_WORKER_STARTED
-    if PROFILE_DISCOVERY_WORKER_STARTED:
-        return
-    with connect_db() as conn:
-        conn.execute(
-            """
-            UPDATE profile_discovery_runs
-            SET status = 'queued',
-                error_message = 'Run was queued again after app restart.'
-            WHERE status = 'running'
-            """
-        )
-        queued_ids = [
-            row["id"]
-            for row in conn.execute(
-                "SELECT id FROM profile_discovery_runs WHERE status = 'queued' ORDER BY id"
-            )
-        ]
-        conn.commit()
-    thread = threading.Thread(target=profile_discovery_worker, name="EdScannerProfileDiscoveryWorker", daemon=True)
-    thread.start()
-    PROFILE_DISCOVERY_WORKER_STARTED = True
-    for run_id in queued_ids:
-        enqueue_profile_discovery_run(run_id)
 
 
 def start_contract_discovery_worker() -> None:
@@ -803,6 +304,7 @@ def start_contract_discovery_worker() -> None:
 if os.getenv("EDSCANNER_DISABLE_WORKER", "").casefold() not in {"1", "true", "yes", "on"}:
     start_search_worker()
     start_profile_discovery_worker()
+    start_guided_search_worker()
     start_contract_discovery_worker()
     start_board_worker()
 
@@ -1597,14 +1099,31 @@ def profile_discovery_run_detail(run_id: int):
                    p.profile_status, p.provider_guess, p.confidence,
                    p.test_result_count, p.search_url_template, p.error_message,
                    p.last_discovered_at
-            FROM district_search_profiles p
-            JOIN districts d ON d.id = p.district_id
-            WHERE p.last_discovered_at >= ?
-            ORDER BY p.id DESC
+            FROM profile_discovery_run_items i
+            JOIN districts d ON d.id = i.district_id
+            JOIN district_search_profiles p ON p.id = i.profile_id
+            WHERE i.run_id = ?
+            ORDER BY i.ordinal
             LIMIT 50
             """,
-            (run["started_at"],),
+            (run_id,),
         ).fetchall()
+        if not recent_profiles:
+            # Legacy runs predate exact per-run profile attribution.
+            recent_profiles = conn.execute(
+                """
+                SELECT d.agency_name, d.state, d.agency_type,
+                       p.profile_status, p.provider_guess, p.confidence,
+                       p.test_result_count, p.search_url_template, p.error_message,
+                       p.last_discovered_at
+                FROM district_search_profiles p
+                JOIN districts d ON d.id = p.district_id
+                WHERE p.last_discovered_at >= ?
+                ORDER BY p.id DESC
+                LIMIT 50
+                """,
+                (run["started_at"],),
+            ).fetchall()
     planned = int(run["districts_planned"] or 0)
     processed = int(run["districts_processed"] or 0)
     in_progress_count = 1 if run["status"] == "running" and processed < planned else 0
@@ -1654,6 +1173,17 @@ def cancel_profile_discovery_run(run_id: int):
             flash("Cancellation requested. Progress already saved will be kept.", "success")
         else:
             flash(f"Profile discovery run #{run_id} is already {status}.", "info")
+        if status in {"queued", "running"}:
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE profile_discovery_run_items
+                SET status = 'cancelled', finished_at = ?, updated_at = ?,
+                    error_message = 'Cancelled before dispatch.'
+                WHERE run_id = ? AND status = 'queued'
+                """,
+                (now, now, run_id),
+            )
         conn.commit()
     return redirect(url_for("profile_discovery_run_detail", run_id=run_id))
 
@@ -1817,6 +1347,17 @@ def cancel_run(run_id: int):
             flash("Cancellation requested. Progress already saved will be kept.", "success")
         else:
             flash(f"Run #{run_id} is already {status}.", "info")
+        if status in {"queued", "running"}:
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE search_run_items
+                SET status = 'cancelled', finished_at = ?, updated_at = ?,
+                    error_message = 'Cancelled before dispatch.'
+                WHERE run_id = ? AND status = 'queued'
+                """,
+                (now, now, run_id),
+            )
         conn.commit()
     return redirect(url_for("run_detail", run_id=run_id))
 

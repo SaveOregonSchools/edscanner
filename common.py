@@ -23,6 +23,7 @@ BOARD_SNAPSHOTS_DIR = DATA_DIR / "board_snapshots"
 LOGS_DIR = APP_ROOT / "logs"
 SEARCH_RUN_LOGS_DIR = LOGS_DIR / "search_runs"
 PROFILE_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "profile_discovery_runs"
+GUIDED_SEARCH_RUN_LOGS_DIR = LOGS_DIR / "guided_search_sessions"
 CONTRACT_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "contract_discovery_runs"
 BOARD_DISCOVERY_RUN_LOGS_DIR = LOGS_DIR / "board_discovery_runs"
 BOARD_SYNC_RUN_LOGS_DIR = LOGS_DIR / "board_sync_runs"
@@ -289,6 +290,7 @@ def ensure_directories() -> None:
         LOGS_DIR,
         SEARCH_RUN_LOGS_DIR,
         PROFILE_DISCOVERY_RUN_LOGS_DIR,
+        GUIDED_SEARCH_RUN_LOGS_DIR,
         CONTRACT_DISCOVERY_RUN_LOGS_DIR,
         BOARD_DISCOVERY_RUN_LOGS_DIR,
         BOARD_SYNC_RUN_LOGS_DIR,
@@ -390,6 +392,10 @@ def init_db(db_path: Path | str | None = None) -> None:
                 api_results_per_district INTEGER,
                 follow_depth INTEGER NOT NULL DEFAULT 0,
                 max_workers INTEGER,
+                adaptive_enabled INTEGER NOT NULL DEFAULT 0,
+                resource_policy_json TEXT,
+                current_workers INTEGER,
+                current_delay_seconds REAL,
                 cancel_requested INTEGER NOT NULL DEFAULT 0,
                 debug_logging INTEGER NOT NULL DEFAULT 0,
                 debug_log_path TEXT,
@@ -527,6 +533,236 @@ def init_db(db_path: Path | str | None = None) -> None:
                 error_message TEXT,
                 debug_log_path TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS search_run_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES search_runs(id) ON DELETE CASCADE,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempt INTEGER NOT NULL DEFAULT 0,
+                result_count INTEGER NOT NULL DEFAULT 0,
+                profile_id INTEGER REFERENCES district_search_profiles(id) ON DELETE SET NULL,
+                profile_status TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                queued_at TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                UNIQUE(run_id, district_id),
+                UNIQUE(run_id, ordinal)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_search_run_items_run_status
+                ON search_run_items(run_id, status, ordinal);
+            CREATE INDEX IF NOT EXISTS idx_search_run_items_district
+                ON search_run_items(district_id);
+
+            CREATE TABLE IF NOT EXISTS profile_discovery_run_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES profile_discovery_runs(id) ON DELETE CASCADE,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempt INTEGER NOT NULL DEFAULT 0,
+                result_count INTEGER NOT NULL DEFAULT 0,
+                profile_id INTEGER REFERENCES district_search_profiles(id) ON DELETE SET NULL,
+                profile_status TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                queued_at TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                UNIQUE(run_id, district_id),
+                UNIQUE(run_id, ordinal)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_profile_discovery_run_items_run_status
+                ON profile_discovery_run_items(run_id, status, ordinal);
+            CREATE INDEX IF NOT EXISTS idx_profile_discovery_run_items_district
+                ON profile_discovery_run_items(district_id);
+
+            CREATE TABLE IF NOT EXISTS guided_search_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                original_objective TEXT NOT NULL,
+                example_text TEXT,
+                example_url TEXT,
+                example_context TEXT,
+                examples_json TEXT NOT NULL DEFAULT '[]',
+                scope_json TEXT NOT NULL DEFAULT '{}',
+                strategy_mode TEXT NOT NULL DEFAULT 'balanced',
+                brave_allowed INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'draft',
+                stage TEXT NOT NULL DEFAULT 'draft',
+                latest_plan_json TEXT,
+                latest_evaluation_json TEXT,
+                final_summary TEXT,
+                ai_model TEXT,
+                prompt_versions_json TEXT NOT NULL DEFAULT '{}',
+                resource_policy_json TEXT NOT NULL DEFAULT '{}',
+                profile_coverage_json TEXT NOT NULL DEFAULT '{}',
+                current_step_id INTEGER,
+                current_workers INTEGER,
+                current_delay_seconds REAL,
+                round_number INTEGER NOT NULL DEFAULT 0,
+                max_rounds INTEGER NOT NULL DEFAULT 0,
+                max_child_search_runs INTEGER NOT NULL DEFAULT 0,
+                district_count INTEGER NOT NULL DEFAULT 0,
+                districts_completed INTEGER NOT NULL DEFAULT 0,
+                results_found INTEGER NOT NULL DEFAULT 0,
+                failures INTEGER NOT NULL DEFAULT 0,
+                cohort_frozen INTEGER NOT NULL DEFAULT 0,
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
+                clarification_round INTEGER NOT NULL DEFAULT 0,
+                clarification_questions_json TEXT NOT NULL DEFAULT '[]',
+                clarification_answers_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                queued_at TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                next_wake_at TEXT,
+                last_heartbeat_at TEXT,
+                error_message TEXT,
+                review_reason TEXT,
+                debug_log_path TEXT,
+                claim_token TEXT,
+                claim_expires_at TEXT,
+                version INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guided_search_sessions_status_wake
+                ON guided_search_sessions(status, next_wake_at, id);
+            CREATE INDEX IF NOT EXISTS idx_guided_search_sessions_claim
+                ON guided_search_sessions(claim_expires_at, claim_token);
+
+            CREATE TABLE IF NOT EXISTS guided_search_session_districts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES guided_search_sessions(id) ON DELETE CASCADE,
+                district_id INTEGER NOT NULL REFERENCES districts(id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(session_id, district_id),
+                UNIQUE(session_id, ordinal)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guided_search_session_districts_session
+                ON guided_search_session_districts(session_id, ordinal);
+            CREATE INDEX IF NOT EXISTS idx_guided_search_session_districts_district
+                ON guided_search_session_districts(district_id);
+
+            CREATE TABLE IF NOT EXISTS guided_search_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES guided_search_sessions(id) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL,
+                step_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                short_description TEXT,
+                input_json TEXT,
+                output_json TEXT,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                started_at TEXT,
+                finished_at TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(session_id, sequence)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guided_search_steps_session_status
+                ON guided_search_steps(session_id, status, sequence);
+
+            CREATE TABLE IF NOT EXISTS guided_search_child_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES guided_search_sessions(id) ON DELETE CASCADE,
+                step_id INTEGER REFERENCES guided_search_steps(id) ON DELETE SET NULL,
+                child_type TEXT NOT NULL,
+                child_run_id INTEGER NOT NULL,
+                round_number INTEGER NOT NULL DEFAULT 0,
+                query_text TEXT,
+                purpose TEXT,
+                status TEXT,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                UNIQUE(child_type, child_run_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guided_search_child_runs_session
+                ON guided_search_child_runs(session_id, round_number, id);
+            CREATE INDEX IF NOT EXISTS idx_guided_search_child_runs_step
+                ON guided_search_child_runs(step_id);
+
+            CREATE TABLE IF NOT EXISTS guided_search_model_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES guided_search_sessions(id) ON DELETE CASCADE,
+                step_id INTEGER REFERENCES guided_search_steps(id) ON DELETE SET NULL,
+                task_type TEXT NOT NULL,
+                model TEXT,
+                endpoint_identity TEXT,
+                prompt_version TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                success INTEGER NOT NULL DEFAULT 0,
+                validation_status TEXT,
+                latency_ms INTEGER,
+                prompt_tokens INTEGER,
+                completion_tokens INTEGER,
+                total_duration_ms INTEGER,
+                metadata_json TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guided_search_model_calls_session
+                ON guided_search_model_calls(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_guided_search_model_calls_step
+                ON guided_search_model_calls(step_id);
+
+            CREATE TABLE IF NOT EXISTS guided_search_evidence (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL REFERENCES guided_search_sessions(id) ON DELETE CASCADE,
+                district_id INTEGER REFERENCES districts(id) ON DELETE SET NULL,
+                canonical_url TEXT NOT NULL,
+                content_fingerprint TEXT,
+                title TEXT,
+                snippet TEXT,
+                best_score REAL NOT NULL DEFAULT 0,
+                first_round INTEGER NOT NULL DEFAULT 0,
+                last_round INTEGER NOT NULL DEFAULT 0,
+                classification TEXT,
+                confidence REAL,
+                evaluation_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(session_id, canonical_url)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guided_search_evidence_session_score
+                ON guided_search_evidence(session_id, best_score DESC, id);
+            CREATE INDEX IF NOT EXISTS idx_guided_search_evidence_session_fingerprint
+                ON guided_search_evidence(session_id, content_fingerprint);
+            CREATE INDEX IF NOT EXISTS idx_guided_search_evidence_district
+                ON guided_search_evidence(district_id);
+
+            CREATE TABLE IF NOT EXISTS guided_search_evidence_sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evidence_id INTEGER NOT NULL REFERENCES guided_search_evidence(id) ON DELETE CASCADE,
+                child_run_link_id INTEGER REFERENCES guided_search_child_runs(id) ON DELETE SET NULL,
+                search_run_id INTEGER NOT NULL REFERENCES search_runs(id) ON DELETE CASCADE,
+                search_result_id INTEGER NOT NULL REFERENCES search_results(id) ON DELETE CASCADE,
+                round_number INTEGER NOT NULL DEFAULT 0,
+                query_text TEXT,
+                purpose TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(evidence_id, search_result_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_guided_search_evidence_sources_evidence
+                ON guided_search_evidence_sources(evidence_id, id);
+            CREATE INDEX IF NOT EXISTS idx_guided_search_evidence_sources_result
+                ON guided_search_evidence_sources(search_result_id);
 
             CREATE TABLE IF NOT EXISTS contract_discovery_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1034,6 +1270,16 @@ def init_db(db_path: Path | str | None = None) -> None:
             conn.execute("ALTER TABLE search_runs ADD COLUMN follow_depth INTEGER NOT NULL DEFAULT 0;")
         if "max_workers" not in existing_columns:
             conn.execute("ALTER TABLE search_runs ADD COLUMN max_workers INTEGER;")
+        if "adaptive_enabled" not in existing_columns:
+            conn.execute(
+                "ALTER TABLE search_runs ADD COLUMN adaptive_enabled INTEGER NOT NULL DEFAULT 0;"
+            )
+        if "resource_policy_json" not in existing_columns:
+            conn.execute("ALTER TABLE search_runs ADD COLUMN resource_policy_json TEXT;")
+        if "current_workers" not in existing_columns:
+            conn.execute("ALTER TABLE search_runs ADD COLUMN current_workers INTEGER;")
+        if "current_delay_seconds" not in existing_columns:
+            conn.execute("ALTER TABLE search_runs ADD COLUMN current_delay_seconds REAL;")
         if "cancel_requested" not in existing_columns:
             conn.execute("ALTER TABLE search_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;")
         if "debug_logging" not in existing_columns:

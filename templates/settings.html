@@ -54,7 +54,8 @@
       </div>
       <div>
         <label for="ollama_model">Ollama model</label>
-        <input id="ollama_model" name="ollama_model" value="{{ llm_model }}" placeholder="gemma4:12b">
+        <input id="ollama_model" name="ollama_model" value="{{ llm_model }}" placeholder="qwen3.5:9b">
+        <p class="field-note"><code>qwen3.5:9b</code> is the recommended starting model for Guided Search. This hint does not replace or save over an existing model.</p>
       </div>
       <div>
         <label for="llm_api_key">Bearer token (optional)</label>
@@ -89,6 +90,10 @@
         <tr>
           <th>Contract classification</th>
           <td>Contract discovery works without AI. When enabled for a run, EdScanner sends bounded candidate excerpts to the configured Ollama servers for structured classification.</td>
+        </tr>
+        <tr>
+          <th>Guided District Search</th>
+          <td>Requires Ollama for structured planning, evaluation, revision, and summarization. District retrieval remains in EdScanner's controlled workers, and manual search remains available without AI.</td>
         </tr>
       </tbody>
     </table>

@@ -17,6 +17,8 @@
   --data-panel: #fff9f2;
   --contracts-accent: #28796f;
   --contracts-panel: #f2faf8;
+  --guided-accent: #286d78;
+  --guided-panel: #f2f9fa;
 }
 
 * {
@@ -1187,6 +1189,350 @@ mark {
   font-size: 13px;
 }
 
+.module-group-guided {
+  border-left: 4px solid var(--guided-accent);
+  background: var(--guided-panel);
+}
+
+.module-group-guided .module-button {
+  background: var(--guided-accent);
+  border-color: #1d5660;
+}
+
+.guided-intro p {
+  max-width: 920px;
+  line-height: 1.55;
+}
+
+.guided-wizard fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.guided-wizard legend {
+  width: 100%;
+  margin-bottom: 8px;
+  font-size: 21px;
+  font-weight: 750;
+}
+
+.guided-wizard textarea,
+.guided-wizard input,
+.guided-wizard select {
+  width: 100%;
+}
+
+.wizard-progress {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 0 24px;
+  padding: 0;
+  list-style: none;
+  counter-reset: guided-step;
+}
+
+.wizard-progress li {
+  counter-increment: guided-step;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  background: var(--panel);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.wizard-progress li::before {
+  content: counter(guided-step) ". ";
+}
+
+.wizard-progress li.active {
+  border-color: var(--guided-accent);
+  color: #fff;
+  background: var(--guided-accent);
+}
+
+.wizard-progress li.complete {
+  border-color: #a9c9c5;
+  color: var(--success);
+  background: #eef8f4;
+}
+
+.wizard-step {
+  scroll-margin-top: 18px;
+}
+
+.wizard-step > label {
+  display: block;
+  margin: 16px 0 6px;
+  font-weight: 700;
+}
+
+.wizard-step > .form-actions {
+  justify-content: flex-end;
+  margin-top: 24px;
+}
+
+.wizard-examples {
+  margin-top: 16px;
+  padding: 12px 16px;
+  border-left: 4px solid #b8d2d6;
+  background: var(--guided-panel);
+}
+
+.wizard-examples p,
+.wizard-examples ul {
+  margin: 0;
+}
+
+.wizard-examples ul {
+  margin-top: 7px;
+  padding-left: 22px;
+  line-height: 1.5;
+}
+
+.guided-scope-grid {
+  margin-top: 16px;
+}
+
+.scope-preview {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 6px 12px;
+  align-self: end;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--guided-panel);
+}
+
+.scope-preview strong {
+  color: var(--guided-accent);
+  font-size: 24px;
+}
+
+.scope-preview button {
+  grid-column: 1 / -1;
+}
+
+.optional {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.mode-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 18px 0;
+}
+
+.mode-card {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 15px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #fff;
+  cursor: pointer;
+}
+
+.mode-card:has(input:checked) {
+  border-color: var(--guided-accent);
+  box-shadow: 0 0 0 2px rgba(40, 109, 120, 0.14);
+  background: var(--guided-panel);
+}
+
+.mode-card input {
+  width: 16px;
+  min-height: 16px;
+  height: 16px;
+  padding: 0;
+  flex: 0 0 16px;
+  margin-top: 3px;
+}
+
+.mode-card span,
+.mode-card small {
+  display: block;
+}
+
+.mode-card small {
+  margin-top: 5px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.guided-brave-choice {
+  margin-top: 18px;
+}
+
+.guided-wizard .checkbox-field input {
+  width: 16px;
+  min-height: 16px;
+  height: 16px;
+  padding: 0;
+  flex: 0 0 16px;
+}
+
+.objective-quote {
+  margin: 12px 0 18px;
+  padding: 12px 16px;
+  border-left: 4px solid var(--guided-accent);
+  background: var(--guided-panel);
+  line-height: 1.55;
+}
+
+.plan-review h3,
+.final-summary h3 {
+  margin-top: 20px;
+}
+
+.concept-list,
+.final-summary ul {
+  line-height: 1.55;
+}
+
+.query-plan-list {
+  display: grid;
+  gap: 9px;
+  padding-left: 28px;
+}
+
+.query-plan-list li {
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--panel);
+}
+
+.query-plan-list code,
+.query-plan-list span {
+  display: block;
+}
+
+.query-plan-list span {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.evidence-list {
+  display: grid;
+  gap: 12px;
+}
+
+.evidence-card {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--guided-accent);
+  border-radius: 6px;
+  background: #fff;
+}
+
+.evidence-card.borderline {
+  border-left-color: var(--warn);
+}
+
+.evidence-card p {
+  margin: 9px 0 0;
+  line-height: 1.5;
+}
+
+.evidence-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.evidence-heading span {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.summary-callout {
+  padding: 14px 16px;
+  border: 1px solid #b8d2d6;
+  border-radius: 6px;
+  background: var(--guided-panel);
+  line-height: 1.6;
+}
+
+.summary-callout p {
+  margin: 0;
+}
+
+.activity-timeline ol {
+  position: relative;
+  display: grid;
+  gap: 0;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.activity-timeline li {
+  display: grid;
+  grid-template-columns: 150px 18px 1fr;
+  gap: 10px;
+  min-height: 50px;
+}
+
+.activity-timeline time {
+  padding-top: 1px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.timeline-marker {
+  position: relative;
+  width: 11px;
+  height: 11px;
+  margin-top: 4px;
+  border: 2px solid var(--guided-accent);
+  border-radius: 50%;
+  background: #fff;
+}
+
+.timeline-marker::after {
+  content: "";
+  position: absolute;
+  top: 11px;
+  left: 3px;
+  width: 1px;
+  height: 35px;
+  background: var(--border);
+}
+
+.activity-timeline li:last-child .timeline-marker::after {
+  display: none;
+}
+
+.timeline-marker.completed {
+  background: var(--success);
+  border-color: var(--success);
+}
+
+.timeline-marker.failed,
+.timeline-marker.error {
+  background: var(--error);
+  border-color: var(--error);
+}
+
+.activity-timeline li p {
+  margin: 4px 0 0;
+  color: var(--error);
+  font-size: 13px;
+}
+
 @media (max-width: 800px) {
   body {
     padding: 14px 14px 0;
@@ -1233,6 +1579,30 @@ mark {
   .import-tool-surface,
   .import-form {
     grid-template-columns: 1fr;
+  }
+
+  .wizard-progress,
+  .mode-options {
+    grid-template-columns: 1fr;
+  }
+
+  .evidence-heading {
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .activity-timeline li {
+    grid-template-columns: 18px 1fr;
+  }
+
+  .activity-timeline time {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .timeline-marker {
+    grid-column: 1;
+    grid-row: 1 / span 2;
   }
 
   .module-row {
