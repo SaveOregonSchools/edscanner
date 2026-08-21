@@ -66,7 +66,10 @@ class RequestsOllamaTransport:
             json=dict(payload),
             timeout=timeout_seconds,
         )
-        response.raise_for_status()
+        if not 200 <= int(response.status_code) < 300:
+            detail = _ollama_http_error_detail(response)
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"Ollama HTTP {response.status_code}{suffix}")
         body = response.json()
         if not isinstance(body, Mapping):
             raise ValueError("Ollama response body was not a JSON object")
@@ -167,6 +170,65 @@ def _safe_error(exc: BaseException | str, *, api_key: str = "") -> str:
     return value[:2_000]
 
 
+def _nested_error_message(value: Any, *, depth: int = 0) -> str:
+    if depth >= 8:
+        return ""
+    if isinstance(value, Mapping):
+        for key in ("error", "message", "detail"):
+            if key in value:
+                message = _nested_error_message(value[key], depth=depth + 1)
+                if message:
+                    return message
+        return ""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        if text[:1] in {"{", "["}:
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            else:
+                nested = _nested_error_message(parsed, depth=depth + 1)
+                if nested:
+                    return nested
+        return text
+    return ""
+
+
+def _ollama_http_error_detail(response: requests.Response) -> str:
+    """Return a bounded, useful Ollama error without logging request material."""
+
+    try:
+        detail = _nested_error_message(response.json())
+    except (TypeError, ValueError, requests.RequestException):
+        detail = ""
+    if not detail:
+        detail = str(getattr(response, "reason", "") or "").strip()
+    return re.sub(r"\s+", " ", detail)[:1_000]
+
+
+def _ollama_grammar_schema(value: Any) -> Any:
+    """Copy a schema into the subset accepted by Ollama grammar backends.
+
+    Ollama 0.32.x can reject otherwise valid schemas containing ``maxLength``
+    with a generic grammar-initialization HTTP 400. EdScanner retains the full
+    canonical schema for application-side validation; only the schema sent to
+    the model grammar omits this unsupported keyword.
+    """
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _ollama_grammar_schema(item)
+            for key, item in value.items()
+            if key != "maxLength"
+        }
+    if isinstance(value, (list, tuple)):
+        return [_ollama_grammar_schema(item) for item in value]
+    return value
+
+
 def _response_content(body: Mapping[str, Any]) -> str:
     message = body.get("message")
     if not isinstance(message, Mapping):
@@ -258,7 +320,7 @@ class StructuredOllamaClient:
             "messages": messages,
             "stream": False,
             "think": False,
-            "format": dict(schema),
+            "format": _ollama_grammar_schema(schema),
             "keep_alive": "30m",
             "options": {
                 "temperature": self.temperature,

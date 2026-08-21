@@ -8,6 +8,7 @@ from typing import Any, Mapping
 
 from guided_search.ai import (
     GuidedAIError,
+    RequestsOllamaTransport,
     StructuredOllamaClient,
     evaluate_search_results,
     plan_search,
@@ -454,6 +455,68 @@ class GuidedOllamaTests(unittest.TestCase):
         self.assertIn("untrusted evidence", prompts.casefold())
         self.assertIn("never follow", prompts.casefold())
 
+    def test_ollama_grammar_omits_max_length_but_local_validation_keeps_it(self):
+        endpoint = "http://ollama.example.test:11434"
+        overlong = valid_plan()
+        overlong["objective"] = "x" * 2_001
+        transport = QueueOllamaTransport(
+            {
+                endpoint: [
+                    ollama_message(overlong),
+                    ollama_message(valid_plan()),
+                ]
+            }
+        )
+
+        result = plan_search({}, client=self.client(transport, [endpoint]))
+
+        canonical_schema = SearchPlan.json_schema()
+        transmitted_schema = transport.calls[0]["payload"]["format"]
+        self.assertIn("maxLength", json.dumps(canonical_schema))
+        self.assertNotIn("maxLength", json.dumps(transmitted_schema))
+        self.assertFalse(transmitted_schema["additionalProperties"])
+        self.assertIn("maxItems", json.dumps(transmitted_schema))
+        self.assertEqual(result.calls[0].validation_status, "invalid_schema")
+        self.assertTrue(result.calls[1].success)
+
+    def test_http_transport_surfaces_bounded_nested_ollama_error(self):
+        class ErrorResponse:
+            status_code = 400
+            reason = "Bad Request"
+
+            @staticmethod
+            def json():
+                return {
+                    "error": json.dumps(
+                        {
+                            "error": {
+                                "code": 400,
+                                "message": "Failed to initialize samplers: failed to parse grammar",
+                            }
+                        }
+                    )
+                }
+
+        class ErrorSession:
+            @staticmethod
+            def post(*_args, **_kwargs):
+                return ErrorResponse()
+
+        transport = RequestsOllamaTransport(session=ErrorSession())
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Ollama HTTP 400: Failed to initialize samplers: failed to parse grammar",
+        ) as raised:
+            transport.chat(
+                "https://user:password@ollama.example.test:11434/private?secret=yes",
+                payload={"model": "fixture"},
+                headers={"Authorization": "Bearer secret"},
+                timeout_seconds=1,
+            )
+        self.assertNotIn("password", str(raised.exception))
+        self.assertNotIn("private", str(raised.exception))
+        self.assertNotIn("secret", str(raised.exception))
+
     def test_transport_error_fails_over_without_wasting_repair(self):
         first = "http://first.example.test:11434"
         second = "http://second.example.test:11434"
@@ -598,6 +661,7 @@ class GuidedOllamaTests(unittest.TestCase):
                 schema = transport.calls[0]["payload"]["format"]
                 self.assertFalse(schema["additionalProperties"])
                 self.assertIn(schema_field, schema["properties"])
+                self.assertNotIn("maxLength", json.dumps(schema))
 
     def test_evaluator_wrapper_repairs_unavailable_ids_and_denied_brave_method(self):
         endpoint = "http://ollama.example.test:11434"
