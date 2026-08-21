@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import email.utils
 import gzip
 import io
 import json
@@ -10,8 +11,9 @@ import threading
 import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
@@ -359,6 +361,9 @@ class SearchSettings:
     browser_render_timeout_seconds: float = 20.0
     brave_api_key: str = ""
     brave_endpoint: str = "https://api.search.brave.com/res/v1/web/search"
+    # Optional, thread-safe execution hook used by Guided Search. Manual searches
+    # leave this unset and retain the existing fixed delay/worker behavior.
+    resource_controller: Any | None = None
 
 
 class RunDebugLogger:
@@ -383,6 +388,176 @@ class RunDebugLogger:
 def debug_log(debug_logger: RunDebugLogger | None, event: str, **fields: Any) -> None:
     if debug_logger is not None:
         debug_logger.log(event, **fields)
+
+
+def _controller_callable(controller: Any | None, *names: str) -> Callable[..., Any] | None:
+    if controller is None:
+        return None
+    for name in names:
+        candidate = getattr(controller, name, None)
+        if callable(candidate):
+            return candidate
+    return None
+
+
+def _controller_delay_seconds(controller: Any | None, default: float) -> float:
+    if controller is None:
+        return max(0.0, float(default))
+    for name in ("current_delay_seconds", "delay_seconds", "get_delay_seconds"):
+        value = getattr(controller, name, None)
+        if callable(value):
+            try:
+                value = value()
+            except Exception:
+                LOGGER.exception("Search resource controller could not report its request delay")
+                continue
+        if value is not None:
+            try:
+                return max(0.0, float(value))
+            except (TypeError, ValueError):
+                continue
+    nested = getattr(controller, "delay_controller", None)
+    if nested is not None:
+        getter = getattr(nested, "get_delay", None)
+        try:
+            value = getter() if callable(getter) else getattr(nested, "delay_seconds", None)
+        except Exception:
+            LOGGER.exception("Search delay controller could not report its request delay")
+            value = None
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+    return max(0.0, float(default))
+
+
+def _parse_retry_after(value: str | None) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return max(0.0, float(text))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(text)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _before_controlled_request(settings: SearchSettings, url: str) -> None:
+    controller = settings.resource_controller
+    if controller is None:
+        return
+    before_request = _controller_callable(controller, "before_request", "wait_before_request")
+    if before_request is not None:
+        try:
+            before_request(url=url)
+            return
+        except TypeError:
+            try:
+                before_request()
+                return
+            except Exception:
+                LOGGER.exception("Search resource controller before-request hook failed")
+        except Exception:
+            LOGGER.exception("Search resource controller before-request hook failed")
+    nested_delay = getattr(controller, "delay_controller", None)
+    nested_wait = getattr(nested_delay, "wait", None)
+    if callable(nested_wait):
+        try:
+            nested_wait()
+            return
+        except Exception:
+            LOGGER.exception("Search delay controller wait failed")
+    delay = _controller_delay_seconds(controller, settings.delay_seconds)
+    if delay:
+        time.sleep(delay)
+
+
+def _observe_controlled_response(settings: SearchSettings, response: requests.Response) -> None:
+    controller = settings.resource_controller
+    if controller is None:
+        return
+    retry_after = _parse_retry_after(response.headers.get("Retry-After"))
+    observer = _controller_callable(controller, "observe_response", "on_response")
+    if observer is not None:
+        try:
+            observer(
+                status_code=response.status_code,
+                headers=dict(response.headers),
+                url=response.url,
+                retry_after_seconds=retry_after,
+            )
+        except TypeError:
+            try:
+                observer(response.status_code, dict(response.headers))
+            except Exception:
+                LOGGER.exception("Search resource controller response hook failed")
+            else:
+                return
+        except Exception:
+            LOGGER.exception("Search resource controller response hook failed")
+        else:
+            return
+    if response.status_code == 429:
+        rate_limit = _controller_callable(controller, "record_rate_limit")
+        if rate_limit is not None:
+            try:
+                rate_limit(response.headers.get("Retry-After"))
+                return
+            except Exception:
+                LOGGER.exception("Search resource controller rate-limit hook failed")
+    if retry_after and response.status_code in {429, 503}:
+        defer = _controller_callable(controller, "defer_requests", "back_off")
+        if defer is not None:
+            try:
+                defer(retry_after, reason=f"HTTP {response.status_code}")
+            except TypeError:
+                defer(retry_after)
+        else:
+            # Only adaptive/controller-backed requests take this path. Preserve
+            # the historical manual behavior when no controller is installed.
+            time.sleep(min(retry_after, 60.0))
+
+
+def _observe_controlled_error(settings: SearchSettings, error: BaseException, *, url: str = "") -> None:
+    observer = _controller_callable(settings.resource_controller, "observe_error", "on_error")
+    if observer is None:
+        return
+    try:
+        observer(error=error, url=url)
+    except TypeError:
+        observer(error)
+
+
+def wait_for_request_delay(
+    settings: SearchSettings,
+    cancel_requested: Callable[[], bool] | None = None,
+) -> None:
+    """Apply the legacy post-request delay or notify an adaptive controller.
+
+    Controller-backed execution throttles centrally in ``request_get`` so all
+    HTTP requests participate. Manual execution retains its historical fixed,
+    per-worker post-request sleep at the existing call sites.
+    """
+
+    controller = settings.resource_controller
+    if controller is not None:
+        after_request = _controller_callable(controller, "after_request")
+        if after_request is not None:
+            try:
+                after_request()
+            except Exception:
+                LOGGER.exception("Search resource controller after-request hook failed")
+        return
+    delay = max(0.0, float(settings.delay_seconds))
+    if delay and not (cancel_requested and cancel_requested()):
+        # Keep the historical one-sleep-per-call behavior for manual searches.
+        time.sleep(delay)
 
 
 def parse_optional_int(value: Any) -> int | None:
@@ -412,6 +587,23 @@ def _clean_list(values: list[str] | tuple[str, ...] | None) -> list[str]:
     return out
 
 
+def clean_district_ids(values: list[int] | tuple[int, ...] | None) -> list[int] | None:
+    if values is None:
+        return None
+    out: list[int] = []
+    seen: set[int] = set()
+    for value in values:
+        try:
+            district_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if district_id <= 0 or district_id in seen:
+            continue
+        out.append(district_id)
+        seen.add(district_id)
+    return out
+
+
 def build_district_filter_sql(
     states: list[str] | tuple[str, ...] | None = None,
     agency_types: list[str] | tuple[str, ...] | None = None,
@@ -419,6 +611,7 @@ def build_district_filter_sql(
     max_enrollment: int | None = None,
     *,
     only_searchable: bool = True,
+    district_ids: list[int] | tuple[int, ...] | None = None,
 ) -> tuple[str, list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -438,6 +631,13 @@ def build_district_filter_sql(
     if max_enrollment is not None:
         clauses.append("total_enrollment_excludes_ae <= ?")
         params.append(max_enrollment)
+    cleaned_district_ids = clean_district_ids(district_ids)
+    if cleaned_district_ids is not None:
+        if cleaned_district_ids:
+            clauses.append(f"id IN ({','.join('?' for _ in cleaned_district_ids)})")
+            params.extend(cleaned_district_ids)
+        else:
+            clauses.append("1 = 0")
     where_sql = " WHERE " + " AND ".join(clauses) if clauses else ""
     return where_sql, params
 
@@ -448,9 +648,17 @@ def count_matching_districts(
     min_enrollment: int | None = None,
     max_enrollment: int | None = None,
     db_path: Path | str | None = None,
+    *,
+    district_ids: list[int] | tuple[int, ...] | None = None,
 ) -> int:
     init_db(db_path)
-    where_sql, params = build_district_filter_sql(states, agency_types, min_enrollment, max_enrollment)
+    where_sql, params = build_district_filter_sql(
+        states,
+        agency_types,
+        min_enrollment,
+        max_enrollment,
+        district_ids=district_ids,
+    )
     with connect_db(db_path) as conn:
         row = conn.execute(f"SELECT COUNT(*) AS count FROM districts{where_sql}", params).fetchone()
     return int(row["count"] or 0)
@@ -464,9 +672,16 @@ def list_matching_districts(
     *,
     limit: int | None = None,
     db_path: Path | str | None = None,
+    district_ids: list[int] | tuple[int, ...] | None = None,
 ) -> list[dict[str, Any]]:
     init_db(db_path)
-    where_sql, params = build_district_filter_sql(states, agency_types, min_enrollment, max_enrollment)
+    where_sql, params = build_district_filter_sql(
+        states,
+        agency_types,
+        min_enrollment,
+        max_enrollment,
+        district_ids=district_ids,
+    )
     limit_sql = ""
     if limit is not None:
         limit_sql = " LIMIT ?"
@@ -497,14 +712,25 @@ def make_session(settings: SearchSettings) -> requests.Session:
 
 
 def request_get(session: requests.Session, url: str, settings: SearchSettings, **kwargs) -> requests.Response:
+    _before_controlled_request(settings, url)
     try:
-        return session.get(url, verify=settings.verify_ssl, **kwargs)
-    except SSLError:
+        response = session.get(url, verify=settings.verify_ssl, **kwargs)
+    except SSLError as exc:
         if not settings.verify_ssl:
+            _observe_controlled_error(settings, exc, url=url)
             raise
         LOGGER.info("SSL verification failed for %s; retrying without certificate verification", url)
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        return session.get(url, verify=False, **kwargs)
+        try:
+            response = session.get(url, verify=False, **kwargs)
+        except Exception as retry_exc:
+            _observe_controlled_error(settings, retry_exc, url=url)
+            raise
+    except Exception as exc:
+        _observe_controlled_error(settings, exc, url=url)
+        raise
+    _observe_controlled_response(settings, response)
+    return response
 
 
 def _host(url: str) -> str:
@@ -1270,8 +1496,7 @@ def _search_district_crawler(
             debug_log(debug_logger, "page_error", district=district.get("agency_name"), url=url, error=str(exc))
             continue
         finally:
-            if settings.delay_seconds:
-                time.sleep(settings.delay_seconds)
+            wait_for_request_delay(settings, cancel_requested)
 
     top_results = sorted(results, key=lambda item: item["score"], reverse=True)[: settings.max_results_per_district]
     LOGGER.info(
@@ -1526,8 +1751,7 @@ def _search_district_brave(
             LOGGER.info("Brave result fetch/search failed for %s: %s", url, exc)
             debug_log(debug_logger, "page_error", district=district.get("agency_name"), url=url, error=str(exc))
         finally:
-            if settings.delay_seconds:
-                time.sleep(settings.delay_seconds)
+            wait_for_request_delay(settings, cancel_requested)
 
     top_results = sorted(result_map.values(), key=lambda item: item["score"], reverse=True)[: settings.max_results_per_district]
     debug_log(
@@ -1618,6 +1842,184 @@ def search_district(
     )
 
 
+def _policy_int(policy: dict[str, Any], name: str, default: int) -> int:
+    try:
+        return int(policy.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _policy_float(policy: dict[str, Any], name: str, default: float) -> float:
+    try:
+        return float(policy.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _insert_search_run_items(
+    conn: Any,
+    run_id: int,
+    districts: list[dict[str, Any]],
+) -> None:
+    now = utc_now_iso()
+    conn.executemany(
+        """
+        INSERT OR IGNORE INTO search_run_items (
+            run_id, district_id, ordinal, status, attempt, result_count,
+            started_at, finished_at, error_message, created_at, updated_at, queued_at
+        )
+        VALUES (?, ?, ?, 'queued', 0, 0, NULL, NULL, NULL, ?, ?, ?)
+        """,
+        [
+            (run_id, int(district["id"]), ordinal, now, now, now)
+            for ordinal, district in enumerate(districts, start=1)
+        ],
+    )
+
+
+def _ensure_search_run_items(run: dict[str, Any], db_path: Path | str | None) -> None:
+    with connect_db(db_path) as conn:
+        item_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM search_run_items WHERE run_id = ?",
+                (run["id"],),
+            ).fetchone()["count"]
+            or 0
+        )
+    if item_count or not int(run.get("districts_matched") or 0):
+        return
+    districts = list_matching_districts(
+        _clean_list(json_loads_list(run.get("states_json"))),
+        _clean_list(json_loads_list(run.get("agency_types_json"))),
+        run.get("min_enrollment"),
+        run.get("max_enrollment"),
+        limit=int(run.get("max_districts") or MAX_TOTAL_DISTRICTS_PER_RUN),
+        db_path=db_path,
+    )
+    with connect_db(db_path) as conn:
+        _insert_search_run_items(conn, int(run["id"]), districts)
+        conn.commit()
+
+
+def _search_run_progress(conn: Any, run_id: int) -> tuple[int, int]:
+    row = conn.execute(
+        """
+        SELECT
+            SUM(CASE WHEN status IN ('completed', 'failed') THEN 1 ELSE 0 END) AS searched,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+        FROM search_run_items
+        WHERE run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    return int(row["searched"] or 0), int(row["failed"] or 0)
+
+
+def _controller_target_workers(
+    controller: Any | None,
+    default: int,
+    maximum: int,
+    *,
+    backlog: int,
+    active: int,
+) -> int:
+    if controller is None:
+        return max(1, min(maximum, default))
+    value: Any = None
+    for name in ("target_workers", "current_workers", "get_target_workers"):
+        candidate = getattr(controller, name, None)
+        if callable(candidate):
+            try:
+                value = candidate(backlog=backlog, active=active, maximum=maximum)
+            except TypeError:
+                try:
+                    value = candidate()
+                except Exception:
+                    LOGGER.exception("Search resource controller could not report target workers")
+                    value = None
+            except Exception:
+                LOGGER.exception("Search resource controller could not report target workers")
+                value = None
+        elif candidate is not None:
+            value = candidate
+        if value is not None:
+            break
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, min(maximum, parsed))
+
+
+def _observe_district_completion(
+    controller: Any | None,
+    *,
+    success: bool,
+    elapsed_seconds: float,
+    result_count: int,
+    backlog: int,
+    active: int,
+) -> None:
+    observer = _controller_callable(
+        controller,
+        "observe_district_completion",
+        "on_task_complete",
+        "observe_completion",
+    )
+    if observer is not None:
+        try:
+            observer(
+                success=success,
+                elapsed_seconds=elapsed_seconds,
+                result_count=result_count,
+                backlog=backlog,
+                active=active,
+            )
+        except TypeError:
+            try:
+                observer(success)
+            except Exception:
+                LOGGER.exception("Search resource controller completion hook failed")
+        except Exception:
+            LOGGER.exception("Search resource controller completion hook failed")
+        return
+    observe_snapshot = _controller_callable(controller, "observe")
+    if observe_snapshot is None:
+        return
+    try:
+        from guided_search.resources import collect_resource_snapshot
+
+        snapshot = collect_resource_snapshot(
+            backlog=backlog,
+            active_workers=active,
+            http_error_rate=0.0 if success else 1.0,
+            timeout_rate=0.0,
+            include_gpu=True,
+        )
+        observe_snapshot(snapshot)
+    except Exception:
+        LOGGER.exception("Search resource controller could not observe a resource snapshot")
+
+
+def _persist_resource_state(
+    run_id: int,
+    target_workers: int,
+    settings: SearchSettings,
+    db_path: Path | str | None,
+) -> None:
+    delay = _controller_delay_seconds(settings.resource_controller, settings.delay_seconds)
+    with connect_db(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE search_runs
+            SET current_workers = ?, current_delay_seconds = ?
+            WHERE id = ?
+            """,
+            (target_workers, delay, run_id),
+        )
+        conn.commit()
+
+
 def create_search_run(
     query_text: str,
     states: list[str] | None = None,
@@ -1631,11 +2033,15 @@ def create_search_run(
     db_path: Path | str | None = None,
     settings: SearchSettings | None = None,
     status: str = "queued",
+    district_ids: list[int] | tuple[int, ...] | None = None,
+    adaptive_enabled: bool = False,
+    resource_policy: dict[str, Any] | None = None,
 ) -> int:
     query_text = str(query_text or "").strip()
     parse_search_query(query_text)
     init_db(db_path)
     settings = settings or SearchSettings()
+    policy = dict(resource_policy or {})
     cap = max_districts or settings.max_total_districts_per_run
     cap = max(1, min(cap, settings.max_total_districts_per_run))
     search_method = normalize_search_method(settings.search_method)
@@ -1647,10 +2053,42 @@ def create_search_run(
         search_provider = "crawler"
     api_results_per_district = clamp_api_results(settings.api_results_per_district)
     follow_depth = clamp_follow_depth(settings.follow_depth)
-    worker_count = clamp_int(max_workers, SEARCH_RUN_WORKERS, 1, MAX_SEARCH_WORKERS)
+    configured_max_workers = max_workers
+    if configured_max_workers is None and adaptive_enabled:
+        configured_max_workers = _policy_int(policy, "max_workers", SEARCH_RUN_WORKERS)
+    worker_count = clamp_int(configured_max_workers, SEARCH_RUN_WORKERS, 1, MAX_SEARCH_WORKERS)
+    initial_workers = worker_count
+    if adaptive_enabled:
+        initial_workers = clamp_int(
+            _policy_int(policy, "initial_workers", worker_count),
+            worker_count,
+            1,
+            worker_count,
+        )
+    initial_delay = max(
+        0.0,
+        _policy_float(policy, "initial_delay_seconds", settings.delay_seconds),
+    )
     states = _clean_list(states)
     agency_types = _clean_list(agency_types)
-    matched_count = count_matching_districts(states, agency_types, min_enrollment, max_enrollment, db_path)
+    cleaned_district_ids = clean_district_ids(district_ids)
+    matched_count = count_matching_districts(
+        states,
+        agency_types,
+        min_enrollment,
+        max_enrollment,
+        db_path,
+        district_ids=cleaned_district_ids,
+    )
+    districts = list_matching_districts(
+        states,
+        agency_types,
+        min_enrollment,
+        max_enrollment,
+        limit=cap,
+        db_path=db_path,
+        district_ids=cleaned_district_ids,
+    )
 
     submitted_at = utc_now_iso()
     with connect_db(db_path) as conn:
@@ -1660,11 +2098,12 @@ def create_search_run(
                 query_text, states_json, agency_types_json, min_enrollment,
                 max_enrollment, max_districts, max_pages_per_district,
                 search_method, search_provider, api_results_per_district,
-                follow_depth, max_workers,
+                follow_depth, max_workers, adaptive_enabled, resource_policy_json,
+                current_workers, current_delay_seconds,
                 cancel_requested, debug_logging, debug_log_path, status,
                 districts_matched, districts_searched, districts_failed, started_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, 0, 0, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?, ?, 0, 0, ?)
             """,
             (
                 query_text,
@@ -1679,6 +2118,10 @@ def create_search_run(
                 api_results_per_district,
                 follow_depth,
                 worker_count,
+                1 if adaptive_enabled else 0,
+                json_dumps(policy),
+                initial_workers,
+                initial_delay,
                 1 if debug_logging else 0,
                 status,
                 matched_count,
@@ -1686,6 +2129,7 @@ def create_search_run(
             ),
         )
         run_id = int(cursor.lastrowid)
+        _insert_search_run_items(conn, run_id, districts)
         conn.commit()
     return run_id
 
@@ -1704,33 +2148,38 @@ def execute_search_run(
     *,
     db_path: Path | str | None = None,
     settings: SearchSettings | None = None,
+    resource_controller: Any | None = None,
 ) -> None:
     init_db(db_path)
     with connect_db(db_path) as conn:
-        run = conn.execute("SELECT * FROM search_runs WHERE id = ?", (run_id,)).fetchone()
-        if run is None:
-            raise ValueError(f"Search run not found: {run_id}")
-        query_text = run["query_text"]
-        states = _clean_list(json_loads_list(run["states_json"]))
-        agency_types = _clean_list(json_loads_list(run["agency_types_json"]))
-        min_enrollment = run["min_enrollment"]
-        max_enrollment = run["max_enrollment"]
-        cap = run["max_districts"] or MAX_TOTAL_DISTRICTS_PER_RUN
-        max_pages = run["max_pages_per_district"] or MAX_PAGES_PER_DISTRICT
-        search_method = normalize_search_method(run["search_method"])
-        search_provider = run["search_provider"] or (
-            "brave"
-            if search_method in {"brave", "hybrid"}
-            else "district_search"
-            if search_method in {"district_search", "district_search_hybrid", "district_search_browser", "district_search_browser_hybrid"}
-            else "crawler"
-        )
-        api_results_per_district = clamp_api_results(run["api_results_per_district"])
-        follow_depth = clamp_follow_depth(run["follow_depth"])
-        max_workers = clamp_int(run["max_workers"], SEARCH_RUN_WORKERS, 1, MAX_SEARCH_WORKERS)
-        matched_count = run["districts_matched"] or 0
-        debug_enabled = bool(run["debug_logging"])
-        already_cancelled = bool(run["cancel_requested"])
+        loaded = conn.execute("SELECT * FROM search_runs WHERE id = ?", (run_id,)).fetchone()
+    if loaded is None:
+        raise ValueError(f"Search run not found: {run_id}")
+    run = dict(loaded)
+    _ensure_search_run_items(run, db_path)
+
+    query_text = run["query_text"]
+    states = _clean_list(json_loads_list(run.get("states_json")))
+    agency_types = _clean_list(json_loads_list(run.get("agency_types_json")))
+    min_enrollment = run.get("min_enrollment")
+    max_enrollment = run.get("max_enrollment")
+    cap = int(run.get("max_districts") or MAX_TOTAL_DISTRICTS_PER_RUN)
+    max_pages = int(run.get("max_pages_per_district") or MAX_PAGES_PER_DISTRICT)
+    search_method = normalize_search_method(run.get("search_method"))
+    search_provider = run.get("search_provider") or (
+        "brave"
+        if search_method in {"brave", "hybrid"}
+        else "district_search"
+        if search_method in {"district_search", "district_search_hybrid", "district_search_browser", "district_search_browser_hybrid"}
+        else "crawler"
+    )
+    api_results_per_district = clamp_api_results(run.get("api_results_per_district"))
+    follow_depth = clamp_follow_depth(run.get("follow_depth"))
+    max_workers = clamp_int(run.get("max_workers"), SEARCH_RUN_WORKERS, 1, MAX_SEARCH_WORKERS)
+    initial_workers = clamp_int(run.get("current_workers"), max_workers, 1, max_workers)
+    adaptive_enabled = bool(run.get("adaptive_enabled"))
+    matched_count = int(run.get("districts_matched") or 0)
+    debug_enabled = bool(run.get("debug_logging"))
 
     debug_logger: RunDebugLogger | None = None
     if debug_enabled:
@@ -1742,48 +2191,44 @@ def execute_search_run(
                 (str(debug_path), run_id),
             )
             conn.commit()
-        debug_log(
-            debug_logger,
-            "run_loaded",
-            run_id=run_id,
-            query=query_text,
-            states=states,
-            agency_types=agency_types,
-            min_enrollment=min_enrollment,
-            max_enrollment=max_enrollment,
-            max_districts=cap,
-            max_pages_per_district=max_pages,
-            search_method=search_method,
-            search_provider=search_provider,
-            api_results_per_district=api_results_per_district,
-            follow_depth=follow_depth,
-            max_workers=max_workers,
-            matched_count=matched_count,
-        )
 
-    if already_cancelled:
+    if bool(run.get("cancel_requested")):
         with connect_db(db_path) as conn:
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE search_run_items
+                SET status = 'cancelled', finished_at = ?, updated_at = ?,
+                    error_message = 'Cancelled before start.'
+                WHERE run_id = ? AND status = 'queued'
+                """,
+                (now, now, run_id),
+            )
+            searched, failed = _search_run_progress(conn, run_id)
             conn.execute(
                 """
                 UPDATE search_runs
-                SET status = 'cancelled',
-                    finished_at = ?,
-                    error_message = 'Cancelled before start.'
+                SET status = 'cancelled', districts_searched = ?, districts_failed = ?,
+                    finished_at = ?, error_message = 'Cancelled before start.'
                 WHERE id = ?
                 """,
-                (utc_now_iso(), run_id),
+                (searched, failed, now, run_id),
             )
             conn.commit()
-        debug_log(debug_logger, "run_cancelled", run_id=run_id, searched=0, failed=0)
-        LOGGER.info("Search run %s cancelled before start", run_id)
+        debug_log(debug_logger, "run_cancelled", run_id=run_id, searched=searched, failed=failed)
         return
 
     base_settings = settings or SearchSettings()
+    active_controller = resource_controller or base_settings.resource_controller
     run_settings = SearchSettings(
         max_pages_per_district=max_pages,
         max_results_per_district=base_settings.max_results_per_district,
         request_timeout_seconds=base_settings.request_timeout_seconds,
-        delay_seconds=base_settings.delay_seconds,
+        delay_seconds=(
+            max(0.0, float(run.get("current_delay_seconds") or 0.0))
+            if adaptive_enabled and run.get("current_delay_seconds") is not None
+            else base_settings.delay_seconds
+        ),
         max_pdf_size_bytes=base_settings.max_pdf_size_bytes,
         max_html_size_bytes=base_settings.max_html_size_bytes,
         max_total_districts_per_run=max(cap, 1),
@@ -1799,172 +2244,316 @@ def execute_search_run(
         browser_render_timeout_seconds=base_settings.browser_render_timeout_seconds,
         brave_api_key=base_settings.brave_api_key or get_local_setting(BRAVE_SEARCH_API_KEY_ENV),
         brave_endpoint=base_settings.brave_endpoint,
-    )
-    districts = list_matching_districts(
-        states,
-        agency_types,
-        min_enrollment,
-        max_enrollment,
-        limit=cap,
-        db_path=db_path,
+        resource_controller=active_controller,
     )
 
-    searched = 0
-    failed = 0
-    cancelled = False
-    try:
-        LOGGER.info("Search run %s started: query=%r matched=%s cap=%s", run_id, query_text, matched_count, cap)
-        debug_log(debug_logger, "run_start", run_id=run_id, district_count=len(districts), max_workers=max_workers)
-        with connect_db(db_path) as conn:
+    with connect_db(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT status, cancel_requested FROM search_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if current is None or current["status"] != "queued":
+            conn.rollback()
+            return
+        if current["cancel_requested"]:
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE search_run_items
+                SET status = 'cancelled', finished_at = ?, updated_at = ?,
+                    error_message = 'Cancelled before dispatch.'
+                WHERE run_id = ? AND status = 'queued'
+                """,
+                (now, now, run_id),
+            )
+            searched, failed = _search_run_progress(conn, run_id)
             conn.execute(
                 """
                 UPDATE search_runs
-                SET status = 'running',
-                    max_workers = ?,
-                    districts_searched = 0,
-                    districts_failed = 0,
-                    finished_at = NULL,
-                    error_message = NULL
+                SET status = 'cancelled', districts_searched = ?, districts_failed = ?,
+                    finished_at = ?, error_message = 'Cancelled before start.'
                 WHERE id = ?
                 """,
-                (max_workers, run_id),
+                (searched, failed, now, run_id),
             )
-            conn.execute("DELETE FROM search_results WHERE search_run_id = ?", (run_id,))
             conn.commit()
+            return
+        searched, failed = _search_run_progress(conn, run_id)
+        claimed = conn.execute(
+            """
+            UPDATE search_runs
+            SET status = 'running', max_workers = ?, districts_searched = ?,
+                districts_failed = ?, finished_at = NULL, error_message = NULL
+            WHERE id = ? AND status = 'queued'
+            """,
+            (max_workers, searched, failed, run_id),
+        )
+        if claimed.rowcount != 1:
+            conn.rollback()
+            return
+        conn.commit()
 
-        def search_one(district: dict[str, Any]) -> list[dict[str, Any]]:
-            return search_district(
-                district,
-                query_text,
-                run_settings,
-                cancel_requested=lambda: is_cancel_requested(run_id, db_path),
-                debug_logger=debug_logger,
-                db_path=db_path,
-            )
+    with connect_db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT d.*, i.ordinal AS run_item_ordinal, i.attempt AS run_item_attempt
+            FROM search_run_items i
+            JOIN districts d ON d.id = i.district_id
+            WHERE i.run_id = ? AND i.status = 'queued'
+            ORDER BY i.ordinal
+            """,
+            (run_id,),
+        ).fetchall()
+    pending_districts = [dict(row) for row in rows]
 
-        def store_district_results(district: dict[str, Any], district_results: list[dict[str, Any]]) -> None:
+    debug_log(
+        debug_logger,
+        "run_loaded",
+        run_id=run_id,
+        query=query_text,
+        states=states,
+        agency_types=agency_types,
+        min_enrollment=min_enrollment,
+        max_enrollment=max_enrollment,
+        max_districts=cap,
+        max_pages_per_district=max_pages,
+        search_method=search_method,
+        search_provider=search_provider,
+        api_results_per_district=api_results_per_district,
+        follow_depth=follow_depth,
+        max_workers=max_workers,
+        current_workers=initial_workers,
+        matched_count=matched_count,
+        pending_items=len(pending_districts),
+    )
+
+    def search_one(district: dict[str, Any]) -> list[dict[str, Any]]:
+        return search_district(
+            district,
+            query_text,
+            run_settings,
+            cancel_requested=lambda: is_cancel_requested(run_id, db_path),
+            debug_logger=debug_logger,
+            db_path=db_path,
+        )
+
+    def claim_item(district_id: int) -> bool:
+        with connect_db(db_path) as conn:
             now = utc_now_iso()
-            with connect_db(db_path) as conn:
-                for rank, result in enumerate(district_results, start=1):
-                    conn.execute(
-                        """
-                        INSERT INTO search_results (
-                            search_run_id, district_id, district_name, state,
-                            agency_type, total_enrollment_excludes_ae, website,
-                            result_rank, url, title, content_type, status_code,
-                            search_source, score, snippet, matched_terms_json, created_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            run_id,
-                            district["id"],
-                            district["agency_name"],
-                            district["state"],
-                            district["agency_type"],
-                            district["total_enrollment_excludes_ae"],
-                            district["website_normalized"] or district["website"],
-                            rank,
-                            result["url"],
-                            result.get("title"),
-                            result.get("content_type"),
-                            result.get("status_code"),
-                            result.get("search_source"),
-                            result.get("score", 0),
-                            result.get("snippet"),
-                            json_dumps(result.get("matched_terms", [])),
-                            now,
-                        ),
-                    )
-                debug_log(
-                    debug_logger,
-                    "district_results_stored",
-                    run_id=run_id,
-                    district=district.get("agency_name"),
-                    stored_results=len(district_results),
-                )
+            cursor = conn.execute(
+                """
+                UPDATE search_run_items
+                SET status = 'running', attempt = attempt + 1, started_at = ?,
+                    updated_at = ?, finished_at = NULL, error_message = NULL
+                WHERE run_id = ? AND district_id = ? AND status = 'queued'
+                """,
+                (now, now, run_id, district_id),
+            )
+            conn.commit()
+        return bool(cursor.rowcount)
+
+    def store_district_results(
+        district: dict[str, Any],
+        district_results: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        now = utc_now_iso()
+        with connect_db(db_path) as conn:
+            # A retry replaces only this district's evidence. Completed districts
+            # and their results are never cleared when a run resumes.
+            conn.execute(
+                "DELETE FROM search_results WHERE search_run_id = ? AND district_id = ?",
+                (run_id, district["id"]),
+            )
+            for rank, result in enumerate(district_results, start=1):
                 conn.execute(
                     """
-                    UPDATE search_runs
-                    SET districts_searched = ?, districts_failed = ?
-                    WHERE id = ?
+                    INSERT INTO search_results (
+                        search_run_id, district_id, district_name, state,
+                        agency_type, total_enrollment_excludes_ae, website,
+                        result_rank, url, title, content_type, status_code,
+                        search_source, score, snippet, matched_terms_json, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (searched, failed, run_id),
+                    (
+                        run_id,
+                        district["id"],
+                        district["agency_name"],
+                        district["state"],
+                        district["agency_type"],
+                        district["total_enrollment_excludes_ae"],
+                        district["website_normalized"] or district["website"],
+                        rank,
+                        result["url"],
+                        result.get("title"),
+                        result.get("content_type"),
+                        result.get("status_code"),
+                        result.get("search_source"),
+                        result.get("score", 0),
+                        result.get("snippet"),
+                        json_dumps(result.get("matched_terms", [])),
+                        now,
+                    ),
+                )
+            conn.execute(
+                """
+                UPDATE search_run_items
+                SET status = 'completed', result_count = ?, finished_at = ?,
+                    updated_at = ?, error_message = NULL
+                WHERE run_id = ? AND district_id = ?
+                """,
+                (len(district_results), now, now, run_id, district["id"]),
+            )
+            searched_count, failed_count = _search_run_progress(conn, run_id)
+            conn.execute(
+                "UPDATE search_runs SET districts_searched = ?, districts_failed = ? WHERE id = ?",
+                (searched_count, failed_count, run_id),
+            )
+            conn.commit()
+        debug_log(
+            debug_logger,
+            "district_results_stored",
+            run_id=run_id,
+            district=district.get("agency_name"),
+            stored_results=len(district_results),
+        )
+        return searched_count, failed_count
+
+    def store_district_failure(district: dict[str, Any], error: BaseException) -> tuple[int, int]:
+        with connect_db(db_path) as conn:
+            now = utc_now_iso()
+            conn.execute(
+                """
+                UPDATE search_run_items
+                SET status = 'failed', result_count = 0, finished_at = ?,
+                    updated_at = ?, error_message = ?
+                WHERE run_id = ? AND district_id = ?
+                """,
+                (now, now, str(error), run_id, district["id"]),
+            )
+            searched_count, failed_count = _search_run_progress(conn, run_id)
+            conn.execute(
+                "UPDATE search_runs SET districts_searched = ?, districts_failed = ? WHERE id = ?",
+                (searched_count, failed_count, run_id),
+            )
+            conn.commit()
+        return searched_count, failed_count
+
+    cancelled = False
+    next_index = 0
+    future_to_district: dict[Future[list[dict[str, Any]]], tuple[dict[str, Any], float]] = {}
+    target_workers = initial_workers
+    try:
+        LOGGER.info("Search run %s started: query=%r matched=%s cap=%s", run_id, query_text, matched_count, cap)
+        debug_log(
+            debug_logger,
+            "run_start",
+            run_id=run_id,
+            district_count=len(pending_districts),
+            max_workers=max_workers,
+            target_workers=target_workers,
+        )
+        _persist_resource_state(run_id, target_workers, run_settings, db_path)
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="SearchRun") as executor:
+            while next_index < len(pending_districts) or future_to_district:
+                if is_cancel_requested(run_id, db_path):
+                    cancelled = True
+                backlog = len(pending_districts) - next_index
+                target_workers = _controller_target_workers(
+                    active_controller,
+                    target_workers,
+                    max_workers,
+                    backlog=backlog,
+                    active=len(future_to_district),
+                )
+                _persist_resource_state(run_id, target_workers, run_settings, db_path)
+
+                while (
+                    not cancelled
+                    and next_index < len(pending_districts)
+                    and len(future_to_district) < target_workers
+                ):
+                    district = pending_districts[next_index]
+                    next_index += 1
+                    if not claim_item(int(district["id"])):
+                        continue
+                    future = executor.submit(search_one, district)
+                    future_to_district[future] = (district, time.monotonic())
+
+                if not future_to_district:
+                    break
+                completed, _not_done = wait(
+                    tuple(future_to_district),
+                    timeout=0.5,
+                    return_when=FIRST_COMPLETED,
+                )
+                if not completed:
+                    continue
+                for future in completed:
+                    district, started_monotonic = future_to_district.pop(future)
+                    elapsed = max(0.0, time.monotonic() - started_monotonic)
+                    try:
+                        district_results = future.result()
+                        searched, failed = store_district_results(district, district_results)
+                        success = True
+                        result_count = len(district_results)
+                    except Exception as exc:
+                        searched, failed = store_district_failure(district, exc)
+                        success = False
+                        result_count = 0
+                        LOGGER.exception("District search failed for %s: %s", district.get("agency_name"), exc)
+                        debug_log(
+                            debug_logger,
+                            "district_error",
+                            run_id=run_id,
+                            district=district.get("agency_name"),
+                            error=str(exc),
+                        )
+                    _observe_district_completion(
+                        active_controller,
+                        success=success,
+                        elapsed_seconds=elapsed,
+                        result_count=result_count,
+                        backlog=len(pending_districts) - next_index,
+                        active=len(future_to_district),
+                    )
+                    target_workers = _controller_target_workers(
+                        active_controller,
+                        target_workers,
+                        max_workers,
+                        backlog=len(pending_districts) - next_index,
+                        active=len(future_to_district),
+                    )
+                    _persist_resource_state(run_id, target_workers, run_settings, db_path)
+
+        if cancelled:
+            with connect_db(db_path) as conn:
+                now = utc_now_iso()
+                conn.execute(
+                    """
+                    UPDATE search_run_items
+                    SET status = 'cancelled', finished_at = ?, updated_at = ?,
+                        error_message = 'Cancelled before dispatch.'
+                    WHERE run_id = ? AND status = 'queued'
+                    """,
+                    (now, now, run_id),
                 )
                 conn.commit()
 
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="SearchRun") as executor:
-            future_to_district = {}
-            for district in districts:
-                if is_cancel_requested(run_id, db_path):
-                    cancelled = True
-                    debug_log(debug_logger, "run_cancel_requested", run_id=run_id, before_district=district.get("agency_name"))
-                    break
-                future_to_district[executor.submit(search_one, district)] = district
-
-            for future in as_completed(future_to_district):
-                district = future_to_district[future]
-                if is_cancel_requested(run_id, db_path):
-                    cancelled = True
-                    for pending in future_to_district:
-                        pending.cancel()
-                    debug_log(debug_logger, "run_cancel_requested", run_id=run_id, before_district=district.get("agency_name"))
-                    break
-                try:
-                    district_results = future.result()
-                    searched += 1
-                    store_district_results(district, district_results)
-                    if is_cancel_requested(run_id, db_path):
-                        cancelled = True
-                        debug_log(
-                            debug_logger,
-                            "run_cancel_requested",
-                            run_id=run_id,
-                            after_district=district.get("agency_name"),
-                        )
-                        break
-                except Exception as exc:
-                    searched += 1
-                    failed += 1
-                    LOGGER.exception("District search failed for %s: %s", district.get("agency_name"), exc)
-                    debug_log(
-                        debug_logger,
-                        "district_error",
-                        run_id=run_id,
-                        district=district.get("agency_name"),
-                        error=str(exc),
-                    )
-                    with connect_db(db_path) as conn:
-                        conn.execute(
-                            """
-                            UPDATE search_runs
-                            SET districts_searched = ?, districts_failed = ?
-                            WHERE id = ?
-                            """,
-                            (searched, failed, run_id),
-                        )
-                        conn.commit()
-                    if is_cancel_requested(run_id, db_path):
-                        cancelled = True
-                        debug_log(
-                            debug_logger,
-                            "run_cancel_requested",
-                            run_id=run_id,
-                            after_district=district.get("agency_name"),
-                        )
-                        break
-
-        final_status = "cancelled" if cancelled else "completed"
-        error_message = "Cancelled by user." if cancelled else None
         with connect_db(db_path) as conn:
+            searched, failed = _search_run_progress(conn, run_id)
+            cancel_row = conn.execute(
+                "SELECT cancel_requested FROM search_runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            final_status = "cancelled" if cancelled or bool(cancel_row and cancel_row["cancel_requested"]) else "completed"
+            error_message = "Cancelled by user." if final_status == "cancelled" else None
             conn.execute(
                 """
                 UPDATE search_runs
-                SET status = ?,
-                    districts_searched = ?,
-                    districts_failed = ?,
-                    finished_at = ?,
-                    error_message = ?
+                SET status = ?, districts_searched = ?, districts_failed = ?,
+                    finished_at = ?, error_message = ?
                 WHERE id = ?
                 """,
                 (final_status, searched, failed, utc_now_iso(), error_message, run_id),
@@ -1974,14 +2563,12 @@ def execute_search_run(
         LOGGER.info("Search run %s %s: searched=%s failed=%s", run_id, final_status, searched, failed)
     except Exception as exc:
         with connect_db(db_path) as conn:
+            searched, failed = _search_run_progress(conn, run_id)
             conn.execute(
                 """
                 UPDATE search_runs
-                SET status = 'failed',
-                    districts_searched = ?,
-                    districts_failed = ?,
-                    finished_at = ?,
-                    error_message = ?
+                SET status = 'failed', districts_searched = ?, districts_failed = ?,
+                    finished_at = ?, error_message = ?
                 WHERE id = ?
                 """,
                 (searched, failed, utc_now_iso(), str(exc), run_id),
@@ -2014,6 +2601,10 @@ def run_search(
     debug_logging: bool = False,
     db_path: Path | str | None = None,
     settings: SearchSettings | None = None,
+    district_ids: list[int] | tuple[int, ...] | None = None,
+    adaptive_enabled: bool = False,
+    resource_policy: dict[str, Any] | None = None,
+    resource_controller: Any | None = None,
 ) -> int:
     run_id = create_search_run(
         query_text,
@@ -2026,9 +2617,17 @@ def run_search(
         debug_logging=debug_logging,
         db_path=db_path,
         settings=settings,
-        status="running",
+        status="queued",
+        district_ids=district_ids,
+        adaptive_enabled=adaptive_enabled,
+        resource_policy=resource_policy,
     )
-    execute_search_run(run_id, db_path=db_path, settings=settings)
+    execute_search_run(
+        run_id,
+        db_path=db_path,
+        settings=settings,
+        resource_controller=resource_controller,
+    )
     return run_id
 
 

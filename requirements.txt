@@ -7,3 +7,4 @@ lxml>=5.0,<7
 openpyxl>=3.1,<4
 pypdf>=5.0,<7
 playwright>=1.48,<2
+psutil>=6.0,<8

@@ -13,12 +13,26 @@
 
   <section class="module-columns" aria-label="EdScanner modules">
     <div class="module-column">
+      <section class="module-group module-group-guided">
+        <div class="module-group-heading">
+          <div><p class="module-kicker">Local AI-guided workflow</p><h3>Guided District Search</h3></div>
+          <a class="module-help-link" href="{{ url_for('help_topic_page', slug='guided-search') }}">Guide</a>
+        </div>
+        <p class="module-intro">Describe a research goal in ordinary language, review a validated plan, and let EdScanner coordinate bounded profile discovery and website-search rounds.</p>
+        <div class="module-list">
+          <div class="module-row">
+            <a class="module-button" href="{{ url_for('guided_search.index') }}">Guided District Search</a>
+            <div class="description">Use the configured local Ollama model for planning and evidence review while EdScanner retains control of every query, method, budget, and request.</div>
+          </div>
+        </div>
+      </section>
+
       <section class="module-group module-group-search">
         <div class="module-group-heading">
           <div><p class="module-kicker">District websites</p><h3>Search and Discovery</h3></div>
           <a class="module-help-link" href="{{ url_for('help_topic_page', slug='search') }}">Guide</a>
         </div>
-        <p class="module-intro">Prepare district-native search endpoints, then search public site content with profile, API, or crawler methods.</p>
+        <p class="module-intro">Use the existing manual tools directly: prepare district-native search endpoints, then search public site content with profile, API, or crawler methods.</p>
         <div class="module-list">
           <div class="module-row">
             <a class="module-button" href="{{ url_for('search_profiles_page') }}">Search Profiles</a>

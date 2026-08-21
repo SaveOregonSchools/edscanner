@@ -1,0 +1,280 @@
+{% extends "base.html" %}
+
+{% block title %}Guided Search #{{ session.id }} - EdScanner{% endblock %}
+
+{% block head_extra %}
+  {% if active %}
+    <meta http-equiv="refresh" content="10">
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">Guided District Search</p>
+      <h2>Session #{{ session.id }}</h2>
+    </div>
+    <div class="action-row">
+      <a class="button-link" href="{{ url_for('guided_search.index') }}">New guided search</a>
+      <a class="button-link" href="{{ url_for('guided_search.detail', session_id=session.id) }}">Refresh</a>
+      {% if session.debug_log_path %}
+        <a class="button-link" href="{{ url_for('guided_search.debug_log', session_id=session.id) }}" target="_blank" rel="noopener">Debug log</a>
+      {% endif %}
+      {% if session.status not in ['completed', 'cancelled', 'failed'] and not session.cancel_requested %}
+        <form method="post" action="{{ url_for('guided_search.cancel', session_id=session.id) }}" class="inline-action">
+          <button type="submit" class="danger">Cancel</button>
+        </form>
+      {% endif %}
+    </div>
+  </section>
+
+  {% if session.cancel_requested and active %}
+    <p class="status-note">Cancellation is requested. The active child request or district will finish safely, and evidence already stored will be preserved.</p>
+  {% elif active %}
+    <p class="status-note">This page refreshes every 10 seconds while Guided Search works in the background. Closing the page does not cancel the session.</p>
+  {% endif %}
+
+  {% if session.status == 'needs_review' %}
+    <div class="message warn">
+      <strong>Manual review needed.</strong>
+      {{ session.review_reason or session.error_message or 'Guided Search cannot safely choose the next action.' }}
+    </div>
+  {% elif session.status == 'failed' %}
+    <div class="message error"><strong>Guided Search failed.</strong> {{ session.error_message or 'See the activity timeline or debug log.' }}</div>
+  {% endif %}
+
+  <section class="stat-grid compact" aria-label="Guided Search status">
+    <div class="stat"><span class="stat-label">Status</span><strong>{{ session.status }}</strong></div>
+    <div class="stat"><span class="stat-label">Stage</span><strong>{{ session.stage or session.status }}</strong></div>
+    <div class="stat"><span class="stat-label">Districts</span><strong>{{ session.district_count|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Round</span><strong>{{ session.round_number|fmt_int }} / {{ session.max_rounds|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Completed</span><strong>{{ session.districts_completed|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Evidence URLs</span><strong>{{ session.results_found|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Failures</span><strong>{{ session.failures|fmt_int }}</strong></div>
+    <div class="stat"><span class="stat-label">Workers</span><strong>{{ session.current_workers|fmt_int or '—' }}</strong></div>
+    <div class="stat"><span class="stat-label">Delay</span><strong>{% if session.current_delay_seconds is not none %}{{ '%.2f'|format(session.current_delay_seconds) }}s{% else %}—{% endif %}</strong></div>
+    <div class="stat"><span class="stat-label">Elapsed</span><strong>{{ elapsed or '' }}</strong></div>
+  </section>
+
+  <section class="content-section">
+    <h2>Research goal and scope</h2>
+    <blockquote class="objective-quote">{{ session.original_objective }}</blockquote>
+    <table class="key-table">
+      <tbody>
+        <tr><th>States</th><td>{{ session.scope.states|join(', ') if session.scope.states else 'All imported states' }}</td></tr>
+        <tr><th>Agency types</th><td>{{ session.scope.agency_types|join(', ') if session.scope.agency_types else 'All imported types' }}</td></tr>
+        <tr><th>Enrollment</th><td>{{ session.scope.min_enrollment|fmt_int or 'Any' }} to {{ session.scope.max_enrollment|fmt_int or 'Any' }}</td></tr>
+        <tr><th>Preference</th><td>{{ session.strategy_mode|title }}</td></tr>
+        <tr><th>Local AI model</th><td>{{ session.ai_model or 'Configured Ollama model' }}</td></tr>
+        <tr><th>Brave permission</th><td>{{ 'Allowed for this session' if session.brave_allowed else 'Not allowed' }}</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  {% if session.status == 'needs_clarification' %}
+    <section class="tool-surface clarification-panel">
+      <h2>A few details would materially improve the plan</h2>
+      <p class="field-note">Guided Search asks at most three questions per round and no more than two clarification rounds.</p>
+      <form method="post" action="{{ url_for('guided_search.clarify', session_id=session.id) }}" class="settings-form">
+        {% for question in session.clarification_questions %}
+          <div class="full">
+            <label for="clarification_{{ loop.index }}">{{ question }}</label>
+            <textarea id="clarification_{{ loop.index }}" name="answers" rows="3" maxlength="2000" required></textarea>
+            <input type="hidden" name="questions" value="{{ question }}">
+          </div>
+        {% endfor %}
+        <div class="form-actions full"><button type="submit">Update the plan</button></div>
+      </form>
+    </section>
+  {% endif %}
+
+  {% if plan %}
+    <section class="content-section plan-review">
+      <div class="section-heading-row">
+        <h2>Validated search plan</h2>
+        {% if session.status == 'ready' %}<span class="status-note">Review this plan before searching begins.</span>{% endif %}
+      </div>
+      <p>{{ plan.short_explanation }}</p>
+      <table class="key-table">
+        <tbody>
+          <tr><th>Interpreted objective</th><td>{{ plan.objective }}</td></tr>
+          <tr><th>Likely approach</th><td>{{ plan.preferred_search_method|replace('_', ' ') }}</td></tr>
+          <tr><th>Profile policy</th><td>{{ plan.profile_policy|replace('_', ' ') }}</td></tr>
+          <tr><th>Profile coverage</th><td>{{ coverage.working|fmt_int }} working, {{ coverage.requires_javascript|fmt_int }} JavaScript-usable, {{ coverage.missing|fmt_int }} missing, {{ coverage.stale|fmt_int }} stale, {{ coverage.review_or_error|fmt_int }} unavailable/review</td></tr>
+          <tr><th>Hard limits</th><td>{{ plan.stop_policy.max_rounds }} rounds; {{ plan.stop_policy.max_child_search_runs }} child search runs</td></tr>
+          <tr><th>Resources</th><td>Start at {{ plan.resource_policy.initial_workers }} workers; never exceed {{ plan.resource_policy.max_workers }}</td></tr>
+          {% if session.brave_allowed %}
+            <tr><th>Estimated Brave use</th><td>The reviewed first-round plan would use up to {{ estimated_brave_calls|fmt_int }} calls (approximately ${{ '%.2f'|format(estimated_brave_cost) }}). If later validated rounds switch to Brave, the hard session ceiling is {{ estimated_brave_session_max_calls|fmt_int }} calls (approximately ${{ '%.2f'|format(estimated_brave_session_max_cost) }} at the displayed estimate).</td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+
+      {% if plan.search_concepts %}
+        <h3>Search concepts</h3>
+        <ul class="concept-list">
+          {% for concept in plan.search_concepts %}
+            <li><strong>{{ concept.name }}</strong>{% if concept.required %} (required){% endif %}{% if concept.synonyms %}: {{ concept.synonyms|join(', ') }}{% endif %}{% if concept.exclude_terms %}; exclude {{ concept.exclude_terms|join(', ') }}{% endif %}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+
+      <h3>Planned queries</h3>
+      <ol class="query-plan-list">
+        {% for query in plan.queries %}
+          <li><code>{{ query.query_text }}</code><span>{{ query.purpose }}</span></li>
+        {% endfor %}
+      </ol>
+      <details>
+        <summary>Advanced plan details</summary>
+        <p><strong>Positive signals:</strong> {{ plan.evaluation_criteria.positive_signals|join('; ') or 'Not specified' }}</p>
+        <p><strong>Negative signals:</strong> {{ plan.evaluation_criteria.negative_signals|join('; ') or 'Not specified' }}</p>
+        <p><strong>Minimum evidence:</strong> {{ plan.evaluation_criteria.minimum_evidence or 'Not specified' }}</p>
+      </details>
+
+      {% if session.status == 'ready' %}
+        <form method="post" action="{{ url_for('guided_search.start', session_id=session.id) }}" class="form-actions">
+          <button type="submit">Start Guided Search</button>
+        </form>
+      {% endif %}
+    </section>
+  {% endif %}
+
+  {% if session.status == 'needs_review' %}
+    <section class="tool-surface review-actions">
+      <h2>Review actions</h2>
+      <div class="action-row">
+        <form method="post" action="{{ url_for('guided_search.retry_ai', session_id=session.id) }}" class="inline-action"><button type="submit">Retry AI</button></form>
+        {% if can_continue_plan %}<form method="post" action="{{ url_for('guided_search.continue_plan', session_id=session.id) }}" class="inline-action"><button type="submit" class="secondary">Continue last validated plan</button></form>{% endif %}
+        {% if can_stop_and_summarize %}<form method="post" action="{{ url_for('guided_search.summarize', session_id=session.id) }}" class="inline-action"><button type="submit" class="secondary">Stop and summarize</button></form>{% endif %}
+        {% if plan and plan.queries %}
+          <a class="button-link" href="{{ url_for('search_page', query_text=manual_prefill.query_text, states=session.scope.states, agency_types=session.scope.agency_types, min_enrollment=session.scope.min_enrollment, max_enrollment=session.scope.max_enrollment, max_districts=session.scope.max_districts, search_method=manual_prefill.search_method, max_pages_per_district=manual_prefill.max_pages_per_district, max_workers=manual_prefill.max_workers, api_results_per_district=manual_prefill.api_results_per_district, follow_depth=manual_prefill.follow_depth) }}">Open manual Search prefilled</a>
+        {% endif %}
+      </div>
+    </section>
+  {% endif %}
+
+  {% if plan and session.status in ['ready', 'needs_review'] %}
+    <section class="tool-surface manual-override">
+      <details>
+        <summary>Manual review and override</summary>
+        <p class="field-note">Add one validated EdScanner query to the next bounded round, or stop after completed child runs and request a summary.</p>
+        <form method="post" action="{{ url_for('guided_search.add_query', session_id=session.id) }}" class="settings-form">
+          <div class="full"><label for="manual_query">Next query</label><input id="manual_query" name="query_text" maxlength="500" placeholder='"full-service community schools"' required></div>
+          <div class="full"><label for="manual_purpose">Purpose</label><input id="manual_purpose" name="purpose" maxlength="500" placeholder="Explain why this query should run"></div>
+          <div class="form-actions full"><button type="submit">Run another query</button></div>
+        </form>
+      </details>
+    </section>
+  {% endif %}
+
+  <section class="content-section">
+    <h2>Underlying EdScanner runs</h2>
+    {% if children %}
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Stage</th><th>Round</th><th>Purpose or query</th><th>Method</th><th>Run</th><th>Status</th><th>Progress</th><th>Failures</th><th>Results</th></tr></thead>
+          <tbody>
+            {% for child in children %}
+              <tr>
+                <td>{{ child.child_type|replace('_', ' ') }}</td>
+                <td>{{ child.round_number|fmt_int }}</td>
+                <td>
+                  {% if child.query_text %}
+                    <code>{{ child.query_text }}</code>
+                    {% if child.purpose %}<span class="field-note">Why: {{ child.purpose }}</span>{% endif %}
+                  {% else %}
+                    {{ child.purpose or 'Profile coverage' }}
+                  {% endif %}
+                </td>
+                <td>{{ child.search_method|default('profile discovery', true)|replace('_', ' ') }}</td>
+                <td>
+                  {% if child.child_type == 'search' %}
+                    <a href="{{ url_for('run_detail', run_id=child.child_run_id) }}">Search #{{ child.child_run_id }}</a>
+                  {% else %}
+                    <a href="{{ url_for('profile_discovery_run_detail', run_id=child.child_run_id) }}">Profiles #{{ child.child_run_id }}</a>
+                  {% endif %}
+                </td>
+                <td><span class="status {{ child.run_status or child.status }}">{{ child.run_status or child.status }}</span></td>
+                <td>{{ child.processed|default(0, true)|fmt_int }} / {{ child.planned|default(0, true)|fmt_int }}</td>
+                <td>{{ child.failures|default(0, true)|fmt_int }}</td>
+                <td>{{ child.result_count|default(0, true)|fmt_int }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <p class="empty">No child runs have started. Planning and clarification do not search district sites.</p>
+    {% endif %}
+  </section>
+
+  {% if evaluation %}
+    <section class="content-section evaluation-checkpoint">
+      <h2>Latest AI evaluation checkpoint</h2>
+      <table class="key-table"><tbody>
+        <tr><th>Assessment</th><td>{{ evaluation.assessment }}</td></tr>
+        <tr><th>Confidence</th><td>{{ '%.0f%%'|format((evaluation.confidence or 0) * 100) }}</td></tr>
+        <tr><th>Recommended action</th><td>{{ evaluation.recommended_action|replace('_', ' ') }}</td></tr>
+        <tr><th>Why</th><td>{{ evaluation.short_reason }}</td></tr>
+        <tr><th>New information gain</th><td>{{ '%.0f%%'|format((evaluation.new_information_gain or 0) * 100) }}</td></tr>
+      </tbody></table>
+      <p class="field-note">The recommendation is advisory. EdScanner validates queries, methods, permissions, resource bounds, and remaining budgets before acting.</p>
+    </section>
+  {% endif %}
+
+  {% if evidence %}
+    <section class="content-section">
+      <h2>Potentially relevant evidence</h2>
+      <p class="field-note">These relevance and confidence judgments are heuristic. Open the child runs for every raw result and query-specific score.</p>
+      <div class="evidence-list">
+        {% for item in evidence %}
+          <article class="evidence-card {% if item.likely_false_positive %}borderline{% endif %}">
+            <div class="evidence-heading">
+              <h3><a href="{{ item.url }}" target="_blank" rel="noopener">{{ item.title or item.url }}</a></h3>
+              <span>{{ item.district_name }} · {{ item.state }}</span>
+            </div>
+            <p>{{ item.snippet }}</p>
+            <p class="field-note">First found in round {{ item.first_round }} · score {{ '%.1f'|format(item.best_score or 0) }}{% if item.useful %} · AI-selected useful evidence{% endif %}{% if item.likely_false_positive %} · possible false positive{% endif %}</p>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+  {% endif %}
+
+  {% if summary %}
+    <section class="content-section final-summary">
+      <h2>Final summary</h2>
+      <div class="summary-callout"><p>{{ summary.overview }}</p></div>
+      {% if summary.what_was_searched %}
+        <h3>What was searched</h3><p>{{ summary.what_was_searched }}</p>
+      {% endif %}
+      {% if summary.what_was_found %}
+        <h3>What was found</h3><p>{{ summary.what_was_found }}</p>
+      {% endif %}
+      {% if summary.how_search_evolved %}
+        <h3>How the search evolved</h3><p>{{ summary.how_search_evolved }}</p>
+      {% endif %}
+      {% if summary.limitations %}
+        <h3>Limitations</h3><ul>{% for limitation in summary.limitations %}<li>{{ limitation }}</li>{% endfor %}</ul>
+      {% endif %}
+      <p class="status-note">Guided Search uses heuristic relevance judgments. A missing result does not prove that evidence does not exist.</p>
+    </section>
+  {% endif %}
+
+  <section class="content-section activity-timeline">
+    <h2>Activity timeline</h2>
+    {% if steps %}
+      <ol>
+        {% for step in steps %}
+          <li>
+            <time>{{ (step.finished_at or step.started_at or step.created_at)|fmt_dt }}</time>
+            <span class="timeline-marker {{ step.status }}"></span>
+            <div><strong>{{ step.description or step.step_type|replace('_', ' ')|title }}</strong>{% if step.error_message %}<p>{{ step.error_message }}</p>{% endif %}</div>
+          </li>
+        {% endfor %}
+      </ol>
+    {% else %}
+      <p class="empty">The first activity event will appear after the planner starts.</p>
+    {% endif %}
+  </section>
+{% endblock %}

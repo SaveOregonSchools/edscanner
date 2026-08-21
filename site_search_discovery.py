@@ -31,6 +31,7 @@ from search_engine import (
     query_variants_for_profile,
     score_match,
     same_organization_url,
+    wait_for_request_delay,
 )
 
 
@@ -973,8 +974,7 @@ def _test_candidate(
                             raw["confirmed_urls"].append(match["url"])
                             if confirmed == 1:
                                 confidence += 30
-                        if settings.delay_seconds:
-                            time.sleep(settings.delay_seconds)
+                        wait_for_request_delay(settings)
                     success = confirmed > 0
                 elif "html" in content_type.casefold() or not content_type:
                     result_links = parse_search_results_page(
@@ -1028,8 +1028,7 @@ def _test_candidate(
                             raw["confirmed_urls"].append(match["url"])
                             if confirmed == 1:
                                 confidence += 30
-                        if settings.delay_seconds:
-                            time.sleep(settings.delay_seconds)
+                        wait_for_request_delay(settings)
                     success = confirmed > 0
                 else:
                     error_message = f"Unsupported content type: {content_type}"
@@ -1371,8 +1370,7 @@ def discover_district_search_profile(
                     attempt=attempt + 1,
                     error=str(exc),
                 )
-                if settings.delay_seconds:
-                    time.sleep(settings.delay_seconds)
+                wait_for_request_delay(settings)
                 continue
     if homepage_error is not None or response is None:
         debug_log(
@@ -1408,8 +1406,7 @@ def discover_district_search_profile(
             content_length=len(homepage),
             provider_guess=provider_guess,
         )
-        if settings.delay_seconds:
-            time.sleep(settings.delay_seconds)
+        wait_for_request_delay(settings)
         try:
             session.headers.update({"Cache-Control": "no-cache", "Pragma": "no-cache"})
             retry_response, retry_homepage = fetch_limited(session, base_url, settings)
@@ -1441,8 +1438,7 @@ def discover_district_search_profile(
             )
         if _is_suspicious_markerless_homepage(homepage, final_home_url, provider_guess):
             cache_busted_url = _cache_busted_url(base_url)
-            if settings.delay_seconds:
-                time.sleep(settings.delay_seconds)
+            wait_for_request_delay(settings)
             try:
                 cache_response, cache_homepage = fetch_limited(session, cache_busted_url, settings)
                 cache_provider_guess = _detect_provider_guess(cache_homepage, cache_response.url)
@@ -1530,8 +1526,7 @@ def discover_district_search_profile(
         except Exception as exc:
             debug_log(debug_logger, "profile_candidate_failed", district=district.get("agency_name"), url=search_page_url, error=str(exc))
         finally:
-            if settings.delay_seconds:
-                time.sleep(settings.delay_seconds)
+            wait_for_request_delay(settings)
     discovered.extend(_common_template_candidates(discovery_base_url))
 
     candidates: list[dict[str, Any]] = []
@@ -1588,8 +1583,7 @@ def discover_district_search_profile(
         test_results.append(result)
         if result["profile_status"] == "working" and result["confidence"] >= 80:
             break
-        if settings.delay_seconds:
-            time.sleep(settings.delay_seconds)
+        wait_for_request_delay(settings)
 
     best = select_best_profile_test_result(test_results)
     resolved_provider_guess = best.get("provider_guess") or provider_guess
@@ -1855,7 +1849,6 @@ def search_with_district_profile(
             )
         else:
             debug_log(debug_logger, "district_search_result_rejected", district=district.get("agency_name"), url=url, reason="no_match")
-        if settings.delay_seconds:
-            time.sleep(settings.delay_seconds)
+        wait_for_request_delay(settings, cancel_requested)
 
     return sorted(result_map.values(), key=lambda item: item["score"], reverse=True)[: settings.max_results_per_district]

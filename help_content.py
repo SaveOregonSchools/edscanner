@@ -35,6 +35,10 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                         "Choose a search method, enter a simple or advanced query, preview the district count, and start a persistent run.",
                     ),
                     (
+                        "Or use Guided District Search",
+                        "Describe a research goal, choose a district scope, and review the local-AI plan before any district search begins.",
+                    ),
+                    (
                         "Set up specialized monitoring",
                         "Discover and sync school-board sources, or scan district sites for labor agreements.",
                     ),
@@ -62,6 +66,7 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                     ("districts_page", "Districts"),
                     ("search_profiles_page", "Search Profiles"),
                     ("search_page", "Search"),
+                    ("guided_search.index", "Guided District Search"),
                 ],
             },
         ),
@@ -204,6 +209,56 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                     },
                 ],
                 "related": [("search_page", "Open Search"), ("search_profiles_page", "Open Search Profiles")],
+            },
+        ),
+        (
+            "guided-search",
+            {
+                "title": "Guided District Search",
+                "summary": (
+                    "Turn a plain-language research goal into a reviewable, bounded sequence of "
+                    "ordinary EdScanner profile and district-website search runs."
+                ),
+                "steps": [
+                    ("Describe the goal", "State what evidence matters and what should be excluded. EdScanner preserves the original wording for later evaluation."),
+                    ("Choose the exact scope", "Filter the imported districts and set a maximum. That cohort is frozen when planning starts and reused by every child run."),
+                    ("Add optional examples", "Paste terminology or provide one public HTTP(S) example URL. Retrieved example text is bounded and treated as untrusted evidence."),
+                    ("Review the plan", "Check the proposed queries, profile policy, search method, resource bounds, and any Brave estimate before approving substantive search work."),
+                    ("Monitor and review", "Follow profile and search child runs, AI checkpoints, evidence provenance, resource adjustments, stop conditions, and the final summary."),
+                ],
+                "sections": [
+                    {
+                        "title": "What the local model can and cannot do",
+                        "paragraphs": [
+                            "The configured Ollama model can propose structured plans, evaluate a bounded evidence sample, recommend a revision, and draft the final summary. It cannot execute arbitrary tools, SQL, shell commands, URLs, or search methods.",
+                            "EdScanner validates every AI response against a strict schema and its normal query parser. Invalid output gets one structured repair attempt; endpoint failure or repeated invalid output moves the session to manual review without losing completed evidence.",
+                        ],
+                    },
+                    {
+                        "title": "Budgets, paid search, and resources",
+                        "bullets": [
+                            "Fast, Balanced, and Thorough set hard limits for pages, rounds, child runs, workers, and browser-backed profile use.",
+                            "Brave is off by default for every session, even when a key is configured. You must explicitly allow it and approve the plan before use.",
+                            "Guided runs can reduce or cautiously increase concurrency and add request delay in response to machine pressure, errors, timeouts, and rate limits. Manual Search keeps its fixed settings.",
+                            "Deterministic application limits always override an AI recommendation to continue.",
+                        ],
+                    },
+                    {
+                        "title": "Recovery, review, and evidence",
+                        "bullets": [
+                            "Sessions, stages, exact district cohorts, child runs, model-call metadata, and every evidence source are persisted in SQLite.",
+                            "A restart resumes the stored stage and only retries unfinished district items; completed search results are retained.",
+                            "Use Retry AI, Continue last validated plan, Stop and summarize, a manual follow-up query, or the prefilled manual Search link when judgment is needed.",
+                            "Relevance and completeness are heuristic. A missing result never proves a district lacks the requested material.",
+                        ],
+                    },
+                ],
+                "related": [
+                    ("guided_search.index", "Open Guided District Search"),
+                    ("search_page", "Open manual Search"),
+                    ("search_profiles_page", "Open Search Profiles"),
+                    ("settings_page", "Configure Ollama"),
+                ],
             },
         ),
         (
@@ -406,12 +461,12 @@ HELP_TOPICS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
                     {
                         "title": "Local AI / Ollama",
                         "paragraphs": [
-                            "One or more Ollama endpoints and a model can optionally assist contract classification. Board collection and ordinary district search do not require AI.",
-                            "Use Test connection before starting a large AI-assisted scan. Endpoints are tried in priority order.",
+                            "One or more Ollama endpoints and a model can optionally assist contract classification and are required for Guided District Search. Board collection and ordinary manual district search do not require AI.",
+                            "Endpoints are tried in priority order. qwen3.5:9b is the recommended starting model for a fresh Guided Search setup; EdScanner never replaces an existing model automatically.",
                         ],
                     },
                 ],
-                "related": [("settings_page", "Open Settings")],
+                "related": [("settings_page", "Open Settings"), ("guided_search.index", "Open Guided District Search")],
             },
         ),
     ]

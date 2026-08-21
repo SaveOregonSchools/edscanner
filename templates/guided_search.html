@@ -1,0 +1,216 @@
+{% extends "base.html" %}
+
+{% block title %}Guided District Search - EdScanner{% endblock %}
+
+{% block content %}
+  <section class="page-heading">
+    <div>
+      <p class="eyebrow">AI-guided research workflow</p>
+      <h2>Guided District Search</h2>
+    </div>
+    <a class="button-link" href="{{ url_for('help_topic_page', slug='guided-search') }}">Guided Search guide</a>
+  </section>
+
+  <section class="content-section guided-intro">
+    <p>Tell EdScanner what you want to find. The configured local Ollama model will propose a bounded search plan, while EdScanner validates every query and controls every district search.</p>
+    <p class="status-note">This is an additional workflow. <a href="{{ url_for('search_page') }}">Search Websites</a> and <a href="{{ url_for('search_profiles_page') }}">Search Profiles</a> retain their full manual controls.</p>
+    {% if not llm_configured %}
+      <div class="message warn">Guided Search needs a configured local Ollama server and model. <a href="{{ url_for('settings_page') }}">Open Settings</a>.</div>
+    {% endif %}
+  </section>
+
+  <section class="tool-surface">
+    <form method="post" action="{{ url_for('guided_search.index') }}" class="guided-wizard" data-scope-url="{{ url_for('guided_search.scope_count') }}">
+      <ol class="wizard-progress" aria-label="Guided Search steps">
+        <li class="active" data-progress-step="1">Goal</li>
+        <li data-progress-step="2">Scope</li>
+        <li data-progress-step="3">Examples</li>
+        <li data-progress-step="4">Preference</li>
+      </ol>
+
+      <fieldset class="wizard-step" data-wizard-step="1">
+        <legend>1. What are you trying to find?</legend>
+        <p class="field-note">Describe the evidence you want in ordinary language. You do not need to know EdScanner query syntax.</p>
+        <label for="objective">Research goal</label>
+        <textarea id="objective" name="objective" rows="8" maxlength="8000" required placeholder="For example: Find references to restorative justice programs, but exclude generic student discipline policies.">{{ form_values.objective or '' }}</textarea>
+        <div class="wizard-examples">
+          <p><strong>Examples</strong></p>
+          <ul>
+            <li>Districts that have adopted a community schools model.</li>
+            <li>Contracts, program pages, or announcements involving Organization X.</li>
+            <li>DEI strategic plans that specifically discuss student affinity groups.</li>
+          </ul>
+        </div>
+        <div class="form-actions">
+          <button type="button" data-wizard-next>Next: district scope</button>
+        </div>
+      </fieldset>
+
+      <fieldset class="wizard-step" data-wizard-step="2">
+        <legend>2. Choose the district scope</legend>
+        <p class="field-note">Options come from the district records currently imported into EdScanner. Leave a list unselected to include all values.</p>
+        <div class="search-form guided-scope-grid">
+          <div>
+            <label for="guided_states">States</label>
+            <select id="guided_states" name="states" multiple size="8">
+              {% for state in options.states %}
+                <option value="{{ state }}" {% if state in form_values.states %}selected{% endif %}>{{ state }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label for="guided_agency_types">Agency or district types</label>
+            <select id="guided_agency_types" name="agency_types" multiple size="8">
+              {% for agency_type in options.agency_types %}
+                <option value="{{ agency_type }}" {% if agency_type in form_values.agency_types %}selected{% endif %}>{{ agency_type }}</option>
+              {% endfor %}
+            </select>
+          </div>
+          <div>
+            <label for="guided_min_enrollment">Minimum enrollment <span class="optional">optional</span></label>
+            <input id="guided_min_enrollment" name="min_enrollment" type="number" min="0" value="{{ form_values.min_enrollment or '' }}">
+          </div>
+          <div>
+            <label for="guided_max_enrollment">Maximum enrollment <span class="optional">optional</span></label>
+            <input id="guided_max_enrollment" name="max_enrollment" type="number" min="0" value="{{ form_values.max_enrollment or '' }}">
+          </div>
+          <div>
+            <label for="guided_max_districts">Maximum districts</label>
+            <input id="guided_max_districts" name="max_districts" type="number" min="1" max="{{ max_total_districts_per_run }}" value="{{ form_values.max_districts }}" required>
+          </div>
+          <div class="scope-preview" aria-live="polite">
+            <span>Matching searchable districts</span>
+            <strong id="guided-scope-matching-count">{{ initial_matching_count|fmt_int }}</strong>
+            <span>Planned after maximum</span>
+            <strong id="guided-scope-planned-count">{{ initial_planned_count|fmt_int }}</strong>
+            <button type="button" class="secondary" id="refresh-guided-scope">Refresh count</button>
+          </div>
+        </div>
+        <div class="form-actions">
+          <button type="button" class="secondary" data-wizard-back>Back</button>
+          <button type="button" data-wizard-next>Next: example context</button>
+        </div>
+      </fieldset>
+
+      <fieldset class="wizard-step" data-wizard-step="3">
+        <legend>3. Add example context <span class="optional">optional</span></legend>
+        <p class="field-note">Examples help the planner understand your intent. They do not become district sites in the search scope.</p>
+        <label for="example_text">Example text</label>
+        <textarea id="example_text" name="example_text" rows="7" maxlength="16000" placeholder="Paste a passage, terminology, policy language, or description of a positive example.">{{ form_values.example_text or '' }}</textarea>
+        <label for="example_url">Public example URL</label>
+        <input id="example_url" name="example_url" type="url" maxlength="2048" value="{{ form_values.example_url or '' }}" placeholder="https://example.org/relevant-page">
+        <p class="field-note">EdScanner retrieves only bounded public HTTP(S) content. Local, private, credential-bearing, unsafe redirect, unsupported, and oversized destinations are rejected.</p>
+        <div class="form-actions">
+          <button type="button" class="secondary" data-wizard-back>Back</button>
+          <button type="button" data-wizard-next>Next: search preference</button>
+        </div>
+      </fieldset>
+
+      <fieldset class="wizard-step" data-wizard-step="4">
+        <legend>4. Choose a search preference</legend>
+        <div class="mode-options">
+          {% for value, title, description in [
+            ('fast', 'Fast', 'A focused first pass with the smallest page and round budget.'),
+            ('balanced', 'Balanced', 'Good coverage with bounded refinement and moderate resources.'),
+            ('thorough', 'Thorough', 'More pages, terminology variants, and browser-backed profiles where useful.')
+          ] %}
+            <label class="mode-card">
+              <input type="radio" name="strategy_mode" value="{{ value }}" {% if form_values.strategy_mode == value %}checked{% endif %}>
+              <span><strong>{{ title }}</strong><small>{{ description }}</small></span>
+            </label>
+          {% endfor %}
+        </div>
+        {% if brave_key_present %}
+          <div class="checkbox-field guided-brave-choice">
+            <input id="brave_allowed" name="brave_allowed" type="checkbox" value="1" {% if form_values.brave_allowed %}checked{% endif %}>
+            <label for="brave_allowed">Allow Brave Search API when it would materially improve coverage</label>
+          </div>
+          <p class="field-note">Off by default. Brave can incur API usage charges. The plan review shows an estimate before the run starts.</p>
+        {% else %}
+          <p class="status-note">Brave is not configured. Guided Search will use district-native and crawler methods; this does not prevent the workflow from running.</p>
+        {% endif %}
+        <div class="form-actions">
+          <button type="button" class="secondary" data-wizard-back>Back</button>
+          <button type="submit" {% if not llm_configured %}disabled title="Configure Ollama in Settings first"{% endif %}>Create AI search plan</button>
+        </div>
+        <p class="field-note">Planning runs in the background. You will review the validated plan before any substantive district search begins.</p>
+      </fieldset>
+    </form>
+  </section>
+
+  {% if recent_sessions %}
+    <section class="content-section">
+      <h2>Recent Guided Searches</h2>
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Session</th><th>Goal</th><th>Status</th><th>Districts</th><th>Round</th><th>Started</th></tr></thead>
+          <tbody>
+            {% for session in recent_sessions %}
+              <tr>
+                <td><a href="{{ url_for('guided_search.detail', session_id=session.id) }}">#{{ session.id }}</a></td>
+                <td>{{ session.original_objective|truncate(100) }}</td>
+                <td><span class="status {{ session.status }}">{{ session.status }}</span></td>
+                <td>{{ session.district_count|fmt_int }}</td>
+                <td>{{ session.round_number|fmt_int }}</td>
+                <td>{{ (session.started_at or session.created_at)|fmt_dt }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
+
+  <script>
+    (() => {
+      const form = document.querySelector('.guided-wizard');
+      if (!form) return;
+      const steps = [...form.querySelectorAll('[data-wizard-step]')];
+      const progress = [...form.querySelectorAll('[data-progress-step]')];
+      let current = 0;
+      const show = (index, moveViewport = true) => {
+        current = Math.max(0, Math.min(index, steps.length - 1));
+        steps.forEach((step, i) => { step.hidden = i !== current; });
+        progress.forEach((item, i) => {
+          item.classList.toggle('active', i === current);
+          item.classList.toggle('complete', i < current);
+        });
+        if (moveViewport) {
+          steps[current].querySelector('textarea, select, input')?.focus({preventScroll: true});
+          steps[current].scrollIntoView({behavior: 'smooth', block: 'start'});
+        }
+      };
+      form.querySelectorAll('[data-wizard-next]').forEach((button) => button.addEventListener('click', () => {
+        const required = [...steps[current].querySelectorAll('[required]')];
+        if (required.some((field) => !field.reportValidity())) return;
+        show(current + 1);
+      }));
+      form.querySelectorAll('[data-wizard-back]').forEach((button) => button.addEventListener('click', () => show(current - 1)));
+
+      const refreshScope = async () => {
+        const matchingOutput = document.getElementById('guided-scope-matching-count');
+        const plannedOutput = document.getElementById('guided-scope-planned-count');
+        matchingOutput.textContent = '…';
+        plannedOutput.textContent = '…';
+        const params = new URLSearchParams();
+        [...form.querySelector('#guided_states').selectedOptions].forEach((option) => params.append('states', option.value));
+        [...form.querySelector('#guided_agency_types').selectedOptions].forEach((option) => params.append('agency_types', option.value));
+        ['min_enrollment', 'max_enrollment', 'max_districts'].forEach((name) => {
+          const value = form.elements[name]?.value;
+          if (value) params.set(name, value);
+        });
+        try {
+          const response = await fetch(`${form.dataset.scopeUrl}?${params.toString()}`, {headers: {'Accept': 'application/json'}});
+          const data = await response.json();
+          matchingOutput.textContent = response.ok ? Number(data.matching_count).toLocaleString() : 'Unavailable';
+          plannedOutput.textContent = response.ok ? Number(data.planned_count).toLocaleString() : 'Unavailable';
+        } catch (_error) {
+          matchingOutput.textContent = 'Unavailable';
+          plannedOutput.textContent = 'Unavailable';
+        }
+      };
+      document.getElementById('refresh-guided-scope')?.addEventListener('click', refreshScope);
+      show(0, false);
+    })();
+  </script>
+{% endblock %}
